@@ -2,6 +2,7 @@ const std = @import("std");
 const client = @import("./client.zig");
 
 const net = std.net;
+const Loop = std.event.Loop;
 
 const Allocator = std.mem.Allocator;
 pub fn listen(comptime H: type, context: anytype, allocator: Allocator, port: u16) !void {
@@ -13,7 +14,8 @@ pub fn listen(comptime H: type, context: anytype, allocator: Allocator, port: u1
 
     while (true) {
         if (server.accept()) |conn| {
-            _ = async client.handle(H, client.NetStream, context, client.NetStream{ .stream = conn.stream }, allocator);
+            const stream = client.NetStream{ .stream = conn.stream };
+            try Loop.instance.?.runDetached(allocator, client.handle, .{ H, client.NetStream, context, stream, allocator });
         } else |err| {
             std.log.err("failed to accept connection {}", .{err});
         }

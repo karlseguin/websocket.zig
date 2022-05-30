@@ -137,12 +137,12 @@ pub fn handle(comptime H: type, comptime S: type, context: anytype, stream: S, a
     // wrap this in case we want to do something fancy with error handling,
     // but as is, it's difficult, since a lot of these would just be normal things,
     // like the client disconnecting.
-    do_handle(H, S, context, stream, allocator) catch {
+    doHandle(H, S, context, stream, allocator) catch {
         return;
     };
 }
 
-fn do_handle(comptime H: type, comptime S: type, context: anytype, stream: S, allocator: Allocator) !void {
+fn doHandle(comptime H: type, comptime S: type, context: anytype, stream: S, allocator: Allocator) !void {
     var buffer: [BUFFER_SIZE]u8 = undefined;
     var buf = buffer[0..];
     var state = &ReadState{ .read = 0, .start = 0, .buf = buf, .dyn = null, .fragment = &Fragmented.init(allocator) };
@@ -387,7 +387,6 @@ fn readFrame(comptime S: type, stream: S, state: *ReadState, allocator: Allocato
 }
 
 fn applyMask(mask: [4]u8, payload: []u8) void {
-    // TODO: this can be partially unrolled
     @setRuntimeSafety(false);
     for (payload) |b, i| {
         payload[i] = b ^ mask[i & 3];
