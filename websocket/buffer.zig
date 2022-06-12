@@ -124,8 +124,13 @@ pub const Buffer = struct {
             self.start = 0;
         } else {
             const message_len = self.message_len;
-            self.len -= message_len;
-            self.start += message_len;
+            if (message_len == self.len) {
+                self.len = 0;
+                self.start = 0;
+            } else {
+                self.len -= message_len;
+                self.start += message_len;
+            }
         }
         self.message_len = 0;
     }
@@ -339,7 +344,7 @@ test "fuzz" {
             _ = stream.fragmentedAdd(m);
         }
 
-        // This is an INNER fuzzing loop which takes a set of messages
+        // This is the inner fuzzing loop which takes a set of messages
         // and tries multiple time with random fragmentation
         var inner: usize = 0;
         while (inner < 10) : (inner += 1) {

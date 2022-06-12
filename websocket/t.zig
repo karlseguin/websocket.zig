@@ -20,7 +20,8 @@ pub const Stream = struct {
     closed: bool,
     buf_index: usize,
     read_index: usize,
-    frames: ArrayList([]u8),
+    frames: ?[]u8,
+    handshake_index: ?usize,
     to_read: ArrayList([]const u8),
     random: std.rand.DefaultPrng,
     received: ArrayList([]const u8),
@@ -30,15 +31,16 @@ pub const Stream = struct {
             .closed = false,
             .buf_index = 0,
             .read_index = 0,
+            .frames = null,
             .random = getRandom(),
-            .frames = ArrayList([]u8).init(allocator),
+            .handshake_index = null,
             .to_read = ArrayList([]const u8).init(allocator),
             .received = ArrayList([]const u8).init(allocator),
         };
     }
 
     // init's the stream + sets up a valid handshake
-    const h = "GET / HTTP/1.1\r\n" ++
+    const HANDSHAKE = "GET / HTTP/1.1\r\n" ++
         "Connection: upgrade\r\n" ++
         "Upgrade: websocket\r\n" ++
         "Sec-websocket-version: 13\r\n" ++
@@ -46,14 +48,7 @@ pub const Stream = struct {
 
     pub fn handshake() Stream {
         var s = init();
-
-        // is all this really necessary?
-        // I think so since everything else in s.frames is dynamically allocated
-        // and owned by s.frames
-
-        var buf = allocator.alloc(u8, h.len) catch unreachable;
-        mem.copy(u8, buf, h);
-        s.frames.append(buf) catch unreachable;
+        s.handshake_index = 0;
         return s;
     }
 
@@ -72,15 +67,17 @@ pub const Stream = struct {
     }
 
     pub fn fragmentedAdd(self: *Stream, value: []const u8) *Stream {
-        // Take ownership of this data so that we can consistently free each
-        // (necessary because we need to allocate data for frames)
-        var copy = allocator.alloc(u8, value.len) catch unreachable;
-        mem.copy(u8, copy, value);
+        var start: usize = 0;
+        var frames: []u8 = undefined;
 
-        // Adding this to frames, instead of to_read, means that, when we
-        // first call read, we'll randomly fragment these. A bit messy, but
-        // this dummy stream has grown up oddly.
-        self.frames.append(copy) catch unreachable;
+        if (self.frames) |f| {
+            start = f.len;
+            frames = allocator.realloc(f, start + value.len) catch unreachable;
+        } else {
+            frames = allocator.alloc(u8, value.len) catch unreachable;
+        }
+        mem.copy(u8, frames[start..], value);
+        self.frames = frames;
         return self;
     }
 
@@ -89,88 +86,117 @@ pub const Stream = struct {
     }
 
     pub fn pingPayload(self: *Stream, payload: []const u8) *Stream {
-        return self.frame(true, 9, payload);
+        return self.frame(true, 9, payload, 0);
     }
 
     pub fn textFrame(self: *Stream, fin: bool, payload: []const u8) *Stream {
-        return self.frame(fin, 1, payload);
+        return self.frame(fin, 1, payload, 0);
+    }
+
+    pub fn textFrameReserved(self: *Stream, fin: bool, payload: []const u8, reserved: u8) *Stream {
+        return self.frame(fin, 1, payload, reserved);
     }
 
     pub fn cont(self: *Stream, fin: bool, payload: []const u8) *Stream {
-        return self.frame(fin, 0, payload);
+        return self.frame(fin, 0, payload, 0);
     }
 
-    pub fn frame(self: *Stream, fin: bool, op_code: u8, payload: []const u8) *Stream {
+    pub fn frame(self: *Stream, fin: bool, op_code: u8, payload: []const u8, reserved: u8) *Stream {
         const l = payload.len;
+        var length_of_length: usize = 0;
 
-        var buf: []u8 = undefined;
-
-        var mask_start: usize = 2;
-        if (l <= 125) {
-            buf = allocator.alloc(u8, l + 6) catch unreachable;
-            buf[1] = 128 | @intCast(u8, l);
-        } else if (l < 65536) {
-            buf = allocator.alloc(u8, l + 8) catch unreachable;
-            buf[1] = 128 | 126;
-            buf[2] = @intCast(u8, (l >> 8) & 0xFF);
-            buf[3] = @intCast(u8, l & 0xFF);
-            mask_start = 4;
-        } else {
-            buf = allocator.alloc(u8, l + 14) catch unreachable;
-            buf[1] = 128 | 127;
-            buf[2] = @intCast(u8, (l >> 56) & 0xFF);
-            buf[3] = @intCast(u8, (l >> 48) & 0xFF);
-            buf[4] = @intCast(u8, (l >> 40) & 0xFF);
-            buf[5] = @intCast(u8, (l >> 32) & 0xFF);
-            buf[6] = @intCast(u8, (l >> 24) & 0xFF);
-            buf[7] = @intCast(u8, (l >> 16) & 0xFF);
-            buf[8] = @intCast(u8, (l >> 8) & 0xFF);
-            buf[9] = @intCast(u8, l & 0xFF);
-            mask_start = 10;
+        if (l > 125) {
+            if (l < 65536) {
+                length_of_length = 2;
+            } else {
+                length_of_length = 8;
+            }
         }
 
-        // now that we've allocated buf (since we didn't know the size before)
-        // we can set our first bit
+        var start: usize = 0;
+        var frames: []u8 = undefined;
+
+        // 2 byte header + length_of_length + mask + payload_length
+        var needed = 2 + length_of_length + 4 + l;
+
+        if (self.frames) |f| {
+            start = f.len;
+            frames = allocator.realloc(f, f.len + needed) catch unreachable;
+        } else {
+            frames = allocator.alloc(u8, needed) catch unreachable;
+        }
+
         if (fin) {
-            buf[0] = 128 | op_code;
+            frames[start] = 128 | op_code | reserved;
         } else {
-            buf[0] = op_code;
+            frames[start] = op_code | reserved;
         }
+
+        if (length_of_length == 0) {
+            frames[start + 1] = 128 | @intCast(u8, l);
+        } else if (length_of_length == 2) {
+            frames[start + 1] = 128 | 126;
+            frames[start + 2] = @intCast(u8, (l >> 8) & 0xFF);
+            frames[start + 3] = @intCast(u8, l & 0xFF);
+        } else {
+            frames[start + 1] = 128 | 127;
+            frames[start + 2] = @intCast(u8, (l >> 56) & 0xFF);
+            frames[start + 3] = @intCast(u8, (l >> 48) & 0xFF);
+            frames[start + 4] = @intCast(u8, (l >> 40) & 0xFF);
+            frames[start + 5] = @intCast(u8, (l >> 32) & 0xFF);
+            frames[start + 6] = @intCast(u8, (l >> 24) & 0xFF);
+            frames[start + 7] = @intCast(u8, (l >> 16) & 0xFF);
+            frames[start + 8] = @intCast(u8, (l >> 8) & 0xFF);
+            frames[start + 9] = @intCast(u8, l & 0xFF);
+        }
+
+        // +2 for the 2 byte prefix
+        const mask_start = start + 2 + length_of_length;
+        const mask = frames[mask_start .. mask_start + 4];
+        self.random.random().bytes(mask);
+        // frames[mask_start] = 0;
+        // frames[mask_start + 1] = 0;
+        // frames[mask_start + 2] = 0;
+        // frames[mask_start + 3] = 0;
 
         const payload_start = mask_start + 4;
-        const mask = buf[mask_start..payload_start];
-
-        // self.random.random().bytes(mask);
-        mask[0] = 0;
-        mask[1] = 0;
-        mask[2] = 0;
-        mask[3] = 0;
         for (payload) |b, i| {
-            buf[payload_start + i] = b ^ mask[i & 3];
+            frames[payload_start + i] = b ^ mask[i & 3];
         }
 
-        self.frames.append(buf) catch unreachable;
+        self.frames = frames;
         return self;
     }
 
     pub fn read(self: *Stream, buf: []u8) !usize {
         std.debug.assert(!self.closed);
 
-        // The first time we call read with frames we will fragment the messages.
-        // So if we have 2 frames, we could end up with 2 or more to_read.
-        if (self.frames.items.len > 0) {
-            var random = self.random.random();
-            for (self.frames.items) |f| {
-                var data = f;
-                while (data.len > 0) {
-                    const l = random.uintAtMost(usize, data.len - 1) + 1;
-                    _ = self.add(data[0..l]);
-                    data = data[l..];
-                }
-                allocator.free(f);
+        if (self.handshake_index) |index| {
+            std.mem.copy(u8, buf, HANDSHAKE[index..]);
+            const written = std.math.min(buf.len, HANDSHAKE.len - index);
+            if (written < buf.len) {
+                self.handshake_index = null;
+            } else {
+                self.handshake_index.? += written;
             }
-            self.frames.deinit();
-            self.frames.items.len = 0;
+            return written;
+        }
+
+        // The first time we call read with frames we will fragment the messages.
+        // The goal is to simulate TCP fragmentation. This doesn't just mean making
+        // some reads smaller than a frame, it also means making some reads overread
+        // one frame plus part (or all) of the next.
+        // This can be voided by using the add function directly.
+        if (self.frames) |frames| {
+            var data = frames;
+            var random = self.random.random();
+            while (data.len > 0) {
+                const l = random.uintAtMost(usize, data.len - 1) + 1;
+                _ = self.add(data[0..l]);
+                data = data[l..];
+            }
+            allocator.free(frames);
+            self.frames = null;
         }
 
         const items = self.to_read.items;
@@ -215,11 +241,12 @@ pub const Stream = struct {
     // it multiple times)
     pub fn clone(self: *Stream) Stream {
         var c = Stream.init();
-        for (self.frames.items) |f| {
+        if (self.frames) |f| {
             var copy = allocator.alloc(u8, f.len) catch unreachable;
             mem.copy(u8, copy, f);
-            c.frames.append(copy) catch unreachable;
+            c.frames = copy;
         }
+        c.handshake_index = self.handshake_index;
         return c;
     }
 
@@ -229,11 +256,9 @@ pub const Stream = struct {
         }
         self.to_read.deinit();
 
-        if (self.frames.items.len > 0) {
-            for (self.frames.items) |buf| {
-                allocator.free(buf);
-            }
-            self.frames.deinit();
+        if (self.frames) |frames| {
+            allocator.free(frames);
+            self.frames = null;
         }
 
         if (self.received.items.len > 0) {

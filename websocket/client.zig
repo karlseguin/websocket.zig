@@ -550,30 +550,28 @@ test "readFrame erros" {
     {
         // reserved bit1
         var expected = .{Expect.close(CLOSE_PROTOCOL_ERROR)};
-        var s = t.Stream.handshake().textFrame(true, "over9000");
-        s.frames.items[1][0] |= 64; // index 0 is the handshake
+        var s = t.Stream.handshake().textFrameReserved(true, "over9000", 64);
         try testReadFrames(s, &expected);
     }
 
     {
         // reserved bit2
         var expected = .{Expect.close(CLOSE_PROTOCOL_ERROR)};
-        var s = t.Stream.handshake().textFrame(true, "over9000");
-        s.frames.items[1][0] |= 32; // index 0 is the handshake
+        var s = t.Stream.handshake().textFrameReserved(true, "over9000", 32);
         try testReadFrames(s, &expected);
     }
 
     {
         // reserved bit3
         var expected = .{Expect.close(CLOSE_PROTOCOL_ERROR)};
-        var s = t.Stream.handshake().textFrame(true, "over9000");
-        s.frames.items[1][0] |= 16; // index 0 is the handshake
+        var s = t.Stream.handshake().textFrameReserved(true, "over9000", 16);
         try testReadFrames(s, &expected);
     }
 }
 
 fn testReadFrames(s: *t.Stream, expected: []Expect) !void {
     defer s.deinit();
+    errdefer s.deinit();
 
     var count: usize = 0;
 
@@ -583,7 +581,7 @@ fn testReadFrames(s: *t.Stream, expected: []Expect) !void {
     // test with various random  TCP fragmentations
     // our t.Stream automatically fragments the frames on the first
     // call to read. Note this is TCP fragmentation, not websocket fragmentation
-    while (count < 100) : (count += 1) {
+    while (count < 1) : (count += 1) {
         var stream = &s.clone();
         handle(TestHandler, *t.Stream, context, stream, TEST_BUFFER_SIZE, TEST_BUFFER_SIZE * 10, t.allocator);
         try t.expectEqual(stream.closed, true);
@@ -591,7 +589,7 @@ fn testReadFrames(s: *t.Stream, expected: []Expect) !void {
         const r = Received.init(stream.received.items);
         const messages = r.messages;
         errdefer r.deinit();
-        errdefer s.deinit();
+        errdefer stream.deinit();
 
         try t.expectEqual(expected.len, messages.len);
 
