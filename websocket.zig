@@ -1,7 +1,10 @@
 const std = @import("std");
 const client = @import("./websocket/client.zig");
 
-pub const listen = @import("./websocket/listen.zig").listen;
+const l = @import("./websocket/listen.zig");
+
+pub const listen = l.listen;
+pub const Config = l.Config;
 pub const Client = client.Client;
 pub const Message = client.Message;
 

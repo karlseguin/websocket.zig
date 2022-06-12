@@ -7,6 +7,7 @@ pub const expect = std.testing.expect;
 pub const allocator = std.testing.allocator;
 
 pub const expectEqual = std.testing.expectEqual;
+pub const expectError = std.testing.expectError;
 pub const expectString = std.testing.expectEqualStrings;
 
 pub fn getRandom() std.rand.DefaultPrng {
@@ -56,12 +57,31 @@ pub const Stream = struct {
         return s;
     }
 
-    pub fn add(self: *Stream, value: []const u8) void {
+    // When bytes are added via add, the call to read will return the
+    // bytes exactly as they were added, provided the destination has
+    // enough space. This is different than adding the bytes via a frame
+    // method which will cause random fragmentation (those framing methods
+    // ultimate end up calling add).
+    pub fn add(self: *Stream, value: []const u8) *Stream {
         // Take ownership of this data so that we can consistently free each
         // (necessary because we need to allocate data for frames)
         var copy = allocator.alloc(u8, value.len) catch unreachable;
         mem.copy(u8, copy, value);
         self.to_read.append(copy) catch unreachable;
+        return self;
+    }
+
+    pub fn fragmentedAdd(self: *Stream, value: []const u8) *Stream {
+        // Take ownership of this data so that we can consistently free each
+        // (necessary because we need to allocate data for frames)
+        var copy = allocator.alloc(u8, value.len) catch unreachable;
+        mem.copy(u8, copy, value);
+
+        // Adding this to frames, instead of to_read, means that, when we
+        // first call read, we'll randomly fragment these. A bit messy, but
+        // this dummy stream has grown up oddly.
+        self.frames.append(copy) catch unreachable;
+        return self;
     }
 
     pub fn ping(self: *Stream) *Stream {
@@ -120,7 +140,11 @@ pub const Stream = struct {
         const payload_start = mask_start + 4;
         const mask = buf[mask_start..payload_start];
 
-        self.random.random().bytes(mask);
+        // self.random.random().bytes(mask);
+        mask[0] = 0;
+        mask[1] = 0;
+        mask[2] = 0;
+        mask[3] = 0;
         for (payload) |b, i| {
             buf[payload_start + i] = b ^ mask[i & 3];
         }
@@ -140,7 +164,7 @@ pub const Stream = struct {
                 var data = f;
                 while (data.len > 0) {
                     const l = random.uintAtMost(usize, data.len - 1) + 1;
-                    self.add(data[0..l]);
+                    _ = self.add(data[0..l]);
                     data = data[l..];
                 }
                 allocator.free(f);

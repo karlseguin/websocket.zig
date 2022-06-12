@@ -11,6 +11,25 @@ const Handshake = websocket.Handshake;
 pub const io_mode = .evented;
 
 pub fn main() !void {
+    const config = websocket.Config{
+        .port = 9223,
+
+        // On connection, each client will get buffer_size bytes allocated
+        // to process messages. This will be a single allocation.
+        .buffer_size = 8192,
+
+        // Maximum allowed message size. If max_size == buffer_size, then the
+        // system will never allocate more than the initial buffer_size.
+        // The system will dynamically allocate up to max_size bytes to deal
+        // with messages large than buffer_size. There is no guarantee around
+        // how long (or short) this memory will remain allocated.
+        // Messages larger than max_size will be rejected.
+
+        // IMPORTANT NOTE: autobahn tests with large messages (16MB).
+        // You almost certainly want to use a small value here.
+        .max_size = 20_000_000,
+    };
+
     // abitrary context object that will get passed to your handler
     const context = Context{};
     var general_purpose_allocator = std.heap.GeneralPurposeAllocator(.{}){};
@@ -18,7 +37,7 @@ pub fn main() !void {
 
     // Start websocket listening on the given port,
     // speficying the handler struct that will servi
-    try websocket.listen(Handler, context, allocator, 9223);
+    try websocket.listen(Handler, context, allocator, config);
 }
 
 const Context = struct {};

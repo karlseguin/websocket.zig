@@ -8,8 +8,6 @@ const mem = std.mem;
 const net = std.net;
 const ascii = std.ascii;
 
-const BUFFER_SIZE = client.BUFFER_SIZE;
-
 const HandshakeError = error{
     Empty,
     Invalid,
@@ -33,7 +31,7 @@ pub const Handshake = struct {
 
         var read: usize = 0;
         while (true) {
-            if (read == BUFFER_SIZE) {
+            if (read == buf.len) {
                 return HandshakeError.TooLarge;
             }
 
@@ -147,7 +145,7 @@ fn toLower(str: []u8) []u8 {
 }
 
 test "parse" {
-    var buffer: [BUFFER_SIZE]u8 = undefined;
+    var buffer: [512]u8 = undefined;
     var buf = buffer[0..];
 
     try t.expectEqual(testHandshake("", buf), HandshakeError.Invalid);
@@ -189,7 +187,7 @@ test "parse" {
 
 fn testHandshake(input: []const u8, buf: []u8) !Handshake {
     var s = t.Stream.init();
-    s.add(input);
+    _ = s.add(input);
 
     defer s.deinit();
     return Handshake.parse(*t.Stream, &s, buf);

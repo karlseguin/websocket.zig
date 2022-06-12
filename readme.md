@@ -6,6 +6,10 @@ Right now, this is just a fun side project. But every mandatory [Autobahn Testsu
 
 Look at autobahn.zig for example usage. This is the code that starts the server and responds to autobahn tests request. It's essentially an echo server but should be straightforward to adapt.
 
-Note that the `handle` function takes a `message` which has a `type` and `data`field. The `type` will either be `text` or `binary`, but in 99% of cases, you can ignore it and just use `data`. This is an unfortunate part of the spec which differentiates between arbitrary byte data (binary) and valid UTF-8 (text). Note that this library _does not_ reject text messages with invalid UTF-8. Again, in most cases, it doesn't matter and just wastes cycles. If you care about this, do like the autobahn test does and validate it in your handler.
+Note that the `handle` function takes a `message` which has a `type` and `data`field. The `type` will either be `text` or `binary`, but in 99% of cases, you can ignore it and just use `data`. This is an unfortunate part of the spec which differentiates between arbitrary byte data (binary) and valid UTF-8 (text). This library _does not_ reject text messages with invalid UTF-8. Again, in most cases, it doesn't matter and just wastes cycles. If you care about this, do like the autobahn test does and validate it in your handler.
 
-The code is optimized for receiving messages < 8K in size. Messages larger than this will require allocation. Furthermore, websockets have their own fragmentation "feature" (not the same as TCP fragmentation) which is not handled efficiently at this time (but, I don't think this websocket fragmentation is being used at all).
+When starting the server, a `buffer_size` and `max_size` must be specified. Each connection will have `buffer_size` bytes allocated. However, up to `max_size` will be allocated as needed for messages larger than `buffer_size`. Setting `max_size` == `buffer_size` is valid and will ensure that only the initial `buffer_size` bytes will be allocated.
+
+Websockets have their own fragmentation "feature" (not the same as TCP fragmentation) which is not handled efficiently at this time (but, I don't think this websocket fragmentation is being used at all).
+
+(There will be addition changes to how buffers behave)

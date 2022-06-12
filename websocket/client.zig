@@ -2,13 +2,9 @@ const std = @import("std");
 const t = @import("t.zig");
 
 const Allocator = std.mem.Allocator;
+const Buffer = @import("buffer.zig").Buffer;
 const Handshake = @import("handshake.zig").Handshake;
 const Fragmented = @import("fragmented.zig").Fragmented;
-
-// Every client will get a [BUFFER_SIZE]u8 which we'll try to use as much
-// as possible. However, for messages larger than BUFFER_SIZE, we'll need
-// to allocate memory.
-pub const BUFFER_SIZE = 8192;
 
 pub const TEXT_FRAME = 128 | 1;
 pub const BIN_FRAME = 128 | 2;
@@ -43,22 +39,8 @@ const ReadFrameResult = union(ReadFrameResultType) {
 };
 
 const ReadState = struct {
-    // Static of size BUFFER_SIZE, used for any message that will fit
-    buf: []u8,
-
-    // Dynamically allocated for messages larger than BUFFER_SIZE
-    // Note that our dynamic buffer is always precisely sized for a specific
-    // message, so we'll never read part of the next message into it, which
-    // makes our life easier.
-    dyn: ?[]u8,
-
-    // How much we've read of the current message, could reference
-    // the end of either buf of dyn
-    read: usize,
-
-    // Where in buf the message starts. For dyn, the start is always 0
-    // since we allocate dyn for a specific message.
-    start: usize,
+    // The buffer that we're reading bytes into.
+    buf: *Buffer,
 
     // If we're dealing with a fragmented message (websocket fragment, not tcp
     // fragment), the state of the fragmented message is maintained here.)
@@ -133,31 +115,31 @@ fn C(comptime S: type) type {
         }
     };
 }
-pub fn handle(comptime H: type, comptime S: type, context: anytype, stream: S, allocator: Allocator) void {
+pub fn handle(comptime H: type, comptime S: type, context: anytype, stream: S, buffer_size: usize, max_size: usize, allocator: Allocator) void {
     // wrap this in case we want to do something fancy with error handling,
     // but as is, it's difficult, since a lot of these would just be normal things,
     // like the client disconnecting.
-    doHandle(H, S, context, stream, allocator) catch {
+    doHandle(H, S, context, stream, buffer_size, max_size, allocator) catch {
         return;
     };
 }
 
-fn doHandle(comptime H: type, comptime S: type, context: anytype, stream: S, allocator: Allocator) !void {
-    var buffer: [BUFFER_SIZE]u8 = undefined;
-    var buf = buffer[0..];
-    var state = &ReadState{ .read = 0, .start = 0, .buf = buf, .dyn = null, .fragment = &Fragmented.init(allocator) };
+fn doHandle(comptime H: type, comptime S: type, context: anytype, stream: S, buffer_size: usize, max_size: usize, allocator: Allocator) !void {
+    var buf = try Buffer.init(buffer_size, max_size, allocator);
+    var state = &ReadState{
+        .buf = &buf,
+        .fragment = &Fragmented.init(allocator),
+    };
 
     const client = &C(S){ .stream = stream, .closed = false };
 
     defer {
+        buf.deinit();
         client.close();
-        if (state.dyn) |dyn| {
-            allocator.free(dyn);
-        }
         state.fragment.deinit();
     }
 
-    const h = Handshake.parse(S, stream, buf) catch |err| {
+    const h = Handshake.parse(S, stream, buf.static) catch |err| {
         try Handshake.close(S, stream, err);
         return;
     };
@@ -169,7 +151,8 @@ fn doHandle(comptime H: type, comptime S: type, context: anytype, stream: S, all
     }
 
     while (true) {
-        const result = readFrame(S, stream, state, allocator) catch |err| {
+        buf.next();
+        const result = readFrame(S, stream, state) catch |err| {
             switch (err) {
                 Error.LargeControl => try stream.write(CLOSE_PROTOCOL_ERROR),
                 Error.ReservedFlags => try stream.write(CLOSE_PROTOCOL_ERROR),
@@ -182,11 +165,6 @@ fn doHandle(comptime H: type, comptime S: type, context: anytype, stream: S, all
             switch (message.type) {
                 .text, .binary => {
                     try handler.handle(message);
-
-                    if (state.dyn) |dyn| {
-                        allocator.free(dyn);
-                        state.dyn = null;
-                    }
                     state.fragment.reset();
                 },
                 .pong => {
@@ -199,17 +177,12 @@ fn doHandle(comptime H: type, comptime S: type, context: anytype, stream: S, all
                 },
                 else => unreachable,
             }
-        } else if (state.dyn) |dyn| {
-            allocator.free(dyn);
-            state.dyn = null;
         }
     }
 }
 
-fn readFrame(comptime S: type, stream: S, state: *ReadState, allocator: Allocator) !?Message {
+fn readFrame(comptime S: type, stream: S, state: *ReadState) !?Message {
     var buf = state.buf;
-    var read = state.read;
-    var start = state.start;
     var fragment = state.fragment;
 
     var data_needed: usize = 2; // always need at least the first two bytes to start figuring things out
@@ -217,38 +190,19 @@ fn readFrame(comptime S: type, stream: S, state: *ReadState, allocator: Allocato
     var header_length: usize = 0;
     var length_of_length: usize = 0;
 
-    // buf might switch from being our static buffer into a dynamic buffer. This
-    // would only happen after we've parsed the header, in whic case the header
-    // is in our static buffer, but our payload is in our dynamic buffer. We could
-    // copy our header into our dynamic buffer, and then it wouldn't matter if
-    // we switch. Instead, we'll capture the header data that we need in these
-    // variables. It's safe to reference the static buffer here since it isn't
-    // going to be used/changed for this message once we switch to dynamic buffer.
-    var byte1: u8 = 0;
     var masked = true;
-    var mask: [4]u8 = undefined;
     var message_type = MessageType.invalid;
 
     while (true) {
-        if (read < data_needed) {
-            var buf_start = start + read;
-            if (data_needed > (buf.len - buf_start)) {
-                std.mem.copy(u8, buf[0..], buf[start..buf_start]);
-                start = 0;
-                buf_start = start + read;
-            }
-            const n = try stream.read(buf[buf_start..]);
-            if (n == 0) {
-                return Error.Closed;
-            }
-            read += n;
-            continue;
+        if ((try buf.read(S, stream, data_needed)) == false) {
+            return Error.Closed;
         }
 
         switch (phase) {
             ParsePhase.pre => {
-                byte1 = buf[start];
-                var byte2 = buf[start + 1];
+                const msg = buf.message();
+                var byte1 = msg[0];
+                var byte2 = msg[1];
                 masked = byte2 & 128 == 128;
                 length_of_length = switch (byte2 & 127) {
                     126 => 2,
@@ -283,67 +237,22 @@ fn readFrame(comptime S: type, stream: S, state: *ReadState, allocator: Allocato
                 }
             },
             ParsePhase.header => {
+                const msg = buf.message();
                 var payload_length = switch (length_of_length) {
-                    2 => @intCast(u16, buf[start + 3]) | @intCast(u16, buf[start + 2]) << 8,
-                    8 => @intCast(u64, buf[start + 9]) | @intCast(u64, buf[start + 8]) << 8 | @intCast(u64, buf[start + 7]) << 16 | @intCast(u64, buf[start + 6]) << 24 | @intCast(u64, buf[start + 5]) << 32 | @intCast(u64, buf[start + 4]) << 40 | @intCast(u64, buf[start + 3]) << 48 | @intCast(u64, buf[start + 2]) << 56,
-                    else => buf[start + 1] & 127,
+                    2 => @intCast(u16, msg[3]) | @intCast(u16, msg[2]) << 8,
+                    8 => @intCast(u64, msg[9]) | @intCast(u64, msg[8]) << 8 | @intCast(u64, msg[7]) << 16 | @intCast(u64, msg[6]) << 24 | @intCast(u64, msg[5]) << 32 | @intCast(u64, msg[4]) << 40 | @intCast(u64, msg[3]) << 48 | @intCast(u64, msg[2]) << 56,
+                    else => msg[1] & 127,
                 };
-
                 data_needed += payload_length;
-
-                // buf data might move around (if our static buffer is at the end
-                // we wrap around). We could move the buffer around too, but let's
-                // just snapshot the 4 bytes, so much easier.
-                const mask_end = start + header_length;
-                std.mem.copy(u8, mask[0..], buf[mask_end - 4 .. mask_end]);
-
-                if (data_needed > BUFFER_SIZE) {
-                    // We require more data than will fit into our static buffer.
-                    // It's time to allocate as much memory as we're going to need.
-
-                    // TODO, we probably want a configurable max_message_size
-                    // and to reject any payload which is larger
-                    const dyn = try allocator.alloc(u8, payload_length);
-
-                    // The header data is already in our static buffer, but that's
-                    // ok because we already captured the important data (see the
-                    // byte1, masked and mask variables).
-
-                    // We've already read some of the payload, we need to copy
-                    // this data into our new dynamic buffer
-                    if (read > header_length) {
-                        const payload_end = start + read;
-                        const payload_start = start + header_length;
-                        std.mem.copy(u8, dyn, buf[payload_start..payload_end]);
-                        read = payload_end - payload_start;
-                    } else {
-                        read = 0;
-                    }
-
-                    start = 0;
-                    header_length = 0;
-                    buf = dyn;
-                    state.dyn = dyn;
-                    data_needed = payload_length;
-                }
                 phase = ParsePhase.payload;
             },
             ParsePhase.payload => {
-                const fin = byte1 & 128 == 128;
-                const payload_end = start + data_needed;
-                const payload_start = start + header_length;
-                var payload = buf[payload_start..payload_end];
-
+                const msg = buf.message();
+                const fin = msg[0] & 128 == 128;
+                var payload = msg[header_length..];
                 if (masked) {
+                    const mask = msg[header_length - 4 .. header_length];
                     applyMask(mask, payload);
-                }
-
-                if (state.dyn != null) {
-                    state.start = 0;
-                    state.read = 0;
-                } else {
-                    state.start = payload_end;
-                    state.read = read - data_needed;
                 }
 
                 if (fin) {
@@ -386,7 +295,7 @@ fn readFrame(comptime S: type, stream: S, state: *ReadState, allocator: Allocato
     }
 }
 
-fn applyMask(mask: [4]u8, payload: []u8) void {
+fn applyMask(mask: []const u8, payload: []u8) void {
     @setRuntimeSafety(false);
     for (payload) |b, i| {
         payload[i] = b ^ mask[i & 3];
@@ -466,6 +375,7 @@ fn handleClose(comptime S: type, stream: S, data: []const u8) !void {
     return try stream.write(CLOSE_NORMAL);
 }
 
+const TEST_BUFFER_SIZE = 512;
 const TestContext = struct {};
 const TestHandler = struct {
     client: *C(*t.Stream),
@@ -497,25 +407,25 @@ test "read messages" {
     }
 
     {
-        // single message exactly BUFFER_SIZE
-        // header will be 8 bytes, so we make the messae BUFFER_SIZE - 8 bytes
-        const msg = [_]u8{'a'} ** (BUFFER_SIZE - 8);
+        // single message exactly TEST_BUFFER_SIZE
+        // header will be 8 bytes, so we make the messae TEST_BUFFER_SIZE - 8 bytes
+        const msg = [_]u8{'a'} ** (TEST_BUFFER_SIZE - 8);
         var expected = .{Expect.text(msg[0..])};
         try testReadFrames(t.Stream.handshake().textFrame(true, msg[0..]), &expected);
     }
 
     {
-        // single message that is bigger than BUFFER_SIZE
-        // header is 8 bytes, so if we make our message BUFFER_SIZE - 7, we'll
-        // end up with a message which is exactly 1 byte larger than BUFFER_SIZE
-        const msg = [_]u8{'a'} ** (BUFFER_SIZE - 7);
+        // single message that is bigger than TEST_BUFFER_SIZE
+        // header is 8 bytes, so if we make our message TEST_BUFFER_SIZE - 7, we'll
+        // end up with a message which is exactly 1 byte larger than TEST_BUFFER_SIZE
+        const msg = [_]u8{'a'} ** (TEST_BUFFER_SIZE - 7);
         var expected = .{Expect.text(msg[0..])};
         try testReadFrames(t.Stream.handshake().textFrame(true, msg[0..]), &expected);
     }
 
     {
-        // single message that is much bigger than BUFFER_SIZE
-        const msg = [_]u8{'a'} ** (BUFFER_SIZE * 2);
+        // single message that is much bigger than TEST_BUFFER_SIZE
+        const msg = [_]u8{'a'} ** (TEST_BUFFER_SIZE * 2);
         var expected = .{Expect.text(msg[0..])};
         try testReadFrames(t.Stream.handshake().textFrame(true, msg[0..]), &expected);
     }
@@ -532,11 +442,11 @@ test "read messages" {
     }
 
     {
-        // two messages, individually smaller than BUFFER_SIZE, but
-        // their total length is greater than BUFFER_SIZE (this is an important
+        // two messages, individually smaller than TEST_BUFFER_SIZE, but
+        // their total length is greater than TEST_BUFFER_SIZE (this is an important
         // test as it requires special handling since the two messages are valid
         // but don't fit in a single buffer)
-        const msg1 = [_]u8{'a'} ** (BUFFER_SIZE - 100);
+        const msg1 = [_]u8{'a'} ** (TEST_BUFFER_SIZE - 100);
         const msg2 = [_]u8{'b'} ** 200;
         var expected = .{ Expect.text(msg1[0..]), Expect.text(msg2[0..]) };
         try testReadFrames(t.Stream.handshake()
@@ -545,8 +455,8 @@ test "read messages" {
     }
 
     {
-        // two messages, the first bigger than BUFFER_SIZE, the second smaller
-        const msg1 = [_]u8{'a'} ** (BUFFER_SIZE + 100);
+        // two messages, the first bigger than TEST_BUFFER_SIZE, the second smaller
+        const msg1 = [_]u8{'a'} ** (TEST_BUFFER_SIZE + 100);
         const msg2 = [_]u8{'b'} ** 200;
         var expected = .{ Expect.text(msg1[0..]), Expect.text(msg2[0..]) };
         try testReadFrames(t.Stream.handshake()
@@ -564,11 +474,11 @@ test "read messages" {
 
     {
         // large fragmented (websocket fragementation)
-        const msg = [_]u8{'a'} ** (BUFFER_SIZE * 2 + 600);
+        const msg = [_]u8{'a'} ** (TEST_BUFFER_SIZE * 2 + 600);
         var expected = .{Expect.text(msg[0..])};
         try testReadFrames(t.Stream.handshake()
-            .textFrame(false, msg[0 .. BUFFER_SIZE + 100])
-            .cont(true, msg[BUFFER_SIZE + 100 ..]), &expected);
+            .textFrame(false, msg[0 .. TEST_BUFFER_SIZE + 100])
+            .cont(true, msg[TEST_BUFFER_SIZE + 100 ..]), &expected);
     }
 
     {
@@ -584,14 +494,14 @@ test "read messages" {
 
     {
         // Large Fragmented with control in between
-        const msg = [_]u8{'b'} ** (BUFFER_SIZE * 2 + 600);
+        const msg = [_]u8{'b'} ** (TEST_BUFFER_SIZE * 2 + 600);
         var expected = .{ Expect.pong(""), Expect.pong(""), Expect.text(msg[0..]) };
         try testReadFrames(t.Stream.handshake()
-            .textFrame(false, msg[0 .. BUFFER_SIZE + 100])
+            .textFrame(false, msg[0 .. TEST_BUFFER_SIZE + 100])
             .ping()
-            .cont(false, msg[BUFFER_SIZE + 100 .. BUFFER_SIZE + 110])
+            .cont(false, msg[TEST_BUFFER_SIZE + 100 .. TEST_BUFFER_SIZE + 110])
             .ping()
-            .cont(true, msg[BUFFER_SIZE + 110 ..]), &expected);
+            .cont(true, msg[TEST_BUFFER_SIZE + 110 ..]), &expected);
     }
 
     {
@@ -675,11 +585,13 @@ fn testReadFrames(s: *t.Stream, expected: []Expect) !void {
     // call to read. Note this is TCP fragmentation, not websocket fragmentation
     while (count < 100) : (count += 1) {
         var stream = &s.clone();
-        handle(TestHandler, *t.Stream, context, stream, t.allocator);
+        handle(TestHandler, *t.Stream, context, stream, TEST_BUFFER_SIZE, TEST_BUFFER_SIZE * 10, t.allocator);
         try t.expectEqual(stream.closed, true);
 
         const r = Received.init(stream.received.items);
         const messages = r.messages;
+        errdefer r.deinit();
+        errdefer s.deinit();
 
         try t.expectEqual(expected.len, messages.len);
 
