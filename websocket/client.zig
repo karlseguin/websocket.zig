@@ -297,6 +297,43 @@ fn readFrame(comptime S: type, stream: S, state: *ReadState) !?Message {
 
 fn applyMask(mask: []const u8, payload: []u8) void {
     @setRuntimeSafety(false);
+    const word_size = @sizeOf(usize);
+
+    // not point optimizing this if it's a really short payload
+    if (payload.len < word_size * 2) {
+        applyMaskSimple(mask, payload);
+        return;
+    }
+
+    // We're going to xor this 1 word at a time.
+    // But, our payload's length probably isn't a perfect multiple of word_size
+    // so we'll first xor the bits until we have it aligned.
+    var data = payload;
+    const over = data.len % word_size;
+
+    if (over > 0) {
+        applyMaskSimple(mask, data[0..over]);
+        data = data[over..];
+    }
+
+    var i: usize = 0;
+    var mask_word: [word_size]u8 = undefined;
+    while (i < word_size) {
+        mask_word[i] = mask[(i + over) & 3];
+        i += 1;
+    }
+    const mask_value = @bitCast(usize, mask_word);
+
+    i = 0;
+    while (i < data.len) {
+        const slice = data[i .. i + word_size];
+        std.mem.bytesAsSlice(usize, slice)[0] ^= mask_value;
+        i += word_size;
+    }
+}
+
+fn applyMaskSimple(mask: []const u8, payload: []u8) void {
+    @setRuntimeSafety(false);
     for (payload) |b, i| {
         payload[i] = b ^ mask[i & 3];
     }
@@ -398,6 +435,30 @@ const TestHandler = struct {
 
     pub fn close(_: TestHandler) void {}
 };
+
+test "mask" {
+    const random = t.getRandom().random();
+    const mask = [4]u8{ 10, 20, 55, 200 };
+
+    var original = try t.allocator.alloc(u8, 10000);
+    var payload = try t.allocator.alloc(u8, 10000);
+
+    var size: usize = 0;
+    while (size < 10000) {
+        var slice = original[0..size];
+        random.bytes(slice);
+        std.mem.copy(u8, payload, slice);
+        applyMask(mask[0..], payload[0..size]);
+
+        for (slice) |b, i| {
+            try t.expectEqual(b ^ mask[i & 3], payload[i]);
+        }
+
+        size += 1;
+    }
+    t.allocator.free(original);
+    t.allocator.free(payload);
+}
 
 test "read messages" {
     {
