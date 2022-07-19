@@ -8,6 +8,7 @@ pub const Config = struct {
     port: u16,
     max_size: usize,
     buffer_size: usize,
+    address: []const u8,
 };
 
 const Allocator = std.mem.Allocator;
@@ -15,7 +16,7 @@ pub fn listen(comptime H: type, context: anytype, allocator: Allocator, config: 
     var server = net.StreamServer.init(.{ .reuse_address = true });
     defer server.deinit();
 
-    try server.listen(net.Address.parseIp("127.0.0.1", config.port) catch unreachable);
+    try server.listen(net.Address.parseIp(config.address, config.port) catch unreachable);
     std.log.info("listening at {}", .{server.listen_address});
     const max_size = config.max_size;
     const buffer_size = config.buffer_size;

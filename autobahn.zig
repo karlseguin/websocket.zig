@@ -14,6 +14,8 @@ pub fn main() !void {
     const config = websocket.Config{
         .port = 9223,
 
+        .address = "127.0.0.1",
+
         // On connection, each client will get buffer_size bytes allocated
         // to process messages. This will be a single allocation.
         .buffer_size = 8192,
