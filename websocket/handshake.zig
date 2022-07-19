@@ -3,15 +3,15 @@ const builtin = @import("builtin");
 
 const t = @import("t.zig");
 const client = @import("client.zig");
+const Request = @import("request.zig").Request;
 
 const mem = std.mem;
 const net = std.net;
 const ascii = std.ascii;
+const whitespace: []const u8 = ascii.spaces[0..];
 
 const HandshakeError = error{
     Empty,
-    Invalid,
-    TooLarge,
     InvalidProtocol,
     InvalidRequestLine,
     InvalidHeader,
@@ -26,89 +26,66 @@ pub const Handshake = struct {
     key: []const u8,
     method: []const u8,
 
-    pub fn parse(comptime S: type, stream: S, buf: []u8) !Handshake {
+    pub fn parse(buf: []u8) !Handshake {
         @setRuntimeSafety(builtin.is_test);
 
-        var read: usize = 0;
-        while (true) {
-            if (read == buf.len) {
-                return HandshakeError.TooLarge;
-            }
+        var data = buf;
+        var index = mem.indexOfScalar(u8, data, '\r') orelse unreachable;
+        var request_line = data[0..index];
 
-            var n = try stream.read(buf[read..]);
-            if (n == 0) {
-                return HandshakeError.Invalid;
-            }
-            read += n;
-
-            if (!mem.endsWith(u8, buf[0..read], "\r\n\r\n")) {
-                continue;
-            }
-            var data = buf[0..read];
-
-            // At this point, we know buf has a trailing \r\n\r\n, so we can optimize
-            // this a bit (e.g., like turning off bound checking at the start of this
-            // function)
-            var index = mem.indexOfScalar(u8, data, '\r') orelse unreachable;
-            var request_line = data[0..index];
-
-            if (!ascii.endsWithIgnoreCase(request_line, "http/1.1")) {
-                return HandshakeError.InvalidProtocol;
-            }
-
-            var key: []const u8 = "";
-            var required_headers: u8 = 0;
-            const whitespace: []const u8 = ascii.spaces[0..];
-
-            data = data[(index + 2)..];
-            while (data.len > 4) {
-                index = mem.indexOfScalar(u8, data, '\r') orelse unreachable;
-                const separator = mem.indexOfScalar(u8, data[0..index], ':') orelse return HandshakeError.InvalidHeader;
-
-                const header = mem.trim(u8, toLower(data[0..separator]), whitespace);
-                var value = data[(separator + 1)..index]; // we'll trim/lowercase this as needed
-
-                if (mem.eql(u8, "upgrade", header)) {
-                    if (!ascii.eqlIgnoreCase("websocket", mem.trim(u8, value, whitespace))) {
-                        return HandshakeError.InvalidUpgrade;
-                    }
-                    required_headers |= 1;
-                } else if (mem.eql(u8, "sec-websocket-version", header)) {
-                    if (!mem.eql(u8, "13", mem.trim(u8, value, whitespace))) {
-                        return HandshakeError.InvalidVersion;
-                    }
-                    required_headers |= 2;
-                } else if (mem.eql(u8, "connection", header)) {
-                    if (!ascii.eqlIgnoreCase("upgrade", mem.trim(u8, value, whitespace))) {
-                        return HandshakeError.InvalidConnection;
-                    }
-                    required_headers |= 4;
-                } else if (mem.eql(u8, "sec-websocket-key", header)) {
-                    key = mem.trim(u8, value, whitespace);
-                    required_headers |= 8;
-                }
-                data = data[(index + 2)..];
-            }
-
-            if (required_headers != 15) {
-                return HandshakeError.MissingHeaders;
-            }
-
-            // we already established that request_line ends with http/1.1, so this buys
-            // us some leeway into parsing it
-            const separator = mem.indexOfScalar(u8, request_line, ' ') orelse return HandshakeError.InvalidRequestLine;
-            const method = request_line[0..separator];
-            const url = mem.trim(u8, request_line[separator + 1 .. request_line.len - 9], whitespace);
-            return Handshake{ .key = key, .url = url, .method = method };
+        if (!ascii.endsWithIgnoreCase(request_line, "http/1.1")) {
+            return HandshakeError.InvalidProtocol;
         }
+
+        var key: []const u8 = "";
+        var required_headers: u8 = 0;
+
+        data = data[(index + 2)..];
+        while (data.len > 4) {
+            index = mem.indexOfScalar(u8, data, '\r') orelse unreachable;
+            const separator = mem.indexOfScalar(u8, data[0..index], ':') orelse return HandshakeError.InvalidHeader;
+
+            const header = mem.trim(u8, toLower(data[0..separator]), whitespace);
+            var value = data[(separator + 1)..index]; // we'll trim/lowercase this as needed
+
+            if (mem.eql(u8, "upgrade", header)) {
+                if (!ascii.eqlIgnoreCase("websocket", mem.trim(u8, value, whitespace))) {
+                    return HandshakeError.InvalidUpgrade;
+                }
+                required_headers |= 1;
+            } else if (mem.eql(u8, "sec-websocket-version", header)) {
+                if (!mem.eql(u8, "13", mem.trim(u8, value, whitespace))) {
+                    return HandshakeError.InvalidVersion;
+                }
+                required_headers |= 2;
+            } else if (mem.eql(u8, "connection", header)) {
+                if (!ascii.eqlIgnoreCase("upgrade", mem.trim(u8, value, whitespace))) {
+                    return HandshakeError.InvalidConnection;
+                }
+                required_headers |= 4;
+            } else if (mem.eql(u8, "sec-websocket-key", header)) {
+                key = mem.trim(u8, value, whitespace);
+                required_headers |= 8;
+            }
+            data = data[(index + 2)..];
+        }
+
+        if (required_headers != 15) {
+            return HandshakeError.MissingHeaders;
+        }
+
+        // we already established that request_line ends with http/1.1, so this buys
+        // us some leeway into parsing it
+        const separator = mem.indexOfScalar(u8, request_line, ' ') orelse return HandshakeError.InvalidRequestLine;
+        const method = request_line[0..separator];
+        const url = mem.trim(u8, request_line[separator + 1 .. request_line.len - 9], whitespace);
+        return Handshake{ .key = key, .url = url, .method = method };
     }
 
     pub fn close(comptime S: type, stream: S, err: anyerror) !void {
         try stream.write("HTTP/1.1 400 Invalid\r\nerror: ");
         const s = switch (err) {
             error.Empty => "empty",
-            error.Invalid => "invalid",
-            error.TooLarge => "toolarge",
             error.InvalidProtocol => "invalidprotocol",
             error.InvalidRequestLine => "invalidrequestline",
             error.InvalidHeader => "invalidheader",
@@ -148,8 +125,6 @@ test "parse" {
     var buffer: [512]u8 = undefined;
     var buf = buffer[0..];
 
-    try t.expectEqual(testHandshake("", buf), HandshakeError.Invalid);
-    try t.expectEqual(testHandshake("HI\r\n", buf), HandshakeError.Invalid);
     try t.expectEqual(testHandshake("GET / HTTP/1.0\r\n\r\n", buf), HandshakeError.InvalidProtocol);
     try t.expectEqual(testHandshake("GET / HTTP/1.1\r\n\r\n", buf), HandshakeError.MissingHeaders);
     try t.expectEqual(testHandshake("GET / HTTP/1.1\r\nConnection:  upgrade\r\n\r\n", buf), HandshakeError.MissingHeaders);
@@ -176,7 +151,8 @@ test "parse" {
                 _ = s.add(data[0..l]);
                 data = data[l..];
             }
-            const h = Handshake.parse(*t.Stream, &s, buf) catch unreachable;
+            const request_buf = Request.read(*t.Stream, &s, buf) catch unreachable;
+            const h = Handshake.parse(request_buf) catch unreachable;
             try t.expectString("1139329", h.key);
             try t.expectString("/", h.url);
             try t.expectString("GET", h.method);
@@ -190,5 +166,6 @@ fn testHandshake(input: []const u8, buf: []u8) !Handshake {
     _ = s.add(input);
 
     defer s.deinit();
-    return Handshake.parse(*t.Stream, &s, buf);
+    const request_buf = try Request.read(*t.Stream, &s, buf);
+    return Handshake.parse(request_buf);
 }

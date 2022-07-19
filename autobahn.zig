@@ -16,8 +16,16 @@ pub fn main() !void {
 
         .address = "127.0.0.1",
 
+        .path = "/",
+
+        // Maximum allowed request sizes. Allocated to parse the request.
+        // Only max_request_size will be allocated for non-websocket requests.
+        .max_request_size = 1024,
+
         // On connection, each client will get buffer_size bytes allocated
-        // to process messages. This will be a single allocation.
+        // to process messages. This will be a single allocation and will only
+        // be allocated after the request has been successfully parsed and
+        // identified as a websocket request.
         .buffer_size = 8192,
 
         // Maximum allowed message size. If max_size == buffer_size, then the

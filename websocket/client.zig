@@ -1,8 +1,12 @@
 const std = @import("std");
 const t = @import("t.zig");
+const builtin = @import("builtin");
 
-const Allocator = std.mem.Allocator;
+const mem = std.mem;
+const ascii = std.ascii;
+const Allocator = mem.Allocator;
 const Buffer = @import("buffer.zig").Buffer;
+const Request = @import("request.zig").Request;
 const Handshake = @import("handshake.zig").Handshake;
 const Fragmented = @import("fragmented.zig").Fragmented;
 
@@ -11,6 +15,8 @@ pub const BIN_FRAME = 128 | 2;
 pub const CLOSE_FRAME = 128 | 8;
 pub const PING_FRAME = 128 | 9;
 pub const PONG_FRAME = 128 | 10;
+
+const whitespace: []const u8 = ascii.spaces[0..];
 
 pub const MessageType = enum {
     continuation,
@@ -87,14 +93,21 @@ pub const Message = struct {
     data: []const u8,
 };
 
+pub const Config = struct {
+    max_size: usize,
+    path: []const u8,
+    buffer_size: usize,
+    max_request_size: usize,
+};
+
 pub const Client = C(NetStream);
 
 // Only use this internally, for testing, when we want a client that's based
 // on our t.Stream instead of a net.Stream
 fn C(comptime S: type) type {
     return struct {
-        closed: bool,
         stream: S,
+        closed: bool = false,
 
         const Self = @This();
 
@@ -107,43 +120,63 @@ fn C(comptime S: type) type {
         }
 
         pub fn close(self: *Self) void {
-            if (self.closed) {
-                return;
-            }
             self.closed = true;
-            self.stream.close();
         }
     };
 }
-pub fn handle(comptime H: type, comptime S: type, context: anytype, stream: S, buffer_size: usize, max_size: usize, allocator: Allocator) void {
-    // wrap this in case we want to do something fancy with error handling,
-    // but as is, it's difficult, since a lot of these would just be normal things,
-    // like the client disconnecting.
-    doHandle(H, S, context, stream, buffer_size, max_size, allocator) catch {
+
+pub fn handle(comptime H: type, comptime S: type, context: anytype, stream: S, config: Config, allocator: Allocator) void {
+    defer stream.close();
+    doHandle(H, S, context, stream, config, allocator) catch {
         return;
     };
 }
 
-fn doHandle(comptime H: type, comptime S: type, context: anytype, stream: S, buffer_size: usize, max_size: usize, allocator: Allocator) !void {
-    var buf = try Buffer.init(buffer_size, max_size, allocator);
+pub fn doHandle(comptime H: type, comptime S: type, context: anytype, stream: S, config: Config, allocator: Allocator) !void {
+    var request_buf = try allocator.alloc(u8, config.max_request_size);
+    defer allocator.free(request_buf);
+    const request = Request.read(S, stream, request_buf) catch |err| {
+        try Request.close(S, stream, err);
+        return;
+    };
+
+    if (isWebsocketRequest(request, config.path)) {
+        try handleWebsocket(H, S, context, stream, request, config, allocator);
+    }
+}
+
+fn isWebsocketRequest(request: []u8, targetPath: []const u8) bool {
+    var index = mem.indexOfScalar(u8, request, ' ') orelse return false;
+    const method = request[0..index];
+    if (!ascii.eqlIgnoreCase("get", method)) {
+        return false;
+    }
+
+    var path = mem.trim(u8, request[index..], whitespace);
+    index = mem.indexOfScalar(u8, path, ' ') orelse return false;
+    path = path[0..index];
+    return ascii.eqlIgnoreCase(targetPath, path);
+}
+
+fn handleWebsocket(comptime H: type, comptime S: type, context: anytype, stream: S, request: []u8, config: Config, allocator: Allocator) !void {
+    const h = Handshake.parse(request) catch |err| {
+        try Handshake.close(S, stream, err);
+        return;
+    };
+    try h.reply(S, stream);
+
+    var buf = try Buffer.init(config.buffer_size, config.max_size, allocator);
     var state = &ReadState{
         .buf = &buf,
         .fragment = &Fragmented.init(allocator),
     };
 
-    const client = &C(S){ .stream = stream, .closed = false };
+    const client = &C(S){ .stream = stream };
 
     defer {
         buf.deinit();
-        client.close();
         state.fragment.deinit();
     }
-
-    const h = Handshake.parse(S, stream, buf.static) catch |err| {
-        try Handshake.close(S, stream, err);
-        return;
-    };
-    try h.reply(S, stream);
 
     var handler = try H.init(h.method, h.url, client, context);
     defer {
@@ -166,6 +199,9 @@ fn doHandle(comptime H: type, comptime S: type, context: anytype, stream: S, buf
                 .text, .binary => {
                     try handler.handle(message);
                     state.fragment.reset();
+                    if (client.closed) {
+                        return;
+                    }
                 },
                 .pong => {
                     // TODO update aliveness?
@@ -642,9 +678,15 @@ fn testReadFrames(s: *t.Stream, expected: []Expect) !void {
     // test with various random  TCP fragmentations
     // our t.Stream automatically fragments the frames on the first
     // call to read. Note this is TCP fragmentation, not websocket fragmentation
-    while (count < 1) : (count += 1) {
+    const config = Config{
+        .path = "/",
+        .max_request_size = 512,
+        .buffer_size = TEST_BUFFER_SIZE,
+        .max_size = TEST_BUFFER_SIZE * 10,
+    };
+    while (count < 100) : (count += 1) {
         var stream = &s.clone();
-        handle(TestHandler, *t.Stream, context, stream, TEST_BUFFER_SIZE, TEST_BUFFER_SIZE * 10, t.allocator);
+        handle(TestHandler, *t.Stream, context, stream, config, t.allocator);
         try t.expectEqual(stream.closed, true);
 
         const r = Received.init(stream.received.items);
