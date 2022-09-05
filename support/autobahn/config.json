@@ -1,6 +1,6 @@
 {
 	"outdir": "/ab/reports/",
-	"servers": [{"agent": "websocket.zig", "url": "ws://127.0.0.1:9223"}],
+	"servers": [{"agent": "websocket.zig", "url": "ws://host.docker.internal:9223"}],
 	"cases": ["*"],
 	"exclude-cases": [],
 	"exclude-agent-cases": {}
