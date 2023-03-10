@@ -3,7 +3,7 @@ set -o errexit
 set -o nounset
 
 root=$(dirname $(realpath $BASH_SOURCE))
-zig run -fstage1 autobahn.zig &
+zig run autobahn.zig &
 pid=$!
 sleep 2 # give chance for socket to listen
 

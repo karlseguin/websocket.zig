@@ -1,6 +1,8 @@
 A zig websocket server.
 
-Should work with 0.9.0, 0.9.1, but is being worked on using 0.10-dev.
+Zig 0.11-dev is rapidly changing and constantly breaking features. I'll try to keep this up to date as much as possible. Note that 0.11-dev currently does not support async, so I've reverted to threads.
+
+See the [v0.10.1-compat](https://github.com/karlseguin/websocket.zig/tree/v0.10.1-compat) tag for a release that's compatible with Zig 0.10.1.
 
 Right now, this is just a fun side project. But every mandatory [Autobahn Testsuite](https://github.com/crossbario/autobahn-testsuite) case is passing. (Three fragmented UTF-8 are flagged as non-strict and as compression is not implemented, these are all flagged as "Unimplemented").
 
