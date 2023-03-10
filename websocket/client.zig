@@ -166,19 +166,20 @@ fn handleWebsocket(comptime H: type, comptime S: type, context: anytype, stream:
     try h.reply(S, stream);
 
     var buf = try Buffer.init(config.buffer_size, config.max_size, allocator);
+    var fragment = Fragmented.init(allocator);
     var state = &ReadState{
         .buf = &buf,
-        .fragment = &Fragmented.init(allocator),
+        .fragment = &fragment,
     };
 
-    const client = &C(S){ .stream = stream };
+    var client = C(S){ .stream = stream };
 
     defer {
         buf.deinit();
         state.fragment.deinit();
     }
 
-    var handler = try H.init(h.method, h.url, client, context);
+    var handler = try H.init(h.method, h.url, &client, context);
     defer {
         handler.close();
     }
@@ -473,7 +474,8 @@ const TestHandler = struct {
 };
 
 test "mask" {
-    const random = t.getRandom().random();
+    var r = t.getRandom();
+    const random = r.random();
     const mask = [4]u8{ 10, 20, 55, 200 };
 
     var original = try t.allocator.alloc(u8, 10000);
@@ -499,16 +501,18 @@ test "mask" {
 test "read messages" {
     {
         // simple small message
-        var expected = .{Expect.text("over 9000!")};
-        try testReadFrames(t.Stream.handshake().textFrame(true, "over 9000!"), &expected);
+        var expected = [_]Expect{Expect.text("over 9000!")};
+        var stream = t.Stream.handshake();
+        try testReadFrames(stream.textFrame(true, "over 9000!"), expected[0..]);
     }
 
     {
         // single message exactly TEST_BUFFER_SIZE
         // header will be 8 bytes, so we make the messae TEST_BUFFER_SIZE - 8 bytes
         const msg = [_]u8{'a'} ** (TEST_BUFFER_SIZE - 8);
-        var expected = .{Expect.text(msg[0..])};
-        try testReadFrames(t.Stream.handshake().textFrame(true, msg[0..]), &expected);
+        var expected = [_]Expect{Expect.text(msg[0..])};
+        var stream = t.Stream.handshake();
+        try testReadFrames(stream.textFrame(true, msg[0..]), expected[0..]);
     }
 
     {
@@ -516,26 +520,29 @@ test "read messages" {
         // header is 8 bytes, so if we make our message TEST_BUFFER_SIZE - 7, we'll
         // end up with a message which is exactly 1 byte larger than TEST_BUFFER_SIZE
         const msg = [_]u8{'a'} ** (TEST_BUFFER_SIZE - 7);
-        var expected = .{Expect.text(msg[0..])};
-        try testReadFrames(t.Stream.handshake().textFrame(true, msg[0..]), &expected);
+        var expected = [_]Expect{Expect.text(msg[0..])};
+        var stream = t.Stream.handshake();
+        try testReadFrames(stream.textFrame(true, msg[0..]), expected[0..]);
     }
 
     {
         // single message that is much bigger than TEST_BUFFER_SIZE
         const msg = [_]u8{'a'} ** (TEST_BUFFER_SIZE * 2);
-        var expected = .{Expect.text(msg[0..])};
-        try testReadFrames(t.Stream.handshake().textFrame(true, msg[0..]), &expected);
+        var expected = [1]Expect{Expect.text(msg[0..])};
+        var stream = t.Stream.handshake();
+        try testReadFrames(stream.textFrame(true, msg[0..]), expected[0..]);
     }
 
     {
         // multiple small messages
-        var expected = .{ Expect.text("over"), Expect.text(" "), Expect.pong(""), Expect.text("9000"), Expect.text("!") };
-        try testReadFrames(t.Stream.handshake()
+        var expected = [_]Expect{ Expect.text("over"), Expect.text(" "), Expect.pong(""), Expect.text("9000"), Expect.text("!") };
+        var stream = t.Stream.handshake();
+        try testReadFrames(stream
             .textFrame(true, "over")
             .textFrame(true, " ")
             .ping()
             .textFrame(true, "9000")
-            .textFrame(true, "!"), &expected);
+            .textFrame(true, "!"), expected[0..]);
     }
 
     {
@@ -545,124 +552,136 @@ test "read messages" {
         // but don't fit in a single buffer)
         const msg1 = [_]u8{'a'} ** (TEST_BUFFER_SIZE - 100);
         const msg2 = [_]u8{'b'} ** 200;
-        var expected = .{ Expect.text(msg1[0..]), Expect.text(msg2[0..]) };
-        try testReadFrames(t.Stream.handshake()
+        var expected = [_]Expect{ Expect.text(msg1[0..]), Expect.text(msg2[0..]) };
+        var stream = t.Stream.handshake();
+        try testReadFrames(stream
             .textFrame(true, msg1[0..])
-            .textFrame(true, msg2[0..]), &expected);
+            .textFrame(true, msg2[0..]), expected[0..]);
     }
 
     {
         // two messages, the first bigger than TEST_BUFFER_SIZE, the second smaller
         const msg1 = [_]u8{'a'} ** (TEST_BUFFER_SIZE + 100);
         const msg2 = [_]u8{'b'} ** 200;
-        var expected = .{ Expect.text(msg1[0..]), Expect.text(msg2[0..]) };
-        try testReadFrames(t.Stream.handshake()
+        var expected = [_]Expect{ Expect.text(msg1[0..]), Expect.text(msg2[0..]) };
+        var stream = t.Stream.handshake();
+        try testReadFrames(stream
             .textFrame(true, msg1[0..])
-            .textFrame(true, msg2[0..]), &expected);
+            .textFrame(true, msg2[0..]), expected[0..]);
     }
 
     {
         // Simple fragmented (websocket fragementation)
-        var expected = .{Expect.text("over 9000!")};
-        try testReadFrames(t.Stream.handshake()
+        var expected = [_]Expect{Expect.text("over 9000!")};
+        var stream = t.Stream.handshake();
+        try testReadFrames(stream
             .textFrame(false, "over")
-            .cont(true, " 9000!"), &expected);
+            .cont(true, " 9000!"), expected[0..]);
     }
 
     {
         // large fragmented (websocket fragementation)
         const msg = [_]u8{'a'} ** (TEST_BUFFER_SIZE * 2 + 600);
-        var expected = .{Expect.text(msg[0..])};
-        try testReadFrames(t.Stream.handshake()
+        var expected  = [_]Expect{Expect.text(msg[0..])};
+        var stream = t.Stream.handshake();
+        try testReadFrames(stream
             .textFrame(false, msg[0 .. TEST_BUFFER_SIZE + 100])
-            .cont(true, msg[TEST_BUFFER_SIZE + 100 ..]), &expected);
+            .cont(true, msg[TEST_BUFFER_SIZE + 100 ..]), expected[0..]);
     }
 
     {
         // Fragmented with control in between
-        var expected = .{ Expect.pong(""), Expect.pong(""), Expect.text("over 9000!") };
-        try testReadFrames(t.Stream.handshake()
+        var expected = [_]Expect{ Expect.pong(""), Expect.pong(""), Expect.text("over 9000!") };
+        var stream = t.Stream.handshake();
+        try testReadFrames(stream
             .textFrame(false, "over")
             .ping()
             .cont(false, " ")
             .ping()
-            .cont(true, "9000!"), &expected);
+            .cont(true, "9000!"), expected[0..]);
     }
 
     {
         // Large Fragmented with control in between
         const msg = [_]u8{'b'} ** (TEST_BUFFER_SIZE * 2 + 600);
-        var expected = .{ Expect.pong(""), Expect.pong(""), Expect.text(msg[0..]) };
-        try testReadFrames(t.Stream.handshake()
+        var expected = [_]Expect{ Expect.pong(""), Expect.pong(""), Expect.text(msg[0..]) };
+        var stream = t.Stream.handshake();
+        try testReadFrames(stream
             .textFrame(false, msg[0 .. TEST_BUFFER_SIZE + 100])
             .ping()
             .cont(false, msg[TEST_BUFFER_SIZE + 100 .. TEST_BUFFER_SIZE + 110])
             .ping()
-            .cont(true, msg[TEST_BUFFER_SIZE + 110 ..]), &expected);
+            .cont(true, msg[TEST_BUFFER_SIZE + 110 ..]), expected[0..]);
     }
 
     {
         // Empty fragmented messages
-        var expected = .{Expect.text("")};
-        try testReadFrames(t.Stream.handshake()
+        var expected = [_]Expect{Expect.text("")};
+        var stream = t.Stream.handshake();
+        try testReadFrames(stream
             .textFrame(false, "")
             .cont(false, "")
-            .cont(true, ""), &expected);
+            .cont(true, ""), expected[0..]);
     }
 
     {
         // max-size control
         const msg = [_]u8{'z'} ** 125;
-        var expected = .{Expect.pong(msg[0..])};
-        try testReadFrames(t.Stream.handshake()
-            .pingPayload(msg[0..]), &expected);
+        var expected = [_]Expect{Expect.pong(msg[0..])};
+        var stream = t.Stream.handshake();
+        try testReadFrames(stream.pingPayload(msg[0..]), expected[0..]);
     }
 }
 
 test "readFrame erros" {
     {
         // Nested non-control fragmented (websocket fragementation)
-        var expected = .{};
-        try testReadFrames(t.Stream.handshake()
+        var expected = [_]Expect{};
+        var s = t.Stream.handshake();
+        try testReadFrames(s
             .textFrame(false, "over")
-            .textFrame(false, " 9000!"), &expected);
+            .textFrame(false, " 9000!"), expected[0..]);
     }
 
     {
         // Nested non-control fragmented FIN (websocket fragementation)
-        var expected = .{};
-        try testReadFrames(t.Stream.handshake()
+        var expected = [_]Expect{};
+        var s = t.Stream.handshake();
+        try testReadFrames(s
             .textFrame(false, "over")
-            .textFrame(true, " 9000!"), &expected);
+            .textFrame(true, " 9000!"), expected[0..]);
     }
 
     {
         // control too big
         const msg = [_]u8{'z'} ** 126;
-        var expected = .{Expect.close(CLOSE_PROTOCOL_ERROR)};
-        try testReadFrames(t.Stream.handshake()
-            .pingPayload(msg[0..]), &expected);
+        var expected = [_]Expect{Expect.close(CLOSE_PROTOCOL_ERROR)};
+        var s = t.Stream.handshake();
+        try testReadFrames(s.pingPayload(msg[0..]), expected[0..]);
     }
 
     {
         // reserved bit1
-        var expected = .{Expect.close(CLOSE_PROTOCOL_ERROR)};
-        var s = t.Stream.handshake().textFrameReserved(true, "over9000", 64);
-        try testReadFrames(s, &expected);
+        var expected = [_]Expect{Expect.close(CLOSE_PROTOCOL_ERROR)};
+        var s = t.Stream.handshake();
+        _ = s.textFrameReserved(true, "over9000", 64);
+        try testReadFrames(&s, expected[0..]);
     }
 
     {
         // reserved bit2
-        var expected = .{Expect.close(CLOSE_PROTOCOL_ERROR)};
-        var s = t.Stream.handshake().textFrameReserved(true, "over9000", 32);
-        try testReadFrames(s, &expected);
+        var expected = [_]Expect{Expect.close(CLOSE_PROTOCOL_ERROR)};
+        var s = t.Stream.handshake();
+        _ = s.textFrameReserved(true, "over9000", 32);
+        try testReadFrames(&s, expected[0..]);
     }
 
     {
         // reserved bit3
-        var expected = .{Expect.close(CLOSE_PROTOCOL_ERROR)};
-        var s = t.Stream.handshake().textFrameReserved(true, "over9000", 16);
-        try testReadFrames(s, &expected);
+        var expected = [_]Expect{Expect.close(CLOSE_PROTOCOL_ERROR)};
+        var s = t.Stream.handshake();
+        _ = s.textFrameReserved(true, "over9000", 16);
+        try testReadFrames(&s, expected[0..]);
     }
 }
 
@@ -685,8 +704,8 @@ fn testReadFrames(s: *t.Stream, expected: []Expect) !void {
         .max_size = TEST_BUFFER_SIZE * 10,
     };
     while (count < 100) : (count += 1) {
-        var stream = &s.clone();
-        handle(TestHandler, *t.Stream, context, stream, config, t.allocator);
+        var stream = s.clone();
+        handle(TestHandler, *t.Stream, context, &stream, config, t.allocator);
         try t.expectEqual(stream.closed, true);
 
         const r = Received.init(stream.received.items);

@@ -147,173 +147,186 @@ pub const Buffer = struct {
 
 test "exact read into static with no overflow" {
     // exact read into static with no overflow
-    var s = t.Stream.init().add("hello1");
+    var s = t.Stream.init();
+    _ = s.add("hello1");
     defer s.deinit();
 
     var b = try Buffer.init(20, 20, t.allocator);
     defer b.deinit();
 
-    try t.expectEqual(true, try b.read(*t.Stream, s, 6));
+    try t.expectEqual(true, try b.read(*t.Stream, &s, 6));
     try t.expectString("hello1", b.message());
     try t.expectString("hello1", b.message());
 }
 
 test "overread into static with no overflow" {
-    var s = t.Stream.init().add("hello1world");
+    var s = t.Stream.init();
+    _ = s.add("hello1world");
     defer s.deinit();
 
     var b = try Buffer.init(20, 20, t.allocator);
     defer b.deinit();
 
-    try t.expectEqual(true, try b.read(*t.Stream, s, 6));
+    try t.expectEqual(true, try b.read(*t.Stream, &s, 6));
     try t.expectString("hello1", b.message());
     try t.expectString("hello1", b.message());
     b.next();
-    try t.expectEqual(true, try b.read(*t.Stream, s, 5));
+    try t.expectEqual(true, try b.read(*t.Stream, &s, 5));
     try t.expectString("world", b.message());
 }
 
 test "incremental read of message" {
-    var s = t.Stream.init().add("12345");
+    var s = t.Stream.init();
+    _ = s.add("12345");
     defer s.deinit();
 
     var b = try Buffer.init(20, 20, t.allocator);
     defer b.deinit();
 
-    try t.expectEqual(true, try b.read(*t.Stream, s, 2));
+    try t.expectEqual(true, try b.read(*t.Stream, &s, 2));
     try t.expectString("12", b.message());
 
-    try t.expectEqual(true, try b.read(*t.Stream, s, 5));
+    try t.expectEqual(true, try b.read(*t.Stream, &s, 5));
     try t.expectString("12345", b.message());
 }
 
 test "reads with overflow" {
-    var s = t.Stream.init().add("hellow").add("orld!");
+    var s = t.Stream.init();
+    _ = s.add("hellow").add("orld!");
     defer s.deinit();
 
     var b = try Buffer.init(6, 5, t.allocator);
     defer b.deinit();
 
-    try t.expectEqual(true, try b.read(*t.Stream, s, 5));
+    try t.expectEqual(true, try b.read(*t.Stream, &s, 5));
     try t.expectString("hello", b.message());
     try t.expectString("hello", b.message());
     b.next();
-    try t.expectEqual(true, try b.read(*t.Stream, s, 6));
+    try t.expectEqual(true, try b.read(*t.Stream, &s, 6));
     try t.expectString("world!", b.message());
 }
 
 test "reads too learge" {
-    var s = t.Stream.init().add("12356");
+    var s = t.Stream.init();
+    _ = s.add("12356");
     defer s.deinit();
 
     var b1 = try Buffer.init(5, 5, t.allocator);
     defer b1.deinit();
-    try t.expectError(BufferError.TooLarge, b1.read(*t.Stream, s, 6));
+    try t.expectError(BufferError.TooLarge, b1.read(*t.Stream, &s, 6));
 
     var b2 = try Buffer.init(5, 10, t.allocator);
     defer b2.deinit();
-    try t.expectError(BufferError.TooLarge, b2.read(*t.Stream, s, 11));
+    try t.expectError(BufferError.TooLarge, b2.read(*t.Stream, &s, 11));
 }
 
 test "reads message larger than static" {
-    var s = t.Stream.init().add("hello world");
+    var s = t.Stream.init();
+    _ = s.add("hello world");
     defer s.deinit();
 
     var b = try Buffer.init(5, 20, t.allocator);
     defer b.deinit();
-    try t.expectEqual(true, try b.read(*t.Stream, s, 11));
+    try t.expectEqual(true, try b.read(*t.Stream, &s, 11));
     try t.expectString("hello world", b.message());
 }
 
 test "reads fragmented message larger than static" {
-    var s = t.Stream.init().add("hello").add(" ").add("world!").add("nice");
+    var s = t.Stream.init();
+    _ = s.add("hello").add(" ").add("world!").add("nice");
     defer s.deinit();
 
     var b = try Buffer.init(5, 20, t.allocator);
     defer b.deinit();
-    try t.expectEqual(true, try b.read(*t.Stream, s, 12));
+    try t.expectEqual(true, try b.read(*t.Stream, &s, 12));
     try t.expectString("hello world!", b.message());
     try t.expectString("hello world!", b.message());
     b.next();
-    try t.expectEqual(true, try b.read(*t.Stream, s, 4));
+    try t.expectEqual(true, try b.read(*t.Stream, &s, 4));
     try t.expectString("nice", b.message());
 }
 
 test "reads large fragmented message after small message" {
-    var s = t.Stream.init().add("nice").add("hello").add(" ").add("world!");
+    var s = t.Stream.init();
+    _ = s.add("nice").add("hello").add(" ").add("world!");
     defer s.deinit();
 
     var b = try Buffer.init(5, 20, t.allocator);
     defer b.deinit();
-    try t.expectEqual(true, try b.read(*t.Stream, s, 4));
+    try t.expectEqual(true, try b.read(*t.Stream, &s, 4));
     try t.expectString("nice", b.message());
     b.next();
-    try t.expectEqual(true, try b.read(*t.Stream, s, 12));
+    try t.expectEqual(true, try b.read(*t.Stream, &s, 12));
     try t.expectString("hello world!", b.message());
     try t.expectString("hello world!", b.message());
 }
 
 test "reads large fragmented message fragmented with small message" {
-    var s = t.Stream.init().add("nicehel").add("lo").add(" ").add("world!");
+    var s = t.Stream.init();
+    _ = s.add("nicehel").add("lo").add(" ").add("world!");
     defer s.deinit();
 
     var b = try Buffer.init(7, 20, t.allocator);
     defer b.deinit();
-    try t.expectEqual(true, try b.read(*t.Stream, s, 4));
+    try t.expectEqual(true, try b.read(*t.Stream, &s, 4));
     try t.expectString("nice", b.message());
     b.next();
-    try t.expectEqual(true, try b.read(*t.Stream, s, 12));
+    try t.expectEqual(true, try b.read(*t.Stream, &s, 12));
     try t.expectString("hello world!", b.message());
     try t.expectString("hello world!", b.message());
 }
 
 test "reads large fragmented message fragmented with small message" {
-    var s = t.Stream.init().add("nicehel").add("lo").add(" ").add("world!");
+    var s = t.Stream.init();
+    _ = s.add("nicehel").add("lo").add(" ").add("world!");
     defer s.deinit();
 
     var b = try Buffer.init(7, 20, t.allocator);
     defer b.deinit();
-    try t.expectEqual(true, try b.read(*t.Stream, s, 4));
+    try t.expectEqual(true, try b.read(*t.Stream, &s, 4));
     try t.expectString("nice", b.message());
     b.next();
-    try t.expectEqual(true, try b.read(*t.Stream, s, 12));
+    try t.expectEqual(true, try b.read(*t.Stream, &s, 12));
     try t.expectString("hello world!", b.message());
     try t.expectString("hello world!", b.message());
 }
 
 test "reads large fragmented message with a small message when static buffer is smaller than read size" {
-    var s = t.Stream.init().add("nicehel").add("lo").add(" ").add("world!");
+    var s = t.Stream.init();
+    _= s.add("nicehel").add("lo").add(" ").add("world!");
     defer s.deinit();
 
     var b = try Buffer.init(5, 20, t.allocator);
     defer b.deinit();
-    try t.expectEqual(true, try b.read(*t.Stream, s, 4));
+    try t.expectEqual(true, try b.read(*t.Stream, &s, 4));
     try t.expectString("nice", b.message());
     b.next();
-    try t.expectEqual(true, try b.read(*t.Stream, s, 12));
+    try t.expectEqual(true, try b.read(*t.Stream, &s, 12));
     try t.expectString("hello world!", b.message());
     try t.expectString("hello world!", b.message());
 }
 
 test "reads large fragmented message" {
-    var s = t.Stream.init().add("0").add("123456").add("789ABCabc").add("defghijklmn");
+    var s = t.Stream.init();
+    _ = s.add("0").add("123456").add("789ABCabc").add("defghijklmn");
     defer s.deinit();
 
     var b = try Buffer.init(5, 20, t.allocator);
     defer b.deinit();
-    try t.expectEqual(true, try b.read(*t.Stream, s, 1));
+    try t.expectEqual(true, try b.read(*t.Stream, &s, 1));
     try t.expectString("0", b.message());
 
-    try t.expectEqual(true, try b.read(*t.Stream, s, 13));
+    try t.expectEqual(true, try b.read(*t.Stream, &s, 13));
     try t.expectString("0123456789ABC", b.message());
     b.next();
-    try t.expectEqual(true, try b.read(*t.Stream, s, 14));
+    try t.expectEqual(true, try b.read(*t.Stream, &s, 14));
     try t.expectString("abcdefghijklmn", b.message());
 }
 
 test "fuzz" {
     const allocator = t.allocator;
-    const random = t.getRandom().random();
+    var r = t.getRandom();
+    const random = r.random();
 
     // NOTE: there's an inner fuzzing loop also.
     // This loop generates 1 set of messages/expectations. The inner loop
@@ -348,11 +361,11 @@ test "fuzz" {
         // and tries multiple time with random fragmentation
         var inner: usize = 0;
         while (inner < 10) : (inner += 1) {
-            var s = &stream.clone();
+            var s = stream.clone();
             var b = try Buffer.init(40, 101, t.allocator);
 
             for (messages) |m| {
-                try t.expectEqual(true, try b.read(*t.Stream, s, m.len));
+                try t.expectEqual(true, try b.read(*t.Stream, &s, m.len));
                 try t.expectString(m, b.message());
                 b.next();
             }

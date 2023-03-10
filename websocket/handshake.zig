@@ -140,7 +140,8 @@ test "parse" {
 
     // fuz tests
     {
-        const random = t.getRandom().random();
+        var r = t.getRandom();
+        var random = r.random();
         var count: usize = 0;
         const valid = "GET / HTTP/1.1\r\nsec-websocket-key: 1139329\r\nConnection: upgrade\r\nUpgrade:WebSocket\r\nSEC-WEBSOCKET-VERSION:   13  \r\n\r\n";
         while (count < 5000) : (count += 1) {

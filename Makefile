@@ -1,8 +1,6 @@
-F="websocket.zig"
-
 .PHONY: t
 t:
-	zig test ${F}
+	zig build test
 
 .PHONY: ab
 ab:

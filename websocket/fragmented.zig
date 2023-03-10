@@ -67,7 +67,7 @@ pub const Fragmented = struct {
 
 test "fragmented" {
     {
-        var f = &Fragmented.init(t.allocator);
+        var f = Fragmented.init(t.allocator);
         defer f.reset();
 
         try f.new(MessageType.text, "hello");
@@ -84,7 +84,8 @@ test "fragmented" {
         var count: usize = 0;
         var data: [100]u8 = undefined;
         var buf = data[0..];
-        const random = std.rand.DefaultPrng.init(0).random();
+        var r = std.rand.DefaultPrng.init(0);
+        var random = r.random();
 
         var f = Fragmented.init(t.allocator);
         while (count < 5000) : (count += 1) {
