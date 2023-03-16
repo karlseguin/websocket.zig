@@ -1,6 +1,7 @@
 const std = @import("std");
 const client = @import("./client.zig");
 
+const os = std.os;
 const net = std.net;
 const Loop = std.event.Loop;
 
@@ -21,6 +22,13 @@ pub fn listen(comptime H: type, context: anytype, allocator: Allocator, config: 
 	defer server.deinit();
 
 	try server.listen(net.Address.parseIp(config.address, config.port) catch unreachable);
+	// TODO: I believe this should work, but it currently doesn't on 0.11-dev. Instead I have to
+	// hardcode 1 for the setsocopt NODELAY option
+	// if (@hasDecl(os.TCP, "NODELAY")) {
+	// 	try os.setsockopt(server.sockfd.?, os.IPPROTO.TCP, os.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1)));
+	// }
+	try os.setsockopt(server.sockfd.?, os.IPPROTO.TCP, 1, &std.mem.toBytes(@as(c_int, 1)));
+
 	std.log.info("listening at {}", .{server.listen_address});
 	const client_config = client.Config{
 		.path = config.path,
