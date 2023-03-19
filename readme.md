@@ -14,4 +14,5 @@ When starting the server, a `buffer_size` and `max_size` must be specified. Each
 
 Websockets have their own fragmentation "feature" (not the same as TCP fragmentation) which is not handled efficiently at this time (but, I don't think this websocket fragmentation is being used at all).
 
-(There will be addition changes to how buffers behave)
+## http.zig
+I'm also working on an HTTP 1.1 server for zig: [https://github.com/karlseguin/http.zig](https://github.com/karlseguin/http.zig).
