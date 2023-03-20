@@ -8,6 +8,7 @@ const Request = @import("request.zig").Request;
 const mem = std.mem;
 const net = std.net;
 const ascii = std.ascii;
+const Stream = if (builtin.is_test) *t.Stream else std.net.Stream;
 
 const HandshakeError = error{
 	Empty,
@@ -81,8 +82,8 @@ pub const Handshake = struct {
 		return Handshake{ .key = key, .url = url, .method = method };
 	}
 
-	pub fn close(comptime S: type, stream: S, err: anyerror) !void {
-		try stream.write("HTTP/1.1 400 Invalid\r\nerror: ");
+	pub fn close(stream: Stream, err: anyerror) !void {
+		try stream.writeAll("HTTP/1.1 400 Invalid\r\nerror: ");
 		const s = switch (err) {
 			error.Empty => "empty",
 			error.InvalidProtocol => "invalidprotocol",
@@ -94,11 +95,11 @@ pub const Handshake = struct {
 			error.MissingHeaders => "missingheaders",
 			else => "unknown",
 		};
-		try stream.write(s);
-		try stream.write("\r\n\r\n");
+		try stream.writeAll(s);
+		try stream.writeAll("\r\n\r\n");
 	}
 
-	pub fn reply(self: Handshake, comptime S: type, stream: S) !void {
+	pub fn reply(self: Handshake, stream: Stream) !void {
 		var h: [20]u8 = undefined;
 		var accept_key: [40]u8 = undefined;
 
@@ -107,9 +108,9 @@ pub const Handshake = struct {
 		hasher.update("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
 		hasher.final(&h);
 
-		try stream.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: upgrade\r\nSec-Websocket-Accept: ");
-		try stream.write(std.base64.standard.Encoder.encode(accept_key[0..], h[0..]));
-		try stream.write("\r\n\r\n");
+		try stream.writeAll("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: upgrade\r\nSec-Websocket-Accept: ");
+		try stream.writeAll(std.base64.standard.Encoder.encode(accept_key[0..], h[0..]));
+		try stream.writeAll("\r\n\r\n");
 	}
 };
 
@@ -151,7 +152,7 @@ test "parse" {
 				_ = s.add(data[0..l]);
 				data = data[l..];
 			}
-			const request_buf = Request.read(*t.Stream, &s, buf) catch unreachable;
+			const request_buf = Request.read(&s, buf) catch unreachable;
 			const h = Handshake.parse(request_buf) catch unreachable;
 			try t.expectString("1139329", h.key);
 			try t.expectString("/", h.url);
@@ -166,6 +167,6 @@ fn testHandshake(input: []const u8, buf: []u8) !Handshake {
 	_ = s.add(input);
 
 	defer s.deinit();
-	const request_buf = try Request.read(*t.Stream, &s, buf);
+	const request_buf = try Request.read( &s, buf);
 	return Handshake.parse(request_buf);
 }

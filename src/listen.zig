@@ -1,9 +1,13 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const client = @import("./client.zig");
 
 const os = std.os;
 const net = std.net;
 const Loop = std.event.Loop;
+
+// const Stream = if (builtin.is_test) *t.Stream else std.net.Stream;
+// const Conn = if (builtin.is_test) *t.Stream else std.net.StreamServer.Connection;
 
 pub const Config = struct {
 	port: u16,
@@ -39,8 +43,7 @@ pub fn listen(comptime H: type, context: anytype, allocator: Allocator, config: 
 
 	while (true) {
 		if (server.accept()) |conn| {
-			const stream = client.NetStream{ .stream = conn.stream };
-			const args = .{ H, client.NetStream, context, stream, client_config, allocator };
+			const args = .{ H, context, conn, client_config, allocator };
 			if (comptime std.io.is_async) {
 				try Loop.instance.?.runDetached(allocator, client.handle, args);
 			} else {

@@ -10,6 +10,9 @@ const Request = @import("request.zig").Request;
 const Handshake = @import("handshake.zig").Handshake;
 const Fragmented = @import("fragmented.zig").Fragmented;
 
+const Stream = if (builtin.is_test) *t.Stream else std.net.Stream;
+const Conn = if (builtin.is_test) *t.Stream else std.net.StreamServer.Connection;
+
 pub const TEXT_FRAME = 128 | 1;
 pub const BIN_FRAME = 128 | 2;
 pub const CLOSE_FRAME = 128 | 8;
@@ -62,34 +65,6 @@ pub const Error = error{
 	ReservedFlags,
 };
 
-// Wrap a std.net.Stream
-// we use this so that we can test with a t.Stream
-pub const NetStream = struct {
-	stream: std.net.Stream,
-
-	pub fn read(self: NetStream, buffer: []u8) !usize {
-		return self.stream.read(buffer);
-	}
-
-	pub fn close(self: NetStream) void {
-		return self.stream.close();
-	}
-
-	// Taken from io/Writer.zig (for writeAll) which calls the net.zig's Stream.write
-	// function in this loop
-	pub fn write(self: NetStream, data: []const u8) !void {
-		var index: usize = 0;
-		const h = self.stream.handle;
-		while (index != data.len) {
-			if (comptime std.io.is_async) {
-				index += try std.event.Loop.instance.?.write(h, data[index..], false);
-			} else {
-				index += try std.os.write(h, data[index..]);
-			}
-		}
-	}
-};
-
 pub const Message = struct {
 	type: MessageType,
 	data: []const u8,
@@ -102,48 +77,43 @@ pub const Config = struct {
 	max_request_size: usize,
 };
 
-pub const Client = C(NetStream);
+pub const Client = struct {
+	stream: Stream,
+	closed: bool = false,
 
-// Only use this internally, for testing, when we want a client that's based
-// on our t.Stream instead of a net.Stream
-fn C(comptime S: type) type {
-	return struct {
-		stream: S,
-		closed: bool = false,
+	const Self = @This();
 
-		const Self = @This();
+	pub fn write(self: Self, data: []const u8) !void {
+		try writeFrame(self.stream, BIN_FRAME, data);
+	}
 
-		pub fn write(self: Self, data: []const u8) !void {
-			try writeFrame(S, self.stream, BIN_FRAME, data);
-		}
+	pub fn writeText(self: Self, data: []const u8) !void {
+		try writeFrame(self.stream, TEXT_FRAME, data);
+	}
 
-		pub fn writeText(self: Self, data: []const u8) !void {
-			try writeFrame(S, self.stream, TEXT_FRAME, data);
-		}
+	pub fn close(self: *Self) void {
+		self.closed = true;
+	}
+};
 
-		pub fn close(self: *Self) void {
-			self.closed = true;
-		}
-	};
-}
-
-pub fn handle(comptime H: type, comptime S: type, context: anytype, stream: S, config: Config, allocator: Allocator) void {
+pub fn handle(comptime H: type,context: anytype, conn: Conn, config: Config, allocator: Allocator) void {
+	const stream = if (comptime builtin.is_test) conn else conn.stream;
 	defer stream.close();
-	doHandle(H, S, context, stream, config, allocator) catch {
+	doHandle(H, context, stream, config, allocator) catch {
 		return;
 	};
 }
 
-pub fn doHandle(comptime H: type, comptime S: type, context: anytype, stream: S, config: Config, allocator: Allocator) !void {
+pub fn doHandle(comptime H: type, context: anytype, stream: Stream, config: Config, allocator: Allocator) !void {
 	var request_buf = try allocator.alloc(u8, config.max_request_size);
 	defer allocator.free(request_buf);
-	const request = Request.read(S, stream, request_buf) catch |err| {
-		try Request.close(S, stream, err);
+	const request = Request.read(stream, request_buf) catch |err| {
+		try Request.close(stream, err);
 		return;
 	};
 
 	if (isWebsocketRequest(request, config.path)) {
-		try handleWebsocket(H, S, context, stream, request, config, allocator);
+		try handleWebsocket(H, context, stream, request, config, allocator);
 	}
 }
 
@@ -160,12 +130,12 @@ fn isWebsocketRequest(request: []u8, targetPath: []const u8) bool {
 	return ascii.eqlIgnoreCase(targetPath, path);
 }
 
-fn handleWebsocket(comptime H: type, comptime S: type, context: anytype, stream: S, request: []u8, config: Config, allocator: Allocator) !void {
+fn handleWebsocket(comptime H: type, context: anytype, stream: Stream, request: []u8, config: Config, allocator: Allocator) !void {
 	const h = Handshake.parse(request) catch |err| {
-		try Handshake.close(S, stream, err);
+		try Handshake.close(stream, err);
 		return;
 	};
-	try h.reply(S, stream);
+	try h.reply(stream);
 
 	var buf = try Buffer.init(config.buffer_size, config.max_size, allocator);
 	var fragment = Fragmented.init(allocator);
@@ -174,7 +144,7 @@ fn handleWebsocket(comptime H: type, comptime S: type, context: anytype, stream:
 		.fragment = &fragment,
 	};
 
-	var client = C(S){ .stream = stream };
+	var client = Client{ .stream = stream };
 
 	defer {
 		buf.deinit();
@@ -188,10 +158,10 @@ fn handleWebsocket(comptime H: type, comptime S: type, context: anytype, stream:
 
 	while (true) {
 		buf.next();
-		const result = readFrame(S, stream, state) catch |err| {
+		const result = readFrame(stream, state) catch |err| {
 			switch (err) {
-				Error.LargeControl => try stream.write(CLOSE_PROTOCOL_ERROR),
-				Error.ReservedFlags => try stream.write(CLOSE_PROTOCOL_ERROR),
+				Error.LargeControl => try stream.writeAll(CLOSE_PROTOCOL_ERROR),
+				Error.ReservedFlags => try stream.writeAll(CLOSE_PROTOCOL_ERROR),
 				else => {},
 			}
 			return;
@@ -209,9 +179,9 @@ fn handleWebsocket(comptime H: type, comptime S: type, context: anytype, stream:
 				.pong => {
 					// TODO update aliveness?
 				},
-				.ping => try handlePong(S, stream, message.data),
+				.ping => try handlePong(stream, message.data),
 				.close => {
-					try handleClose(S, stream, message.data);
+					try handleClose(stream, message.data);
 					return;
 				},
 				else => unreachable,
@@ -220,7 +190,7 @@ fn handleWebsocket(comptime H: type, comptime S: type, context: anytype, stream:
 	}
 }
 
-fn readFrame(comptime S: type, stream: S, state: *ReadState) !?Message {
+fn readFrame(stream: Stream, state: *ReadState) !?Message {
 	var buf = state.buf;
 	var fragment = state.fragment;
 
@@ -233,7 +203,7 @@ fn readFrame(comptime S: type, stream: S, state: *ReadState) !?Message {
 	var message_type = MessageType.invalid;
 
 	while (true) {
-		if ((try buf.read(S, stream, data_needed)) == false) {
+		if ((try buf.read(stream, data_needed)) == false) {
 			return Error.Closed;
 		}
 
@@ -378,7 +348,7 @@ fn applyMaskSimple(mask: []const u8, payload: []u8) void {
 	}
 }
 
-fn writeFrame(comptime S: type, stream: S, op_code: u8, data: []const u8) !void {
+fn writeFrame(stream: Stream, op_code: u8, data: []const u8) !void {
 	const l = data.len;
 
 	// maximum possible prefix length. op_code + length_type + 8byte length
@@ -387,12 +357,12 @@ fn writeFrame(comptime S: type, stream: S, op_code: u8, data: []const u8) !void 
 
 	if (l <= 125) {
 		buf[1] = @intCast(u8, l);
-		try stream.write(buf[0..2]);
+		try stream.writeAll(buf[0..2]);
 	} else if (l < 65536) {
 		buf[1] = 126;
 		buf[2] = @intCast(u8, (l >> 8) & 0xFF);
 		buf[3] = @intCast(u8, l & 0xFF);
-		try stream.write(buf[0..4]);
+		try stream.writeAll(buf[0..4]);
 	} else {
 		buf[1] = 127;
 		buf[2] = @intCast(u8, (l >> 56) & 0xFF);
@@ -403,19 +373,19 @@ fn writeFrame(comptime S: type, stream: S, op_code: u8, data: []const u8) !void 
 		buf[7] = @intCast(u8, (l >> 16) & 0xFF);
 		buf[8] = @intCast(u8, (l >> 8) & 0xFF);
 		buf[9] = @intCast(u8, l & 0xFF);
-		try stream.write(buf[0..]);
+		try stream.writeAll(buf[0..]);
 	}
 	if (l > 0) {
-		try stream.write(data);
+		try stream.writeAll(data);
 	}
 }
 
 const EMPTY_PONG = ([2]u8{ PONG_FRAME, 0 })[0..];
-fn handlePong(comptime S: type, stream: S, data: []const u8) !void {
+fn handlePong(stream: Stream, data: []const u8) !void {
 	if (data.len == 0) {
-		try stream.write(EMPTY_PONG);
+		try stream.writeAll(EMPTY_PONG);
 	} else {
-		try writeFrame(S, stream, PONG_FRAME, data);
+		try writeFrame(stream, PONG_FRAME, data);
 	}
 }
 
@@ -423,40 +393,40 @@ fn handlePong(comptime S: type, stream: S, data: []const u8) !void {
 const CLOSE_NORMAL = ([_]u8{ CLOSE_FRAME, 2, 3, 232 })[0..]; // code: 1000
 const CLOSE_PROTOCOL_ERROR = ([_]u8{ CLOSE_FRAME, 2, 3, 234 })[0..]; //code: 1002
 
-fn handleClose(comptime S: type, stream: S, data: []const u8) !void {
+fn handleClose(stream: Stream, data: []const u8) !void {
 	const l = data.len;
 
 	if (l == 0) {
-		return try stream.write(CLOSE_NORMAL);
+		return try stream.writeAll(CLOSE_NORMAL);
 	}
 	if (l == 1) {
 		// close with a payload always has to have at least a 2-byte payload,
 		// since a 2-byte code is required
-		return try stream.write(CLOSE_PROTOCOL_ERROR);
+		return try stream.writeAll(CLOSE_PROTOCOL_ERROR);
 	}
 	const code = @intCast(u16, data[1]) | @intCast(u16, data[0]) << 8;
 	if (code < 1000 or code == 1004 or code == 1005 or code == 1006 or (code > 1013 and code < 3000)) {
-		return try stream.write(CLOSE_PROTOCOL_ERROR);
+		return try stream.writeAll(CLOSE_PROTOCOL_ERROR);
 	}
 
 	if (l == 2) {
-		return try stream.write(CLOSE_NORMAL);
+		return try stream.writeAll(CLOSE_NORMAL);
 	}
 
 	const payload = data[2..];
 	if (!std.unicode.utf8ValidateSlice(payload)) {
 		// if we have a payload, it must be UTF8 (why?!)
-		return try stream.write(CLOSE_PROTOCOL_ERROR);
+		return try stream.writeAll(CLOSE_PROTOCOL_ERROR);
 	}
-	return try stream.write(CLOSE_NORMAL);
+	return try stream.writeAll(CLOSE_NORMAL);
 }
 
 const TEST_BUFFER_SIZE = 512;
 const TestContext = struct {};
 const TestHandler = struct {
-	client: *C(*t.Stream),
+	client: *Client,
 
-	pub fn init(_: []const u8, _: []const u8, client: *C(*t.Stream), _: TestContext) !TestHandler {
+	pub fn init(_: []const u8, _: []const u8, client: *Client, _: TestContext) !TestHandler {
 		return TestHandler{
 			.client = client,
 		};
@@ -707,7 +677,7 @@ fn testReadFrames(s: *t.Stream, expected: []Expect) !void {
 	};
 	while (count < 100) : (count += 1) {
 		var stream = s.clone();
-		handle(TestHandler, *t.Stream, context, &stream, config, t.allocator);
+		handle(TestHandler, context, &stream, config, t.allocator);
 		try t.expectEqual(stream.closed, true);
 
 		const r = Received.init(stream.received.items);

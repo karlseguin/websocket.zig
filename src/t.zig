@@ -226,7 +226,7 @@ pub const Stream = struct {
 	}
 
 	// store messages that are written to the stream
-	pub fn write(self: *Stream, data: []const u8) !void {
+	pub fn writeAll(self: *Stream, data: []const u8) !void {
 		std.debug.assert(!self.closed);
 		var copy = allocator.alloc(u8, data.len) catch unreachable;
 		mem.copy(u8, copy, data);

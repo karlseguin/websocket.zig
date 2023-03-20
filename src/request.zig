@@ -1,6 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const t = @import("t.zig");
+
 const mem = std.mem;
+const Stream = if (builtin.is_test) *t.Stream else std.net.Stream;
 
 const RequestError = error{
 	Invalid,
@@ -8,7 +11,7 @@ const RequestError = error{
 };
 
 pub const Request = struct {
-	pub fn read(comptime S: type, stream: S, buf: []u8) ![]u8 {
+	pub fn read(stream: Stream, buf: []u8) ![]u8 {
 		@setRuntimeSafety(builtin.is_test);
 
 		var total: usize = 0;
@@ -29,14 +32,14 @@ pub const Request = struct {
 		}
 	}
 
-	pub fn close(comptime S: type, stream: S, err: anyerror) !void {
-		try stream.write("HTTP/1.1 400 Invalid\r\nerror: ");
+	pub fn close(stream: Stream, err: anyerror) !void {
+		try stream.writeAll("HTTP/1.1 400 Invalid\r\nerror: ");
 		const s = switch (err) {
 			error.Invalid => "invalid",
 			error.TooLarge => "toolarge",
 			else => "unknown",
 		};
-		try stream.write(s);
-		try stream.write("\r\n\r\n");
+		try stream.writeAll(s);
+		try stream.writeAll("\r\n\r\n");
 	}
 };
