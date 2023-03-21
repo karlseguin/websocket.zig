@@ -101,16 +101,24 @@ pub const Handshake = struct {
 
 	pub fn reply(self: Handshake, stream: Stream) !void {
 		var h: [20]u8 = undefined;
-		var accept_key: [40]u8 = undefined;
+		//"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: upgrade\r\nSec-Websocket-Accept: BASE64_ENCODED_KEY_HASH_PLACEHOLDER_000\r\n\r\n";
+		var buf = [_]u8{
+			'H','T','T','P','/','1','.','1',' ', '1','0','1',' ', 'S','w','i','t','c','h','i','n','g',' ','P','r','o','t','o','c','o','l','s', '\r','\n',
+			'U','p','g','r','a','d','e',':',' ','w','e','b','s','o','c','k','e','t','\r','\n',
+			'C','o','n','n','e','c','t','i','o','n',':',' ','u','p','g','r','a','d','e','\r','\n',
+			'S','e','c','-','W','e','b','s','o','c','k','e','t','-','A','c','c','e','p','t',':',' ',0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,'\r','\n',
+			'\r','\n'
+		};
+		const key_pos = buf.len - 32;
 
 		var hasher = std.crypto.hash.Sha1.init(.{});
 		hasher.update(self.key);
 		hasher.update("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
 		hasher.final(&h);
 
-		try stream.writeAll("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: upgrade\r\nSec-Websocket-Accept: ");
-		try stream.writeAll(std.base64.standard.Encoder.encode(accept_key[0..], h[0..]));
-		try stream.writeAll("\r\n\r\n");
+
+		_ = std.base64.standard.Encoder.encode(buf[key_pos..key_pos+28], h[0..]);
+		try stream.writeAll(&buf);
 	}
 };
 
@@ -121,7 +129,7 @@ fn toLower(str: []u8) []u8 {
 	return str;
 }
 
-test "parse" {
+test "handshake: parse" {
 	var buffer: [512]u8 = undefined;
 	var buf = buffer[0..];
 
@@ -159,6 +167,21 @@ test "parse" {
 			try t.expectString("GET", h.method);
 			s.deinit();
 		}
+	}
+}
+
+test "handshake: reply" {
+	var s = t.Stream.init();
+	defer s.deinit();
+
+	const h = Handshake{.key = "this is my key", .url = "", .method = ""};
+	try h.reply(&s);
+
+	var pos: usize = 0;
+	const expected = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: upgrade\r\nSec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n\r\n";
+	for (s.received.items) |chunk| {
+		try t.expectString(expected[pos..(pos+chunk.len)], chunk);
+		pos += chunk.len;
 	}
 }
 
