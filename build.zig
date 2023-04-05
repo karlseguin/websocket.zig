@@ -4,13 +4,9 @@ pub fn build(b: *std.Build) !void {
 	const target = b.standardTargetOptions(.{});
 	const optimize = b.standardOptimizeOption(.{});
 
-	const lib = b.addStaticLibrary(.{
-		.name = "wsz",
-		.root_source_file = .{ .path = "src/websocket.zig" },
-		.target = target,
-		.optimize = optimize,
+	_ = b.addModule("websocket", .{
+		.source_file = .{ .path = "src/websocket.zig" },
 	});
-	lib.install();
 
 	const lib_test = b.addTest(.{
 		.root_source_file = .{ .path = "src/websocket.zig" },
