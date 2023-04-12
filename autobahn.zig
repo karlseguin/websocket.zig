@@ -18,8 +18,9 @@ pub fn main() !void {
 
 		.path = "/",
 
-		// Maximum allowed request sizes. Allocated to parse the request.
-		// Only max_request_size will be allocated for non-websocket requests.
+		// Maximum allowed request size for the initial handshake.
+		// Allocated to parse the request. Only max_request_size will be allocated
+		// for non-websocket requests.
 		.max_request_size = 1024,
 
 		// On connection, each client will get buffer_size bytes allocated
