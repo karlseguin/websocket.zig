@@ -39,7 +39,7 @@ pub const Buffer = struct {
 
 	allocator: Allocator,
 
-	pub fn init(static_size: usize, max_size: usize, allocator: Allocator) !Buffer {
+	pub fn init(allocator: Allocator, static_size: usize, max_size: usize) !Buffer {
 		const static = try allocator.alloc(u8, static_size);
 		return Buffer{
 			.start = 0,
@@ -154,7 +154,7 @@ test "exact read into static with no overflow" {
 	_ = s.add("hello1");
 	defer s.deinit();
 
-	var b = try Buffer.init(20, 20, t.allocator);
+	var b = try Buffer.init(t.allocator, 20, 20);
 	defer b.deinit();
 
 	try t.expectEqual(true, try b.read(&s, 6));
@@ -167,7 +167,7 @@ test "overread into static with no overflow" {
 	_ = s.add("hello1world");
 	defer s.deinit();
 
-	var b = try Buffer.init(20, 20, t.allocator);
+	var b = try Buffer.init(t.allocator, 20, 20);
 	defer b.deinit();
 
 	try t.expectEqual(true, try b.read(&s, 6));
@@ -183,7 +183,7 @@ test "incremental read of message" {
 	_ = s.add("12345");
 	defer s.deinit();
 
-	var b = try Buffer.init(20, 20, t.allocator);
+	var b = try Buffer.init(t.allocator, 20, 20);
 	defer b.deinit();
 
 	try t.expectEqual(true, try b.read(&s, 2));
@@ -198,7 +198,7 @@ test "reads with overflow" {
 	_ = s.add("hellow").add("orld!");
 	defer s.deinit();
 
-	var b = try Buffer.init(6, 5, t.allocator);
+	var b = try Buffer.init(t.allocator, 6, 5);
 	defer b.deinit();
 
 	try t.expectEqual(true, try b.read(&s, 5));
@@ -214,11 +214,11 @@ test "reads too learge" {
 	_ = s.add("12356");
 	defer s.deinit();
 
-	var b1 = try Buffer.init(5, 5, t.allocator);
+	var b1 = try Buffer.init(t.allocator, 5, 5);
 	defer b1.deinit();
 	try t.expectError(BufferError.TooLarge, b1.read(&s, 6));
 
-	var b2 = try Buffer.init(5, 10, t.allocator);
+	var b2 = try Buffer.init(t.allocator, 5, 10);
 	defer b2.deinit();
 	try t.expectError(BufferError.TooLarge, b2.read(&s, 11));
 }
@@ -228,7 +228,7 @@ test "reads message larger than static" {
 	_ = s.add("hello world");
 	defer s.deinit();
 
-	var b = try Buffer.init(5, 20, t.allocator);
+	var b = try Buffer.init(t.allocator, 5, 20);
 	defer b.deinit();
 	try t.expectEqual(true, try b.read(&s, 11));
 	try t.expectString("hello world", b.message());
@@ -239,7 +239,7 @@ test "reads fragmented message larger than static" {
 	_ = s.add("hello").add(" ").add("world!").add("nice");
 	defer s.deinit();
 
-	var b = try Buffer.init(5, 20, t.allocator);
+	var b = try Buffer.init(t.allocator, 5, 20);
 	defer b.deinit();
 	try t.expectEqual(true, try b.read(&s, 12));
 	try t.expectString("hello world!", b.message());
@@ -254,7 +254,7 @@ test "reads large fragmented message after small message" {
 	_ = s.add("nice").add("hello").add(" ").add("world!");
 	defer s.deinit();
 
-	var b = try Buffer.init(5, 20, t.allocator);
+	var b = try Buffer.init(t.allocator, 5, 20);
 	defer b.deinit();
 	try t.expectEqual(true, try b.read(&s, 4));
 	try t.expectString("nice", b.message());
@@ -269,7 +269,7 @@ test "reads large fragmented message fragmented with small message" {
 	_ = s.add("nicehel").add("lo").add(" ").add("world!");
 	defer s.deinit();
 
-	var b = try Buffer.init(7, 20, t.allocator);
+	var b = try Buffer.init(t.allocator, 7, 20);
 	defer b.deinit();
 	try t.expectEqual(true, try b.read(&s, 4));
 	try t.expectString("nice", b.message());
@@ -284,7 +284,7 @@ test "reads large fragmented message fragmented with small message" {
 	_ = s.add("nicehel").add("lo").add(" ").add("world!");
 	defer s.deinit();
 
-	var b = try Buffer.init(7, 20, t.allocator);
+	var b = try Buffer.init(t.allocator, 7, 20);
 	defer b.deinit();
 	try t.expectEqual(true, try b.read(&s, 4));
 	try t.expectString("nice", b.message());
@@ -299,7 +299,7 @@ test "reads large fragmented message with a small message when static buffer is 
 	_= s.add("nicehel").add("lo").add(" ").add("world!");
 	defer s.deinit();
 
-	var b = try Buffer.init(5, 20, t.allocator);
+	var b = try Buffer.init(t.allocator, 5, 20);
 	defer b.deinit();
 	try t.expectEqual(true, try b.read(&s, 4));
 	try t.expectString("nice", b.message());
@@ -314,7 +314,7 @@ test "reads large fragmented message" {
 	_ = s.add("0").add("123456").add("789ABCabc").add("defghijklmn");
 	defer s.deinit();
 
-	var b = try Buffer.init(5, 20, t.allocator);
+	var b = try Buffer.init(t.allocator, 5, 20);
 	defer b.deinit();
 	try t.expectEqual(true, try b.read(&s, 1));
 	try t.expectString("0", b.message());
@@ -365,7 +365,7 @@ test "fuzz" {
 		var inner: usize = 0;
 		while (inner < 10) : (inner += 1) {
 			var s = stream.clone();
-			var b = try Buffer.init(40, 101, t.allocator);
+			var b = try Buffer.init(t.allocator, 40, 101);
 
 			for (messages) |m| {
 				try t.expectEqual(true, try b.read(&s, m.len));

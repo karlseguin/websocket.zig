@@ -72,7 +72,6 @@ pub const Message = struct {
 
 pub const Config = struct {
 	max_size: usize,
-	path: []const u8,
 	buffer_size: usize,
 	max_handshake_size: usize,
 };
@@ -96,64 +95,53 @@ pub const Client = struct {
 	}
 };
 
-pub fn handle(comptime H: type,context: anytype, conn: Conn, config: Config, allocator: Allocator) void {
+pub fn handle(comptime H: type, allocator: Allocator, context: anytype, conn: Conn, config: Config) void {
 	const stream = if (comptime builtin.is_test) conn else conn.stream;
 	defer stream.close();
-	doHandle(H, context, stream, config, allocator) catch {
-		return;
-	};
+	handleLoop(H, allocator, context, stream, config) catch return;
 }
 
-pub fn doHandle(comptime H: type, context: anytype, stream: Stream, config: Config, allocator: Allocator) !void {
-	var request_buf = try allocator.alloc(u8, config.max_handshake_size);
-	defer allocator.free(request_buf);
-	const request = Request.read(stream, request_buf) catch |err| {
-		try Request.close(stream, err);
-		return;
-	};
+fn handleLoop(comptime H: type, allocator: Allocator, context: anytype, stream: Stream, config: Config) !void {
+	var client = Client{ .stream = stream };
+	var handler: H = undefined;
 
-	if (isWebsocketRequest(request, config.path)) {
-		try handleWebsocket(H, context, stream, request, config, allocator);
+	{
+		// This block represents handshake_buffer's lifetime
+		var handshake_buffer = try allocator.alloc(u8, config.max_handshake_size);
+		defer allocator.free(handshake_buffer);
+
+		const request = Request.read(stream, handshake_buffer) catch |err| {
+			allocator.free(handshake_buffer);
+			return Request.close(stream, err);
+		};
+
+		const h = Handshake.parse(request) catch |err| {
+			allocator.free(handshake_buffer);
+			return Handshake.close(stream, err);
+		};
+
+		handler = try H.init(h, &client, context);
+
+		// handshake_buffer (via `h` which references it), must be valid up until
+		// this call to reply
+		h.reply(stream) catch |err| {
+			handler.close();
+			return err;
+		};
 	}
-}
 
-fn isWebsocketRequest(request: []u8, targetPath: []const u8) bool {
-	var index = mem.indexOfScalar(u8, request, ' ') orelse return false;
-	const method = request[0..index];
-	if (!ascii.eqlIgnoreCase("get", method)) {
-		return false;
-	}
+	defer handler.close();
 
-	var path = mem.trim(u8, request[index..], &ascii.whitespace);
-	index = mem.indexOfScalar(u8, path, ' ') orelse return false;
-	path = path[0..index];
-	return ascii.eqlIgnoreCase(targetPath, path);
-}
-
-fn handleWebsocket(comptime H: type, context: anytype, stream: Stream, request: []u8, config: Config, allocator: Allocator) !void {
-	const h = Handshake.parse(request) catch |err| {
-		try Handshake.close(stream, err);
-		return;
-	};
-	try h.reply(stream);
-
-	var buf = try Buffer.init(config.buffer_size, config.max_size, allocator);
+	var buf = try Buffer.init(allocator, config.buffer_size, config.max_size);
 	var fragment = Fragmented.init(allocator);
 	var state = &ReadState{
 		.buf = &buf,
 		.fragment = &fragment,
 	};
 
-	var client = Client{ .stream = stream };
-
 	defer {
 		buf.deinit();
 		state.fragment.deinit();
-	}
-
-	var handler = try H.init(h.method, h.url, &client, context);
-	defer {
-		handler.close();
 	}
 
 	while (true) {
@@ -426,7 +414,7 @@ const TestContext = struct {};
 const TestHandler = struct {
 	client: *Client,
 
-	pub fn init(_: []const u8, _: []const u8, client: *Client, _: TestContext) !TestHandler {
+	pub fn init(_: Handshake, client: *Client, _: TestContext) !TestHandler {
 		return TestHandler{
 			.client = client,
 		};
@@ -670,14 +658,13 @@ fn testReadFrames(s: *t.Stream, expected: []Expect) !void {
 	// our t.Stream automatically fragments the frames on the first
 	// call to read. Note this is TCP fragmentation, not websocket fragmentation
 	const config = Config{
-		.path = "/",
 		.max_handshake_size = 512,
 		.buffer_size = TEST_BUFFER_SIZE,
 		.max_size = TEST_BUFFER_SIZE * 10,
 	};
 	while (count < 100) : (count += 1) {
 		var stream = s.clone();
-		handle(TestHandler, context, &stream, config, t.allocator);
+		handle(TestHandler, t.allocator, context, &stream, config);
 		try t.expectEqual(stream.closed, true);
 
 		const r = stream.asReceived(true);

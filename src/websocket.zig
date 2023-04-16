@@ -1,14 +1,15 @@
 const std = @import("std");
-const t = @import("./t.zig");
-const client = @import("./client.zig");
+const t = @import("t.zig");
+const client = @import("client.zig");
 
-const l = @import("./listen.zig");
+const l = @import("listen.zig");
 
 pub const listen = l.listen;
 pub const Config = l.Config;
 pub const Client = client.Client;
 pub const Message = client.Message;
 pub const testing = @import("testing.zig");
+pub const Handshake = @import("handshake.zig").Handshake;
 
 pub fn frameText(comptime msg: []const u8) [frameLen(msg)]u8 {
 	return frameMsg(msg, client.TEXT_FRAME);

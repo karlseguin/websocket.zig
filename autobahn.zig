@@ -22,8 +22,6 @@ pub fn main() !void {
 
 		.address = "127.0.0.1",
 
-		.path = "/",
-
 		// Maximum allowed handshake size (the handshake is the initial part of the
 		// wesocket request).
 		// Allocated to parse the request. Only max_handshake_size will be allocated
@@ -59,7 +57,7 @@ const Handler = struct {
 	client: *Client,
 	context: *Context,
 
-	pub fn init(_: []const u8, _: []const u8, client: *Client, context: *Context) !Handler {
+	pub fn init(_: websocket.Handshake, client: *Client, context: *Context) !Handler {
 		return Handler{
 			.client = client,
 			.context = context,

@@ -25,13 +25,14 @@ pub const Handshake = struct {
 	url: []const u8,
 	key: []const u8,
 	method: []const u8,
+	headers: []const u8,
 
 	pub fn parse(buf: []u8) !Handshake {
 		@setRuntimeSafety(builtin.is_test);
 
 		var data = buf;
-		var index = mem.indexOfScalar(u8, data, '\r') orelse unreachable;
-		var request_line = data[0..index];
+		const request_line_end = mem.indexOfScalar(u8, data, '\r') orelse unreachable;
+		var request_line = data[0..request_line_end];
 
 		if (!ascii.endsWithIgnoreCase(request_line, "http/1.1")) {
 			return HandshakeError.InvalidProtocol;
@@ -40,9 +41,11 @@ pub const Handshake = struct {
 		var key: []const u8 = "";
 		var required_headers: u8 = 0;
 
-		data = data[(index + 2)..];
+		var request_length = request_line_end;
+
+		data = data[request_line_end+2..];
 		while (data.len > 4) {
-			index = mem.indexOfScalar(u8, data, '\r') orelse unreachable;
+			const index = mem.indexOfScalar(u8, data, '\r') orelse unreachable;
 			const separator = mem.indexOfScalar(u8, data[0..index], ':') orelse return HandshakeError.InvalidHeader;
 
 			const header = mem.trim(u8, toLower(data[0..separator]), &ascii.whitespace);
@@ -67,7 +70,9 @@ pub const Handshake = struct {
 				key = mem.trim(u8, value, &ascii.whitespace);
 				required_headers |= 8;
 			}
-			data = data[(index + 2)..];
+			const next = index + 2;
+			request_length += next;
+			data = data[next..];
 		}
 
 		if (required_headers != 15) {
@@ -79,7 +84,13 @@ pub const Handshake = struct {
 		const separator = mem.indexOfScalar(u8, request_line, ' ') orelse return HandshakeError.InvalidRequestLine;
 		const method = request_line[0..separator];
 		const url = mem.trim(u8, request_line[separator + 1 .. request_line.len - 9], &ascii.whitespace);
-		return Handshake{ .key = key, .url = url, .method = method };
+
+		return .{
+			.key = key,
+			.url = url,
+			.method = method,
+			.headers = buf[request_line_end+2..request_length+2],
+		};
 	}
 
 	pub fn close(stream: Stream, err: anyerror) !void {
@@ -140,13 +151,14 @@ test "handshake: parse" {
 	try t.expectEqual(testHandshake("GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nsec-websocket-version:13\r\n\r\n", buf), HandshakeError.MissingHeaders);
 
 	{
-		const h = try testHandshake("GET /test?a=1   HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nsec-websocket-version:13\r\nsec-websocket-key: 9000!\r\n\r\n", buf);
+		const h = try testHandshake("GET /test?a=1   HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nsec-websocket-version:13\r\nsec-websocket-key: 9000!\r\nCustom: Header-Value\r\n\r\n", buf);
 		try t.expectString("9000!", h.key);
-		try t.expectString("/test?a=1", h.url);
 		try t.expectString("GET", h.method);
+		try t.expectString("/test?a=1", h.url);
+		try t.expectString("connection: upgrade\r\nupgrade: websocket\r\nsec-websocket-version:13\r\nsec-websocket-key: 9000!\r\ncustom: Header-Value\r\n", h.headers);
 	}
 
-	// fuz tests
+	// fuzz tests
 	{
 		var r = t.getRandom();
 		var random = r.random();
@@ -174,7 +186,12 @@ test "handshake: reply" {
 	var s = t.Stream.init();
 	defer s.deinit();
 
-	const h = Handshake{.key = "this is my key", .url = "", .method = ""};
+	const h = Handshake{
+		.url = "",
+		.method = "",
+		.headers = "",
+		.key = "this is my key",
+	};
 	try h.reply(&s);
 
 	var pos: usize = 0;

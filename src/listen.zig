@@ -14,7 +14,6 @@ const Loop = std.event.Loop;
 
 pub const Config = struct {
 	port: u16 = 9223,
-	path: []const u8 = "/",
 	max_size: usize = 65536,
 	buffer_size: usize = 4096,
 	address: []const u8 = "127.0.0.1",
@@ -37,7 +36,6 @@ pub fn listen(comptime H: type, allocator: Allocator, context: anytype, config: 
 	try os.setsockopt(server.sockfd.?, os.IPPROTO.TCP, 1, &std.mem.toBytes(@as(c_int, 1)));
 
 	const client_config = client.Config{
-		.path = config.path,
 		.max_size = config.max_size,
 		.buffer_size = config.buffer_size,
 		.max_handshake_size = config.max_handshake_size,
@@ -46,7 +44,7 @@ pub fn listen(comptime H: type, allocator: Allocator, context: anytype, config: 
 	while (true) {
 		if (server.accept()) |conn| {
 			const c: Conn = if (comptime builtin.is_test) undefined else conn;
-			const args = .{ H, context, c, client_config, allocator };
+			const args = .{ H, allocator, context, c, client_config };
 			if (comptime std.io.is_async) {
 				try Loop.instance.?.runDetached(allocator, client.handle, args);
 			} else {
