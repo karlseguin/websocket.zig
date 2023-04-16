@@ -93,13 +93,13 @@ You can see `autobahn.zig` in the root of the project for the handler that's use
 ## Config
 The 4th parameter to `websocket.listen` is a configuration object. 
 
-* `port` - Port to listen to. Default: `9223`,
-* `max_size` - Maximum incoming message size to allow. The server will dynamically allocate up to this much space per request. Default: `65536`,
-* `buffer_size` - Size of the static buffer that's available per connection for incoming messages. While there's other overhead, the minimal memory usage of the server will be `# of active connections * buffer_size`. Default: 4096,
-* `address` - Address to bind to. Default: `"127.0.0.1"``,
+* `port` - Port to listen to. Default: `9223`.
+* `max_size` - Maximum incoming message size to allow. The server will dynamically allocate up to this much space per request. Default: `65536`.
+* `buffer_size` - Size of the static buffer that's available per connection for incoming messages. While there's other overhead, the minimal memory usage of the server will be `# of active connections * buffer_size`. Default: `4096`.
+* `address` - Address to bind to. Default: `"127.0.0.1"`.
 * `max_handshake_size` - The maximum size of the initial handshake to allow. Default: `1024`.
 
-Setting `max_size == buffer_size` is valid and will ensure that only the initial `buffer_size` bytes will be allocated.
+Setting `max_size == buffer_size` is valid and will ensure that no dynamic memory allocation occurs once the connection is established.
 
 The reason for the separate configuration values of `max_handshake_size` and `buffer_size` is to reduce the cost of invalid handshakes. When the connection is first established, only `max_handshake_size` is allocated. Unless you're expecting a large url/querystring value or large headers, this value can be relatively small and thus limits the amount of resources committed. Only once the handshake is accepted is `buffer_size` allocated. However, keep in mind that the websocket handshake contains a number of mandatory headers, so `max_handshake_size` cannot be set super small either.
 
@@ -108,7 +108,7 @@ Websockets have their own fragmentation "feature" (not the same as TCP fragmenta
 ## Advanced
 
 ### Pre-Framed Comptime Message
-Websocket message have their own special framing. When you using `client.write` or `client.writeBin` the data you provide is "framed" into a correct websocket message. Framing is fast and cheap (e.g., it DOES NOT require an O(N) loop through the data). Nonetheless, there maybe be cases where pre-framing messages at compile-time is desired. The `websocket.frameText` and `websocket.frameBin` can be used for this purpose:
+Websocket message have their own special framing. When you use `client.write` or `client.writeBin` the data you provide is "framed" into a correct websocket message. Framing is fast and cheap (e.g., it DOES NOT require an O(N) loop through the data). Nonetheless, there may be be cases where pre-framing messages at compile-time is desired. The `websocket.frameText` and `websocket.frameBin` can be used for this purpose:
 
 ```zig
 const UNKNOWN_COMMAND = websocket.frameText("unknown command");
@@ -124,6 +124,7 @@ pub fn handle(self: *Handler, message: Message) !void {
         try self.client.writeFramed(UNKNOWN_COMMAND);
     }
 }
+```
 
 ## Testing
 The library comes with some helpers for testing:
