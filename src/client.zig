@@ -82,12 +82,16 @@ pub const Client = struct {
 
 	const Self = @This();
 
-	pub fn write(self: Self, data: []const u8) !void {
+	pub fn writeBin(self: Self, data: []const u8) !void {
 		try writeFrame(self.stream, BIN_FRAME, data);
 	}
 
-	pub fn writeText(self: Self, data: []const u8) !void {
+	pub fn write(self: Self, data: []const u8) !void {
 		try writeFrame(self.stream, TEXT_FRAME, data);
+	}
+
+	pub fn writeFramed(self: Self, data: []const u8) !void {
+		try self.steam.writeAll(data);
 	}
 
 	pub fn close(self: *Self) void {
@@ -111,16 +115,16 @@ fn handleLoop(comptime H: type, allocator: Allocator, context: anytype, stream: 
 		defer allocator.free(handshake_buffer);
 
 		const request = Request.read(stream, handshake_buffer) catch |err| {
-			allocator.free(handshake_buffer);
 			return Request.close(stream, err);
 		};
 
 		const h = Handshake.parse(request) catch |err| {
-			allocator.free(handshake_buffer);
 			return Handshake.close(stream, err);
 		};
 
-		handler = try H.init(h, &client, context);
+		handler = H.init(h, &client, context) catch |err| {
+			return Handshake.close(stream, err);
+		};
 
 		// handshake_buffer (via `h` which references it), must be valid up until
 		// this call to reply
@@ -424,8 +428,8 @@ const TestHandler = struct {
 	pub fn handle(self: TestHandler, message: Message) !void {
 		const data = message.data;
 		switch (message.type) {
-			.binary => try self.client.write(data),
-			.text => try self.client.writeText(data),
+			.binary => try self.client.writeBin(data),
+			.text => try self.client.write(data),
 			else => unreachable,
 		}
 	}

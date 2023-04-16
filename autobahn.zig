@@ -57,7 +57,7 @@ const Handler = struct {
 	client: *Client,
 	context: *Context,
 
-	pub fn init(_: websocket.Handshake, client: *Client, context: *Context) !Handler {
+	pub fn init(_: Handshake, client: *Client, context: *Context) !Handler {
 		return Handler{
 			.client = client,
 			.context = context,
@@ -67,10 +67,10 @@ const Handler = struct {
 	pub fn handle(self: *Handler, message: Message) !void {
 		const data = message.data;
 		switch (message.type) {
-			.binary => try self.client.write(data),
+			.binary => try self.client.writeBin(data),
 			.text => {
 				if (std.unicode.utf8ValidateSlice(data)) {
-					try self.client.writeText(data);
+					try self.client.write(data);
 				} else {
 					self.client.close();
 				}
