@@ -89,7 +89,6 @@ Every mandatory [Autobahn Testsuite](https://github.com/crossbario/autobahn-test
 
 You can see `autobahn.zig` in the root of the project for the handler that's used for the autobahn tests.
 
-
 ## Config
 The 4th parameter to `websocket.listen` is a configuration object. 
 
@@ -97,11 +96,14 @@ The 4th parameter to `websocket.listen` is a configuration object.
 * `max_size` - Maximum incoming message size to allow. The server will dynamically allocate up to this much space per request. Default: `65536`.
 * `buffer_size` - Size of the static buffer that's available per connection for incoming messages. While there's other overhead, the minimal memory usage of the server will be `# of active connections * buffer_size`. Default: `4096`.
 * `address` - Address to bind to. Default: `"127.0.0.1"`.
-* `max_handshake_size` - The maximum size of the initial handshake to allow. Default: `1024`.
+* `handshake_pool_size` - The number of buffers to create and keep for reading the initial handshake. Default: `50`
+* `handshake_max_size` - The maximum size of the initial handshake to allow. Default: `1024`.
 
 Setting `max_size == buffer_size` is valid and will ensure that no dynamic memory allocation occurs once the connection is established.
 
-The reason for the separate configuration values of `max_handshake_size` and `buffer_size` is to reduce the cost of invalid handshakes. When the connection is first established, only `max_handshake_size` is allocated. Unless you're expecting a large url/querystring value or large headers, this value can be relatively small and thus limits the amount of resources committed. Only once the handshake is accepted is `buffer_size` allocated. However, keep in mind that the websocket handshake contains a number of mandatory headers, so `max_handshake_size` cannot be set super small either.
+The server allocates and keep around `handshake_pool_size * handshake_max_size` bytes at all times. If the handshake buffer pool is empty, new buffers of `handshake_max_size` are dynamically created.
+
+The handshake pool/buffer is separate from the main `buffer_size` to reduce the memory cost of invalid handshakes. Unless you're expecting a very large handshake request (a large URL, querystring or headers), the initial handshake is usually < 1KB. This data is also short-lived. Once the websocket is established however, you may want a larger buffer for handling incoming requests (and this buffer is generally much longer lived). By using a small pooled buffer for the initial handshake, invalid connections don't use up [as much] memory and thus the server may be more resilient to basic DOS attacks. Keep in mind that the websocket protocol requires a number of mandatory headers, so `handshake_max_size` can't be set to a super small value. Also keep in mind that the current pool implementation does not block when empty, but rather created dynamic buffers of `handshake_max_size`.
 
 Websockets have their own fragmentation "feature" (not the same as TCP fragmentation) which this library could handle more efficiently. However, I'm not aware of any client (e.g. browsers) which use this feature at all.
 

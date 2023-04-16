@@ -22,11 +22,14 @@ pub fn main() !void {
 
 		.address = "127.0.0.1",
 
-		// Maximum allowed handshake size (the handshake is the initial part of the
-		// wesocket request).
-		// Allocated to parse the request. Only max_handshake_size will be allocated
-		// for non-websocket requests.
-		.max_handshake_size = 1024,
+		// We initialize and keep in memory `handshake_pool_size` buffers, each of
+		// `handshake_max_size` at all time. This is used to parse the initial
+		// handshake request. If the pool is empty and new connections come in,
+		// then buffers of `handshake_max_size` are dynamically allocated as needed.
+		.handshake_pool_size = 10,
+
+		// See handshake_pool_size
+		.handshake_max_size = 1024,
 
 		// On connection, each client will get buffer_size bytes allocated
 		// to process messages. This will be a single allocation and will only

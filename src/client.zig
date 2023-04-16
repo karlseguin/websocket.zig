@@ -5,6 +5,7 @@ const builtin = @import("builtin");
 const mem = std.mem;
 const ascii = std.ascii;
 const Allocator = mem.Allocator;
+const Pool = @import("pool.zig").Pool;
 const Buffer = @import("buffer.zig").Buffer;
 const Request = @import("request.zig").Request;
 const Handshake = @import("handshake.zig").Handshake;
@@ -73,7 +74,6 @@ pub const Message = struct {
 pub const Config = struct {
 	max_size: usize,
 	buffer_size: usize,
-	max_handshake_size: usize,
 };
 
 pub const Client = struct {
@@ -99,20 +99,20 @@ pub const Client = struct {
 	}
 };
 
-pub fn handle(comptime H: type, allocator: Allocator, context: anytype, conn: Conn, config: Config) void {
+pub fn handle(comptime H: type, allocator: Allocator, context: anytype, conn: Conn, config: Config, pool: *Pool) void {
 	const stream = if (comptime builtin.is_test) conn else conn.stream;
 	defer stream.close();
-	handleLoop(H, allocator, context, stream, config) catch return;
+	handleLoop(H, allocator, context, stream, config, pool) catch return;
 }
 
-fn handleLoop(comptime H: type, allocator: Allocator, context: anytype, stream: Stream, config: Config) !void {
+fn handleLoop(comptime H: type, allocator: Allocator, context: anytype, stream: Stream, config: Config, pool: *Pool) !void {
 	var client = Client{ .stream = stream };
 	var handler: H = undefined;
 
 	{
 		// This block represents handshake_buffer's lifetime
-		var handshake_buffer = try allocator.alloc(u8, config.max_handshake_size);
-		defer allocator.free(handshake_buffer);
+		var handshake_buffer = try pool.acquire();
+		defer pool.release(handshake_buffer);
 
 		const request = Request.read(stream, handshake_buffer) catch |err| {
 			return Request.close(stream, err);
@@ -662,13 +662,16 @@ fn testReadFrames(s: *t.Stream, expected: []Expect) !void {
 	// our t.Stream automatically fragments the frames on the first
 	// call to read. Note this is TCP fragmentation, not websocket fragmentation
 	const config = Config{
-		.max_handshake_size = 512,
 		.buffer_size = TEST_BUFFER_SIZE,
 		.max_size = TEST_BUFFER_SIZE * 10,
 	};
+
+	var pool = try Pool.init(t.allocator, 10, 512);
+	defer pool.deinit();
+
 	while (count < 100) : (count += 1) {
 		var stream = s.clone();
-		handle(TestHandler, t.allocator, context, &stream, config);
+		handle(TestHandler, t.allocator, context, &stream, config, &pool);
 		try t.expectEqual(stream.closed, true);
 
 		const r = stream.asReceived(true);
