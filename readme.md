@@ -14,13 +14,13 @@ const Context = struct {
 };
 
 pub fn main() !void {
-    // this is the instance of your "global" struct to pass into your handlers
-    const context = Context{}; 
-
     var general_purpose_allocator = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = general_purpose_allocator.allocator();
 
-    try websocket.listen(Handler, context, allocator, .{
+    // this is the instance of your "global" struct to pass into your handlers
+    var context = Context{}; 
+
+    try websocket.listen(Handler, allocator,  &context, .{
         .path = "/",
         .port = 9223,
         .address = "127.0.0.1",
@@ -29,9 +29,9 @@ pub fn main() !void {
 
 const Handler = struct {
     client: *Client,
-    context: Context,
+    context: *Context,
 
-    pub fn init(method: []const u8, url: []const u8, client: *Client, context: Context) !Handler {
+    pub fn init(method: []const u8, url: []const u8, client: *Client, context: *Context) !Handler {
         return Handler{
             .client = client,
             .context = context,

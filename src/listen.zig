@@ -24,7 +24,7 @@ pub const Config = struct {
 // const ParseFn = fn (parser: *Parser) anyerror!void;
 
 const Allocator = std.mem.Allocator;
-pub fn listen(comptime H: type, context: anytype, allocator: Allocator, config: Config) !void {
+pub fn listen(comptime H: type, allocator: Allocator, context: anytype, config: Config) !void {
 	var server = net.StreamServer.init(.{ .reuse_address = true });
 	defer server.deinit();
 

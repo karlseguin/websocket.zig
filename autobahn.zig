@@ -11,6 +11,12 @@ const Handshake = websocket.Handshake;
 pub const io_mode = .evented;
 
 pub fn main() !void {
+	var general_purpose_allocator = std.heap.GeneralPurposeAllocator(.{}){};
+	const allocator = general_purpose_allocator.allocator();
+
+	// abitrary context object that will get passed to your handler
+	var context = Context{};
+
 	const config = websocket.Config{
 		.port = 9223,
 
@@ -42,23 +48,18 @@ pub fn main() !void {
 		.max_size = 20_000_000,
 	};
 
-	// abitrary context object that will get passed to your handler
-	const context = Context{};
-	var general_purpose_allocator = std.heap.GeneralPurposeAllocator(.{}){};
-	const allocator = general_purpose_allocator.allocator();
-
 	// Start websocket listening on the given port,
 	// speficying the handler struct that will servi
-	try websocket.listen(Handler, context, allocator, config);
+	try websocket.listen(Handler, allocator, &context, config);
 }
 
 const Context = struct {};
 
 const Handler = struct {
 	client: *Client,
-	context: Context,
+	context: *Context,
 
-	pub fn init(_: []const u8, _: []const u8, client: *Client, context: Context) !Handler {
+	pub fn init(_: []const u8, _: []const u8, client: *Client, context: *Context) !Handler {
 		return Handler{
 			.client = client,
 			.context = context,
