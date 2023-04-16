@@ -74,7 +74,7 @@ pub const Config = struct {
 	max_size: usize,
 	path: []const u8,
 	buffer_size: usize,
-	max_request_size: usize,
+	max_handshake_size: usize,
 };
 
 pub const Client = struct {
@@ -105,7 +105,7 @@ pub fn handle(comptime H: type,context: anytype, conn: Conn, config: Config, all
 }
 
 pub fn doHandle(comptime H: type, context: anytype, stream: Stream, config: Config, allocator: Allocator) !void {
-	var request_buf = try allocator.alloc(u8, config.max_request_size);
+	var request_buf = try allocator.alloc(u8, config.max_handshake_size);
 	defer allocator.free(request_buf);
 	const request = Request.read(stream, request_buf) catch |err| {
 		try Request.close(stream, err);
@@ -671,7 +671,7 @@ fn testReadFrames(s: *t.Stream, expected: []Expect) !void {
 	// call to read. Note this is TCP fragmentation, not websocket fragmentation
 	const config = Config{
 		.path = "/",
-		.max_request_size = 512,
+		.max_handshake_size = 512,
 		.buffer_size = TEST_BUFFER_SIZE,
 		.max_size = TEST_BUFFER_SIZE * 10,
 	};
@@ -680,7 +680,7 @@ fn testReadFrames(s: *t.Stream, expected: []Expect) !void {
 		handle(TestHandler, context, &stream, config, t.allocator);
 		try t.expectEqual(stream.closed, true);
 
-		const r = Received.init(stream.received.items);
+		const r = stream.asReceived(true);
 		const messages = r.messages;
 		errdefer r.deinit();
 		errdefer stream.deinit();
@@ -723,83 +723,5 @@ const Expect = struct {
 			.data = data[2..],
 			.type = .close,
 		};
-	}
-};
-
-const Received = struct {
-	messages: []Message,
-
-	// We make some big assumptions about these messages.
-	// Namely, we know that there's no websocket fragmentation, there's no
-	// continuation and we know that there's only two ways a single message
-	// will be fragmented:
-	//  either 1 received message == 1 full frame (such as when we write a
-	//       pre-generated message, like CLOSE_NORMAL)
-	//  or when writeFrame is used, in which case we'd expect 2 messages:
-	//       the first is the op_code + length, and the 2nd is the payload.
-	//
-	// There's a cleaner world where we'd let our real readFrame parse this.
-	fn init(all: [][]const u8) Received {
-		var i: usize = 0;
-		// skip the handshake reply (at least for now)
-		while (i < all.len) : (i += 1) {
-			if (std.ascii.endsWithIgnoreCase(all[i], "\r\n\r\n")) {
-				break;
-			}
-		}
-
-		// move past the last received data, which was the end of our handshake
-		var frames = all[i + 1 ..];
-
-		var frame_index: usize = 0;
-		var message_index: usize = 0;
-
-		var messages = t.allocator.alloc(Message, frames.len) catch unreachable;
-		while (frame_index < frames.len) : (frame_index += 1) {
-			var f = frames[frame_index];
-			const message_type = switch (f[0] & 15) {
-				1 => MessageType.text,
-				2 => MessageType.binary,
-				8 => MessageType.close,
-				10 => MessageType.pong,
-				else => unreachable,
-			};
-
-			// Let's figure out if this message is all within this single frame
-			// or if it's split between this frame and the next.
-			// If it is split, then this frame will contain OP + LENGTH_PREFIX + LENGTH
-			// and the next one will be the full payload (and nothing else)
-			const length_of_length: u8 = switch (f[1] & 127) {
-				126 => 2,
-				127 => 8,
-				else => 0,
-			};
-
-			const payload_length = switch (length_of_length) {
-				2 => @intCast(u16, f[3]) | @intCast(u16, f[2]) << 8,
-				8 => @intCast(u64, f[9]) | @intCast(u64, f[8]) << 8 | @intCast(u64, f[7]) << 16 | @intCast(u64, f[6]) << 24 | @intCast(u64, f[5]) << 32 | @intCast(u64, f[4]) << 40 | @intCast(u64, f[3]) << 48 | @intCast(u64, f[2]) << 56,
-				else => f[1],
-			};
-
-			var payload: []const u8 = undefined;
-			if (f.len >= 2 + length_of_length + payload_length) {
-				payload = f[2 + length_of_length ..];
-			} else {
-				frame_index += 1;
-				f = frames[frame_index];
-				payload = f;
-			}
-
-			messages[message_index] = Message{
-				.data = payload,
-				.type = message_type,
-			};
-			message_index += 1;
-		}
-		return Received{ .messages = messages[0..message_index] };
-	}
-
-	fn deinit(self: Received) void {
-		t.allocator.free(self.messages);
 	}
 };

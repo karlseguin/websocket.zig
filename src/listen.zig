@@ -1,6 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const client = @import("./client.zig");
+const t = @import("t.zig");
+const client = @import("client.zig");
+
+const Conn = if (builtin.is_test) *t.Stream else std.net.StreamServer.Connection;
 
 const os = std.os;
 const net = std.net;
@@ -10,12 +13,12 @@ const Loop = std.event.Loop;
 // const Conn = if (builtin.is_test) *t.Stream else std.net.StreamServer.Connection;
 
 pub const Config = struct {
-	port: u16,
-	max_size: usize,
-	path: []const u8,
-	buffer_size: usize,
-	address: []const u8,
-	max_request_size: usize,
+	port: u16 = 9223,
+	path: []const u8 = "/",
+	max_size: usize = 65536,
+	buffer_size: usize = 4096,
+	address: []const u8 = "127.0.0.1",
+	max_handshake_size: usize = 1024,
 };
 
 // const ParseFn = fn (parser: *Parser) anyerror!void;
@@ -33,22 +36,22 @@ pub fn listen(comptime H: type, context: anytype, allocator: Allocator, config: 
 	// }
 	try os.setsockopt(server.sockfd.?, os.IPPROTO.TCP, 1, &std.mem.toBytes(@as(c_int, 1)));
 
-	std.log.info("listening at {}", .{server.listen_address});
 	const client_config = client.Config{
 		.path = config.path,
 		.max_size = config.max_size,
 		.buffer_size = config.buffer_size,
-		.max_request_size = config.max_request_size,
+		.max_handshake_size = config.max_handshake_size,
 	};
 
 	while (true) {
 		if (server.accept()) |conn| {
-			const args = .{ H, context, conn, client_config, allocator };
+			const c: Conn = if (comptime builtin.is_test) undefined else conn;
+			const args = .{ H, context, c, client_config, allocator };
 			if (comptime std.io.is_async) {
 				try Loop.instance.?.runDetached(allocator, client.handle, args);
 			} else {
-				const t = try std.Thread.spawn(.{}, client.handle, args);
-				t.detach();
+				const thread = try std.Thread.spawn(.{}, client.handle, args);
+				thread.detach();
 			}
 		} else |err| {
 			std.log.err("failed to accept connection {}", .{err});

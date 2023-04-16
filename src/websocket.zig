@@ -8,6 +8,7 @@ pub const listen = l.listen;
 pub const Config = l.Config;
 pub const Client = client.Client;
 pub const Message = client.Message;
+pub const testing = @import("testing.zig");
 
 pub fn frameText(comptime msg: []const u8) [frameLen(msg)]u8 {
 	return frameMsg(msg, client.TEXT_FRAME);
@@ -52,7 +53,7 @@ fn frameLen(comptime msg: []const u8) usize {
 }
 
 comptime {
-	// std.testing.refAllDecls(@This());
+	std.testing.refAllDecls(@This());
 }
 
 test "frameText" {

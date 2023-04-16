@@ -1,4 +1,5 @@
 const std = @import("std");
+const client = @import("client.zig");
 
 const mem = std.mem;
 const ArrayList = std.ArrayList;
@@ -233,6 +234,10 @@ pub const Stream = struct {
 		self.received.append(copy) catch unreachable;
 	}
 
+	pub fn asReceived(self: Stream, skip_handshake: bool) Received {
+		return Received.init(self.received.items, skip_handshake);
+	}
+
 	pub fn close(self: *Stream) void {
 		self.closed = true;
 	}
@@ -269,5 +274,86 @@ pub const Stream = struct {
 		}
 
 		self.* = undefined;
+	}
+};
+
+pub const Received = struct {
+	messages: []client.Message,
+
+	// We make some big assumptions about these messages.
+	// Namely, we know that there's no websocket fragmentation, there's no
+	// continuation and we know that there's only two ways a single message
+	// will be fragmented:
+	//  either 1 received message == 1 full frame (such as when we write a
+	//       pre-generated message, like CLOSE_NORMAL)
+	//  or when writeFrame is used, in which case we'd expect 2 messages:
+	//       the first is the op_code + length, and the 2nd is the payload.
+	//
+	// There's a cleaner world where we'd let our real readFrame parse this.
+	fn init(all: [][]const u8, skip_handshake: bool) Received {
+		var i: usize = 0;
+
+		if (skip_handshake) {
+			while (i < all.len) : (i += 1) {
+				if (std.ascii.endsWithIgnoreCase(all[i], "\r\n\r\n")) {
+					break;
+				}
+			}
+			i += 1;
+		}
+
+		// move past the last received data, which was the end of our handshake
+		var frames = all[i..];
+
+		var frame_index: usize = 0;
+		var message_index: usize = 0;
+
+		var messages = allocator.alloc(client.Message, frames.len) catch unreachable;
+		while (frame_index < frames.len) : (frame_index += 1) {
+			var f = frames[frame_index];
+			const message_type = switch (f[0] & 15) {
+				1 => client.MessageType.text,
+				2 => client.MessageType.binary,
+				8 => client.MessageType.close,
+				10 => client.MessageType.pong,
+				else => unreachable,
+			};
+
+			// Let's figure out if this message is all within this single frame
+			// or if it's split between this frame and the next.
+			// If it is split, then this frame will contain OP + LENGTH_PREFIX + LENGTH
+			// and the next one will be the full payload (and nothing else)
+			const length_of_length: u8 = switch (f[1] & 127) {
+				126 => 2,
+				127 => 8,
+				else => 0,
+			};
+
+			const payload_length = switch (length_of_length) {
+				2 => @intCast(u16, f[3]) | @intCast(u16, f[2]) << 8,
+				8 => @intCast(u64, f[9]) | @intCast(u64, f[8]) << 8 | @intCast(u64, f[7]) << 16 | @intCast(u64, f[6]) << 24 | @intCast(u64, f[5]) << 32 | @intCast(u64, f[4]) << 40 | @intCast(u64, f[3]) << 48 | @intCast(u64, f[2]) << 56,
+				else => f[1],
+			};
+
+			var payload: []const u8 = undefined;
+			if (f.len >= 2 + length_of_length + payload_length) {
+				payload = f[2 + length_of_length ..];
+			} else {
+				frame_index += 1;
+				f = frames[frame_index];
+				payload = f;
+			}
+
+			messages[message_index] = client.Message{
+				.data = payload,
+				.type = message_type,
+			};
+			message_index += 1;
+		}
+		return Received{ .messages = messages[0..message_index] };
+	}
+
+	pub fn deinit(self: Received) void {
+		allocator.free(self.messages);
 	}
 };
