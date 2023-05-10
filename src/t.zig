@@ -278,6 +278,7 @@ pub const Stream = struct {
 };
 
 pub const Received = struct {
+	_ptr: []client.Message,
 	messages: []client.Message,
 
 	// We make some big assumptions about these messages.
@@ -350,10 +351,10 @@ pub const Received = struct {
 			};
 			message_index += 1;
 		}
-		return Received{ .messages = messages[0..message_index] };
+		return Received{ ._ptr = messages, .messages = messages[0..message_index] };
 	}
 
 	pub fn deinit(self: Received) void {
-		allocator.free(self.messages);
+		allocator.free(self._ptr);
 	}
 };

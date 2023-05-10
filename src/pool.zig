@@ -30,7 +30,7 @@ pub const Pool = struct {
 	pub fn deinit(self: *Pool) void {
 		const allocator = self.allocator;
 		for (self.buffers) |b| {
-			allocator.destroy(b);
+			allocator.free(b);
 		}
 		allocator.free(self.buffers);
 	}
