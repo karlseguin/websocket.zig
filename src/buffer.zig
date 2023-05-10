@@ -279,21 +279,6 @@ test "reads large fragmented message fragmented with small message" {
 	try t.expectString("hello world!", b.message());
 }
 
-test "reads large fragmented message fragmented with small message" {
-	var s = t.Stream.init();
-	_ = s.add("nicehel").add("lo").add(" ").add("world!");
-	defer s.deinit();
-
-	var b = try Buffer.init(t.allocator, 7, 20);
-	defer b.deinit();
-	try t.expectEqual(true, try b.read(&s, 4));
-	try t.expectString("nice", b.message());
-	b.next();
-	try t.expectEqual(true, try b.read(&s, 12));
-	try t.expectString("hello world!", b.message());
-	try t.expectString("hello world!", b.message());
-}
-
 test "reads large fragmented message with a small message when static buffer is smaller than read size" {
 	var s = t.Stream.init();
 	_= s.add("nicehel").add("lo").add(" ").add("world!");
