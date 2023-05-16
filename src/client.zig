@@ -182,7 +182,7 @@ fn handleLoop(comptime H: type, allocator: Allocator, context: anytype, stream: 
 	}
 }
 
-fn readFrame(stream: Stream, state: *ReadState) !?Message {
+fn readFrame(stream: Stream, state: *const ReadState) !?Message {
 	var buf = state.buf;
 	var fragment = state.fragment;
 
