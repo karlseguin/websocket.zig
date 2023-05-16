@@ -48,10 +48,10 @@ const Handler = struct {
 
     pub fn handle(self: *Handler, message: Message) !void {
         const data = message.data;
-        try self.client.write(data); // echo the messge back
+        try self.client.write(data); // echo the message back
     }
 
-    // called whenever the connection is closed, can do some cleanup in ehre
+    // called whenever the connection is closed, can do some cleanup in here
     pub fn close(_: *Handler) void {}
 };
 ```
