@@ -19,6 +19,7 @@ pub fn frameBin(comptime msg: []const u8) [frameLen(msg)]u8 {
 	return frameMsg(msg, client.BIN_FRAME);
 }
 
+
 fn frameMsg(comptime msg: []const u8, op_code: u8) [frameLen(msg)]u8 {
 	var framed: [frameLen(msg)]u8 = undefined;
 	framed[0] = op_code;

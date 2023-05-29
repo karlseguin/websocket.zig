@@ -13,6 +13,7 @@ const Loop = std.event.Loop;
 pub const Config = struct {
 	port: u16 = 9223,
 	max_size: usize = 65536,
+	max_headers: usize = 0,
 	buffer_size: usize = 4096,
 	address: []const u8 = "127.0.0.1",
 	handshake_max_size: usize = 1024,
@@ -24,7 +25,7 @@ pub fn listen(comptime H: type, allocator: Allocator, context: anytype, config: 
 	var server = net.StreamServer.init(.{ .reuse_address = true });
 	defer server.deinit();
 
-	var pool = try Pool.init(allocator, config.handshake_pool_size, config.handshake_max_size);
+	var pool = try Pool.init(allocator, config.handshake_pool_size, config.handshake_max_size, config.max_headers);
 	defer pool.deinit();
 
 	try server.listen(net.Address.parseIp(config.address, config.port) catch unreachable);

@@ -1,68 +1,101 @@
 const std = @import("std");
 const t = @import("t.zig");
+const KeyValue = @import("key_value.zig").KeyValue;
 
 const Mutex = std.Thread.Mutex;
 const Allocator = std.mem.Allocator;
 
+// This is what we're pooling
+const HandshakeState = struct {
+	// a buffer to read data into
+	buffer: []u8,
+
+	// Headers
+	headers: KeyValue,
+
+	fn init(allocator: Allocator, buffer_size: usize, max_headers: usize) !*HandshakeState {
+		const hs = try allocator.create(HandshakeState);
+		hs.* = .{
+			.buffer = try allocator.alloc(u8, buffer_size),
+			.headers = try KeyValue.init(allocator, max_headers),
+		};
+		return hs;
+	}
+
+	fn deinit(self: *HandshakeState, allocator: Allocator) void {
+		allocator.free(self.buffer);
+		self.headers.deinit(allocator);
+		allocator.destroy(self);
+	}
+
+	fn reset(self: *HandshakeState) void {
+		self.headers.reset();
+	}
+};
+
 pub const Pool = struct {
 	mutex: Mutex,
-	buffers: [][] u8,
 	available: usize,
 	allocator: Allocator,
 	buffer_size: usize,
+	max_headers: usize,
+	states: []*HandshakeState,
 
-	pub fn init(allocator: Allocator, buffer_count: usize, buffer_size: usize) !Pool {
-		const buffers = try allocator.alloc([]u8, buffer_count);
+	pub fn init(allocator: Allocator, count: usize, buffer_size: usize, max_headers: usize) !Pool {
+		const states = try allocator.alloc(*HandshakeState, count);
 
-		for (0..buffer_count) |i| {
-			buffers[i] = try allocator.alloc(u8, buffer_size);
+		for (0..count) |i| {
+			states[i] = try HandshakeState.init(allocator, buffer_size, max_headers);
 		}
 
 		return .{
 			.mutex = Mutex{},
-			.buffers = buffers,
+			.states = states,
 			.allocator = allocator,
-			.available = buffer_count,
+			.available = count,
+			.max_headers = max_headers,
 			.buffer_size = buffer_size,
 		};
 	}
 
 	pub fn deinit(self: *Pool) void {
 		const allocator = self.allocator;
-		for (self.buffers) |b| {
-			allocator.free(b);
+		for (self.states) |s| {
+			s.deinit(allocator);
 		}
-		allocator.free(self.buffers);
+		allocator.free(self.states);
 	}
 
-	pub fn acquire(self: *Pool) ![]u8 {
+	pub fn acquire(self: *Pool) !*HandshakeState {
 		self.mutex.lock();
 
-		const buffers = self.buffers;
+		const states = self.states;
 		const available = self.available;
 		if (available == 0) {
 			// dont hold the lock over factory
 			self.mutex.unlock();
-			return self.allocator.alloc(u8, self.buffer_size);
+			return try HandshakeState.init(self.allocator, self.buffer_size, self.max_headers);
 		}
 		const index = available - 1;
-		const buffer = buffers[index];
+		const state = states[index];
 		self.available = index;
 		self.mutex.unlock();
-		return buffer;
+		return state;
 	}
 
-	pub fn release(self: *Pool, buffer: []u8) void {
+	pub fn release(self: *Pool, state: *HandshakeState) void {
+		state.reset();
+
 		self.mutex.lock();
 
-		var buffers = self.buffers;
+		var states = self.states;
 		const available = self.available;
-		if (available == buffers.len) {
+		if (available == states.len) {
 			self.mutex.unlock();
-			self.allocator.free(buffer);
+			state.deinit(self.allocator);
 			return;
 		}
-		buffers[available] = buffer;
+		states[available] = state;
 		self.available = available + 1;
 		self.mutex.unlock();
 	}
@@ -70,36 +103,41 @@ pub const Pool = struct {
 
 test "pool: acquire and release" {
 	// not 100% sure this is testing exactly what I want, but it's ....something ?
-	var p = try Pool.init(t.allocator, 2, 10);
+	var p = try Pool.init(t.allocator, 2, 10, 3);
 	defer p.deinit();
 
-	var b1a = p.acquire() catch unreachable;
-	var b2a = p.acquire() catch unreachable;
-	var b3a = p.acquire() catch unreachable; // this should be dynamically generated
+	var hs1a = p.acquire() catch unreachable;
+	var hs2a = p.acquire() catch unreachable;
+	var hs3a = p.acquire() catch unreachable; // this should be dynamically generated
 
-	try t.expectEqual(false, &b1a[0] == &b2a[0]);
-	try t.expectEqual(false, &b2a[0] == &b3a[0]);
-	try t.expectEqual(@as(usize, 10), b1a.len);
-	try t.expectEqual(@as(usize, 10), b2a.len);
-	try t.expectEqual(@as(usize, 10), b3a.len);
+	try t.expectEqual(false, &hs1a.buffer[0] == &hs2a.buffer[0]);
+	try t.expectEqual(false, &hs2a.buffer[0] == &hs3a.buffer[0]);
+	try t.expectEqual(@as(usize, 10), hs1a.buffer.len);
+	try t.expectEqual(@as(usize, 10), hs2a.buffer.len);
+	try t.expectEqual(@as(usize, 10), hs3a.buffer.len);
+	try t.expectEqual(@as(usize, 0), hs1a.headers.len);
+	try t.expectEqual(@as(usize, 0), hs2a.headers.len);
+	try t.expectEqual(@as(usize, 0), hs3a.headers.len);
+	try t.expectEqual(@as(usize, 3), hs1a.headers.keys.len);
+	try t.expectEqual(@as(usize, 3), hs2a.headers.keys.len);
+	try t.expectEqual(@as(usize, 3), hs3a.headers.keys.len);
 
-	p.release(b1a);
+	p.release(hs1a);
 
-	var b1b = p.acquire() catch unreachable;
-	try t.expectEqual(true, &b1a[0] == &b1b[0]);
+	var hs1b = p.acquire() catch unreachable;
+	try t.expectEqual(true, &hs1a.buffer[0] == &hs1b.buffer[0]);
 
-	p.release(b3a);
-	p.release(b2a);
-	p.release(b1b);
+	p.release(hs3a);
+	p.release(hs2a);
+	p.release(hs1b);
 }
 
-
 test "pool: threadsafety" {
-	var p = try Pool.init(t.allocator, 4, 10);
+	var p = try Pool.init(t.allocator, 4, 10, 2);
 	defer p.deinit();
 
-	for (p.buffers) |b| {
-		b[0] = 0;
+	for (p.states) |hs| {
+		hs.buffer[0] = 0;
 	}
 
 	const t1 = try std.Thread.spawn(.{}, testPool, .{&p});
@@ -115,11 +153,11 @@ fn testPool(p: *Pool) void {
 	const random = r.random();
 
 	for (0..5000) |_| {
-		var buf = p.acquire() catch unreachable;
-		std.debug.assert(buf[0] == 0);
-		buf[0] = 255;
+		var hs = p.acquire() catch unreachable;
+		std.debug.assert(hs.buffer[0] == 0);
+		hs.buffer[0] = 255;
 		std.time.sleep(random.uintAtMost(u32, 100000));
-		buf[0] = 0;
-		p.release(buf);
+		hs.buffer[0] = 0;
+		p.release(hs);
 	}
 }

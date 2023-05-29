@@ -25,6 +25,7 @@ pub fn main() !void {
 
     try websocket.listen(Handler, allocator, &context, .{
         .port = 9223,
+        .max_headers = 10,
         .address = "127.0.0.1",
     });
 }
@@ -65,14 +66,24 @@ The `websocket.Handshake` exposes the following fields:
 
 * `url: []const u8` - URL of the request in its original casing
 * `method: []const u8` - Method of the request in its original casing
-* `headers: []const u8` - The raw "key1: value1\r\nkey2: value2\r\n" headers. Keys are lowercase.
+* `raw_headers: []const u8` - The raw "key1: value1\r\nkey2: value2\r\n" headers. Keys are lowercase.
 
-You might wish that the URL's querystring was parsed and/or headers were split and placed into a map. But this requires memory allocation and isn't something every system requires, so it's left up to the application to handle (TODO: add helpers to this library to handle these common cases).
+If you set the `max_headers` configuration value to > 0, then you can use `req.headers.get("HEADER_NAME")` to extract a header value from the given name:
 
-Memory referenced by the `websocket.Handshake` will be freed after the call to `init` completes. Application that need these values to exist beyond the call to `init` must make a copy.
+```zig
+// get returns a ?[]const u8
+// the name is lowercase
+// the value is in its original case
+const token = handshake.headers.get("authorization") orelse {
+    return error.NotAuthorized;
+}
+...
+```
+
+Memory referenced by the `websocket.Handshake`, including headers from `handshake.headers` will be freed after the call to `init` completes. Application that need these values to exist beyond the call to `init` must make a copy.
 
 ### handle
-The `handle` function takes a `message` which has a `type` and `data`field. The `type` will either be `text` or `binary`, but in 99% of cases, you can ignore it and just use `data`. This is an unfortunate part of the spec which differentiates between arbitrary byte data (binary) and valid UTF-8 (text). This library _does not_ reject text messages with invalid UTF-8. Again, in most cases, it doesn't matter and just wastes cycles. If you care about this, do like the autobahn test does and validate it in your handler.
+The `handle` function takes a `message` which has a `type` and `data` field. The `type` will either be `text` or `binary`, but in 99% of cases, you can ignore it and just use `data`. This is an unfortunate part of the spec which differentiates between arbitrary byte data (binary) and valid UTF-8 (text). This library _does not_ reject text messages with invalid UTF-8. Again, in most cases, it doesn't matter and just wastes cycles. If you care about this, do like the autobahn test does and validate it in your handler.
 
 If `handle` returns an error, the connection is closed.
 
@@ -98,6 +109,7 @@ The 4th parameter to `websocket.listen` is a configuration object.
 * `address` - Address to bind to. Default: `"127.0.0.1"`.
 * `handshake_pool_size` - The number of buffers to create and keep for reading the initial handshake. Default: `50`
 * `handshake_max_size` - The maximum size of the initial handshake to allow. Default: `1024`.
+* `max_headers` - The maximum size of headers to store in `handshake.headers`. Requests with more headers will still be processed, but `handshake.headers` will only contain the first `max_headers` headers. Default: `0`.
 
 Setting `max_size == buffer_size` is valid and will ensure that no dynamic memory allocation occurs once the connection is established.
 

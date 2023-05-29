@@ -4,10 +4,12 @@ const builtin = @import("builtin");
 const t = @import("t.zig");
 const client = @import("client.zig");
 const Request = @import("request.zig").Request;
+const KeyValue = @import("key_value.zig").KeyValue;
 
 const mem = std.mem;
 const net = std.net;
 const ascii = std.ascii;
+const Allocator = std.mem.Allocator;
 const Stream = if (builtin.is_test) *t.Stream else std.net.Stream;
 
 const HandshakeError = error{
@@ -25,9 +27,10 @@ pub const Handshake = struct {
 	url: []const u8,
 	key: []const u8,
 	method: []const u8,
-	headers: []const u8,
+	headers: *KeyValue,
+	raw_header: []const u8,
 
-	pub fn parse(buf: []u8) !Handshake {
+	pub fn parse(buf: []u8, headers: *KeyValue) !Handshake {
 		@setRuntimeSafety(builtin.is_test);
 
 		var data = buf;
@@ -44,32 +47,34 @@ pub const Handshake = struct {
 		var request_length = request_line_end;
 
 		data = data[request_line_end+2..];
+
 		while (data.len > 4) {
 			const index = mem.indexOfScalar(u8, data, '\r') orelse unreachable;
 			const separator = mem.indexOfScalar(u8, data[0..index], ':') orelse return HandshakeError.InvalidHeader;
 
-			const header = mem.trim(u8, toLower(data[0..separator]), &ascii.whitespace);
-			var value = data[(separator + 1)..index]; // we'll trim/lowercase this as needed
+			const name = mem.trim(u8, toLower(data[0..separator]), &ascii.whitespace);
+			const value = mem.trim(u8, data[(separator + 1)..index], &ascii.whitespace);
+			headers.add(name, value);
 
-			if (mem.eql(u8, "upgrade", header)) {
-				if (!ascii.eqlIgnoreCase("websocket", mem.trim(u8, value, &ascii.whitespace))) {
+			if (mem.eql(u8, "upgrade", name)) {
+				if (!ascii.eqlIgnoreCase("websocket", value)) {
 					return HandshakeError.InvalidUpgrade;
 				}
 				required_headers |= 1;
-			} else if (mem.eql(u8, "sec-websocket-version", header)) {
-				if (!mem.eql(u8, "13", mem.trim(u8, value, &ascii.whitespace))) {
+			} else if (mem.eql(u8, "sec-websocket-version", name)) {
+				if (!mem.eql(u8, "13", value)) {
 					return HandshakeError.InvalidVersion;
 				}
 				required_headers |= 2;
-			} else if (mem.eql(u8, "connection", header)) {
+			} else if (mem.eql(u8, "connection", name)) {
 				// find if connection header has upgrade in it, example header: 
 				//		Connection: keep-alive, Upgrade
 				if (ascii.indexOfIgnoreCase(value, "upgrade") == null) {
 					return HandshakeError.InvalidConnection;
 				}
 				required_headers |= 4;
-			} else if (mem.eql(u8, "sec-websocket-key", header)) {
-				key = mem.trim(u8, value, &ascii.whitespace);
+			} else if (mem.eql(u8, "sec-websocket-key", name)) {
+				key = value;
 				required_headers |= 8;
 			}
 			const next = index + 2;
@@ -91,7 +96,8 @@ pub const Handshake = struct {
 			.key = key,
 			.url = url,
 			.method = method,
-			.headers = buf[request_line_end+2..request_length+2],
+			.headers = headers,
+			.raw_header = buf[request_line_end+2..request_length+2],
 		};
 	}
 
@@ -144,23 +150,32 @@ fn toLower(str: []u8) []u8 {
 test "handshake: parse" {
 	var buffer: [512]u8 = undefined;
 	var buf = buffer[0..];
+	var headers = try KeyValue.init(t.allocator, 10);
+	defer headers.deinit(t.allocator);
 
-	try t.expectEqual(testHandshake("GET / HTTP/1.0\r\n\r\n", buf), HandshakeError.InvalidProtocol);
-	try t.expectEqual(testHandshake("GET / HTTP/1.1\r\n\r\n", buf), HandshakeError.MissingHeaders);
-	try t.expectEqual(testHandshake("GET / HTTP/1.1\r\nConnection:  upgrade\r\n\r\n", buf), HandshakeError.MissingHeaders);
-	try t.expectEqual(testHandshake("GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n", buf), HandshakeError.MissingHeaders);
-	try t.expectEqual(testHandshake("GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nsec-websocket-version:13\r\n\r\n", buf), HandshakeError.MissingHeaders);
+	try t.expectEqual(testHandshake("GET / HTTP/1.0\r\n\r\n", buf, &headers), HandshakeError.InvalidProtocol);
+	try t.expectEqual(testHandshake("GET / HTTP/1.1\r\n\r\n", buf, &headers), HandshakeError.MissingHeaders);
+	try t.expectEqual(testHandshake("GET / HTTP/1.1\r\nConnection:  upgrade\r\n\r\n", buf, &headers), HandshakeError.MissingHeaders);
+	try t.expectEqual(testHandshake("GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n", buf, &headers), HandshakeError.MissingHeaders);
+	try t.expectEqual(testHandshake("GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nsec-websocket-version:13\r\n\r\n", buf, &headers), HandshakeError.MissingHeaders);
 
 	{
-		const h = try testHandshake("GET /test?a=1   HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nsec-websocket-version:13\r\nsec-websocket-key: 9000!\r\nCustom: Header-Value\r\n\r\n", buf);
+		headers.reset();
+		const h = try testHandshake("GET /test?a=1   HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nsec-websocket-version:13\r\nsec-websocket-key: 9000!\r\nCustom:  Header-Value\r\n\r\n", buf, &headers);
 		try t.expectString("9000!", h.key);
 		try t.expectString("GET", h.method);
 		try t.expectString("/test?a=1", h.url);
-		try t.expectString("connection: upgrade\r\nupgrade: websocket\r\nsec-websocket-version:13\r\nsec-websocket-key: 9000!\r\ncustom: Header-Value\r\n", h.headers);
+		try t.expectString("connection: upgrade\r\nupgrade: websocket\r\nsec-websocket-version:13\r\nsec-websocket-key: 9000!\r\ncustom:  Header-Value\r\n", h.raw_header);
+		try t.expectString("upgrade", headers.get("connection").?);
+		try t.expectString("websocket", headers.get("upgrade").?);
+		try t.expectString("13", headers.get("sec-websocket-version").?);
+		try t.expectString("9000!", headers.get("sec-websocket-key").?);
+		try t.expectString("Header-Value", headers.get("custom").?);
 	}
 
 	// fuzz tests
 	{
+		headers.reset();
 		var r = t.getRandom();
 		var random = r.random();
 		var count: usize = 0;
@@ -174,7 +189,7 @@ test "handshake: parse" {
 				data = data[l..];
 			}
 			const request_buf = Request.read(&s, buf) catch unreachable;
-			const h = Handshake.parse(request_buf) catch unreachable;
+			const h = Handshake.parse(request_buf, &headers) catch unreachable;
 			try t.expectString("1139329", h.key);
 			try t.expectString("/", h.url);
 			try t.expectString("GET", h.method);
@@ -190,7 +205,8 @@ test "handshake: reply" {
 	const h = Handshake{
 		.url = "",
 		.method = "",
-		.headers = "",
+		.raw_header = "",
+		.headers = undefined,
 		.key = "this is my key",
 	};
 	try h.reply(&s);
@@ -203,11 +219,11 @@ test "handshake: reply" {
 	}
 }
 
-fn testHandshake(input: []const u8, buf: []u8) !Handshake {
+fn testHandshake(input: []const u8, buf: []u8, headers: *KeyValue) !Handshake {
 	var s = t.Stream.init();
 	_ = s.add(input);
 
 	defer s.deinit();
 	const request_buf = try Request.read( &s, buf);
-	return Handshake.parse(request_buf);
+	return Handshake.parse(request_buf, headers);
 }

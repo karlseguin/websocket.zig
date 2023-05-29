@@ -110,15 +110,15 @@ fn handleLoop(comptime H: type, allocator: Allocator, context: anytype, stream: 
 	var handler: H = undefined;
 
 	{
-		// This block represents handshake_buffer's lifetime
-		var handshake_buffer = try pool.acquire();
-		defer pool.release(handshake_buffer);
+		// This block represents handshake_state's lifetime
+		var handshake_state = try pool.acquire();
+		defer pool.release(handshake_state);
 
-		const request = Request.read(stream, handshake_buffer) catch |err| {
+		const request = Request.read(stream, handshake_state.buffer) catch |err| {
 			return Request.close(stream, err);
 		};
 
-		const h = Handshake.parse(request) catch |err| {
+		const h = Handshake.parse(request, &handshake_state.headers) catch |err| {
 			return Handshake.close(stream, err);
 		};
 
@@ -666,7 +666,7 @@ fn testReadFrames(s: *t.Stream, expected: []Expect) !void {
 		.max_size = TEST_BUFFER_SIZE * 10,
 	};
 
-	var pool = try Pool.init(t.allocator, 10, 512);
+	var pool = try Pool.init(t.allocator, 10, 512, 10);
 	defer pool.deinit();
 
 	while (count < 100) : (count += 1) {
