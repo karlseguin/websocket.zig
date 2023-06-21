@@ -174,7 +174,7 @@ pub const Stream = struct {
 
 		if (self.handshake_index) |index| {
 			std.mem.copy(u8, buf, HANDSHAKE[index..]);
-			const written = std.math.min(buf.len, HANDSHAKE.len - index);
+			const written = @min(buf.len, HANDSHAKE.len - index);
 			if (written < buf.len) {
 				self.handshake_index = null;
 			} else {
