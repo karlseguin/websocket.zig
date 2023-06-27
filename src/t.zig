@@ -134,21 +134,21 @@ pub const Stream = struct {
 		}
 
 		if (length_of_length == 0) {
-			frames[start + 1] = 128 | @intCast(u8, l);
+			frames[start + 1] = 128 | @as(u8, @intCast(l));
 		} else if (length_of_length == 2) {
 			frames[start + 1] = 128 | 126;
-			frames[start + 2] = @intCast(u8, (l >> 8) & 0xFF);
-			frames[start + 3] = @intCast(u8, l & 0xFF);
+			frames[start + 2] = @intCast((l >> 8) & 0xFF);
+			frames[start + 3] = @intCast(l & 0xFF);
 		} else {
 			frames[start + 1] = 128 | 127;
-			frames[start + 2] = @intCast(u8, (l >> 56) & 0xFF);
-			frames[start + 3] = @intCast(u8, (l >> 48) & 0xFF);
-			frames[start + 4] = @intCast(u8, (l >> 40) & 0xFF);
-			frames[start + 5] = @intCast(u8, (l >> 32) & 0xFF);
-			frames[start + 6] = @intCast(u8, (l >> 24) & 0xFF);
-			frames[start + 7] = @intCast(u8, (l >> 16) & 0xFF);
-			frames[start + 8] = @intCast(u8, (l >> 8) & 0xFF);
-			frames[start + 9] = @intCast(u8, l & 0xFF);
+			frames[start + 2] = @intCast((l >> 56) & 0xFF);
+			frames[start + 3] = @intCast((l >> 48) & 0xFF);
+			frames[start + 4] = @intCast((l >> 40) & 0xFF);
+			frames[start + 5] = @intCast((l >> 32) & 0xFF);
+			frames[start + 6] = @intCast((l >> 24) & 0xFF);
+			frames[start + 7] = @intCast((l >> 16) & 0xFF);
+			frames[start + 8] = @intCast((l >> 8) & 0xFF);
+			frames[start + 9] = @intCast(l & 0xFF);
 		}
 
 		// +2 for the 2 byte prefix
@@ -331,8 +331,8 @@ pub const Received = struct {
 			};
 
 			const payload_length = switch (length_of_length) {
-				2 => @intCast(u16, f[3]) | @intCast(u16, f[2]) << 8,
-				8 => @intCast(u64, f[9]) | @intCast(u64, f[8]) << 8 | @intCast(u64, f[7]) << 16 | @intCast(u64, f[6]) << 24 | @intCast(u64, f[5]) << 32 | @intCast(u64, f[4]) << 40 | @intCast(u64, f[3]) << 48 | @intCast(u64, f[2]) << 56,
+				2 => @as(u16, @intCast(f[3])) | (@as(u16, @intCast(f[2])) << 8),
+				8 => @as(u64, @intCast(f[9])) | @as(u64, @intCast(f[8])) << 8 | @as(u64, @intCast(f[7])) << 16 | @as(u64,  @intCast(f[6])) << 24 | @as(u64, @intCast(f[5])) << 32 | @as(u64, @intCast(f[4])) << 40 | @as(u64, @intCast(f[3])) << 48 | @as(u64, @intCast(f[2])) << 56,
 				else => f[1],
 			};
 

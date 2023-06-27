@@ -240,8 +240,8 @@ fn readFrame(stream: Stream, state: *const ReadState) !?Message {
 			ParsePhase.header => {
 				const msg = buf.message();
 				var payload_length = switch (length_of_length) {
-					2 => @intCast(u16, msg[3]) | @intCast(u16, msg[2]) << 8,
-					8 => @intCast(u64, msg[9]) | @intCast(u64, msg[8]) << 8 | @intCast(u64, msg[7]) << 16 | @intCast(u64, msg[6]) << 24 | @intCast(u64, msg[5]) << 32 | @intCast(u64, msg[4]) << 40 | @intCast(u64, msg[3]) << 48 | @intCast(u64, msg[2]) << 56,
+					2 => @as(u16, @intCast(msg[3])) | @as(u16, @intCast(msg[2])) << 8,
+					8 => @as(u64, @intCast(msg[9])) | @as(u64, @intCast(msg[8])) << 8 | @as(u64, @intCast(msg[7])) << 16 | @as(u64, @intCast(msg[6])) << 24 | @as(u64, @intCast(msg[5])) << 32 | @as(u64, @intCast(msg[4])) << 40 | @as(u64, @intCast(msg[3])) << 48 | @as(u64, @intCast(msg[2])) << 56,
 					else => msg[1] & 127,
 				};
 				data_needed += payload_length;
@@ -323,7 +323,7 @@ fn applyMask(mask: []const u8, payload: []u8) void {
 		mask_word[i] = mask[(i + over) & 3];
 		i += 1;
 	}
-	const mask_value = @bitCast(usize, mask_word);
+	const mask_value: usize = @bitCast(mask_word);
 
 	i = 0;
 	while (i < data.len) {
@@ -348,23 +348,23 @@ fn writeFrame(stream: Stream, op_code: u8, data: []const u8) !void {
 	buf[0] = op_code;
 
 	if (l <= 125) {
-		buf[1] = @intCast(u8, l);
+		buf[1] = @intCast(l);
 		try stream.writeAll(buf[0..2]);
 	} else if (l < 65536) {
 		buf[1] = 126;
-		buf[2] = @intCast(u8, (l >> 8) & 0xFF);
-		buf[3] = @intCast(u8, l & 0xFF);
+		buf[2] = @intCast((l >> 8) & 0xFF);
+		buf[3] = @intCast(l & 0xFF);
 		try stream.writeAll(buf[0..4]);
 	} else {
 		buf[1] = 127;
-		buf[2] = @intCast(u8, (l >> 56) & 0xFF);
-		buf[3] = @intCast(u8, (l >> 48) & 0xFF);
-		buf[4] = @intCast(u8, (l >> 40) & 0xFF);
-		buf[5] = @intCast(u8, (l >> 32) & 0xFF);
-		buf[6] = @intCast(u8, (l >> 24) & 0xFF);
-		buf[7] = @intCast(u8, (l >> 16) & 0xFF);
-		buf[8] = @intCast(u8, (l >> 8) & 0xFF);
-		buf[9] = @intCast(u8, l & 0xFF);
+		buf[2] = @intCast((l >> 56) & 0xFF);
+		buf[3] = @intCast((l >> 48) & 0xFF);
+		buf[4] = @intCast((l >> 40) & 0xFF);
+		buf[5] = @intCast((l >> 32) & 0xFF);
+		buf[6] = @intCast((l >> 24) & 0xFF);
+		buf[7] = @intCast((l >> 16) & 0xFF);
+		buf[8] = @intCast((l >> 8) & 0xFF);
+		buf[9] = @intCast(l & 0xFF);
 		try stream.writeAll(buf[0..]);
 	}
 	if (l > 0) {
@@ -396,7 +396,7 @@ fn handleClose(stream: Stream, data: []const u8) !void {
 		// since a 2-byte code is required
 		return try stream.writeAll(CLOSE_PROTOCOL_ERROR);
 	}
-	const code = @intCast(u16, data[1]) | @intCast(u16, data[0]) << 8;
+	const code = @as(u16, @intCast(data[1])) | (@as(u16, @intCast(data[0])) << 8);
 	if (code < 1000 or code == 1004 or code == 1005 or code == 1006 or (code > 1013 and code < 3000)) {
 		return try stream.writeAll(CLOSE_PROTOCOL_ERROR);
 	}

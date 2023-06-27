@@ -26,23 +26,23 @@ fn frameMsg(comptime msg: []const u8, op_code: u8) [frameLen(msg)]u8 {
 
 	const len = msg.len;
 	if (len <= 125) {
-		framed[1] = @intCast(u8, len);
+		framed[1] = @intCast(len);
 		std.mem.copy(u8, framed[2..], msg);
 	} else if (len < 65536) {
 		framed[1] = 126;
-		framed[2] = @intCast(u8, (len >> 8) & 0xFF);
-		framed[3] = @intCast(u8, len & 0xFF);
+		framed[2] = @intCast((len >> 8) & 0xFF);
+		framed[3] = @intCast(len & 0xFF);
 		std.mem.copy(u8, framed[4..], msg);
 	} else {
 		framed[1] = 127;
-		framed[2] = @intCast(u8, (len >> 56) & 0xFF);
-		framed[3] = @intCast(u8, (len >> 48) & 0xFF);
-		framed[4] = @intCast(u8, (len >> 40) & 0xFF);
-		framed[5] = @intCast(u8, (len >> 32) & 0xFF);
-		framed[6] = @intCast(u8, (len >> 24) & 0xFF);
-		framed[7] = @intCast(u8, (len >> 16) & 0xFF);
-		framed[8] = @intCast(u8, (len >> 8) & 0xFF);
-		framed[9] = @intCast(u8, len & 0xFF);
+		framed[2] = @intCast((len >> 56) & 0xFF);
+		framed[3] = @intCast((len >> 48) & 0xFF);
+		framed[4] = @intCast((len >> 40) & 0xFF);
+		framed[5] = @intCast((len >> 32) & 0xFF);
+		framed[6] = @intCast((len >> 24) & 0xFF);
+		framed[7] = @intCast((len >> 16) & 0xFF);
+		framed[8] = @intCast((len >> 8) & 0xFF);
+		framed[9] = @intCast(len & 0xFF);
 		std.mem.copy(u8, framed[10..], msg);
 	}
 	return framed;
