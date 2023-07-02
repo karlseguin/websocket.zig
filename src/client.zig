@@ -301,7 +301,7 @@ fn applyMask(mask: []const u8, payload: []u8) void {
 	const word_size = @sizeOf(usize);
 
 	// not point optimizing this if it's a really short payload
-	if (payload.len < word_size * 2) {
+	if (payload.len < word_size) {
 		applyMaskSimple(mask, payload);
 		return;
 	}
@@ -317,19 +317,18 @@ fn applyMask(mask: []const u8, payload: []u8) void {
 		data = data[over..];
 	}
 
-	var i: usize = 0;
-	var mask_word: [word_size]u8 = undefined;
-	while (i < word_size) {
-		mask_word[i] = mask[(i + over) & 3];
-		i += 1;
+	// shift the mask based on the # bytes we already unmasked in the above loop
+	var mask_template: [4]u8 = undefined;
+	for (0..4) |i| {
+		mask_template[i] = mask[(i + over) & 3];
 	}
-	const mask_value: usize = @bitCast(mask_word);
 
-	i = 0;
-	while (i < data.len) {
-		const slice = data[i .. i + word_size];
-		std.mem.bytesAsSlice(usize, slice)[0] ^= mask_value;
-		i += word_size;
+	var i: usize = 0;
+	const mask_vector = std.simd.repeat(word_size, @as(@Vector(4, u8), mask_template[0..4].*));
+	while (i < data.len) : (i += word_size) {
+		var slice = data[i..i+word_size][0..word_size];
+		var masked_data_slice: @Vector(word_size, u8) = slice.*;
+		slice.* = masked_data_slice ^ mask_vector;
 	}
 }
 
