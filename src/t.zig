@@ -22,6 +22,7 @@ pub const Stream = struct {
 	buf_index: usize,
 	read_index: usize,
 	frames: ?[]u8,
+	handle: c_int = 0,
 	handshake_index: ?usize,
 	to_read: ArrayList([]const u8),
 	random: std.rand.DefaultPrng,

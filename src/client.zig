@@ -74,6 +74,7 @@ pub const Message = struct {
 pub const Config = struct {
 	max_size: usize,
 	buffer_size: usize,
+	handshake_timeout_ms: ?u32,
 };
 
 pub const Client = struct {
@@ -114,7 +115,7 @@ fn handleLoop(comptime H: type, allocator: Allocator, context: anytype, stream: 
 		var handshake_state = try pool.acquire();
 		defer pool.release(handshake_state);
 
-		const request = Request.read(stream, handshake_state.buffer) catch |err| {
+		const request = Request.read(stream, handshake_state.buffer, config.handshake_timeout_ms) catch |err| {
 			return Request.close(stream, err);
 		};
 
@@ -663,6 +664,7 @@ fn testReadFrames(s: *t.Stream, expected: []Expect) !void {
 	const config = Config{
 		.buffer_size = TEST_BUFFER_SIZE,
 		.max_size = TEST_BUFFER_SIZE * 10,
+		.handshake_timeout_ms = null,
 	};
 
 	var pool = try Pool.init(t.allocator, 10, 512, 10);

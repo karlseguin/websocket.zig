@@ -110,6 +110,7 @@ The 4th parameter to `websocket.listen` is a configuration object.
 * `handshake_pool_size` - The number of buffers to create and keep for reading the initial handshake. Default: `50`
 * `handshake_max_size` - The maximum size of the initial handshake to allow. Default: `1024`.
 * `max_headers` - The maximum size of headers to store in `handshake.headers`. Requests with more headers will still be processed, but `handshake.headers` will only contain the first `max_headers` headers. Default: `0`.
+* `handshake_timeout_ms` - The time, in milliseconds, to wait for the handshake to complete. This essentially prevents a client from opening a connection and "hanging" the thread while it waits for data. If a client slowly sends a few bytes at a time, the actual timeout might happen up to 2x longer than specified. Generally speaking, it might be better to let a proxy (e.g. nginx) handle this. Default 10_000;
 
 Setting `max_size == buffer_size` is valid and will ensure that no dynamic memory allocation occurs once the connection is established.
 

@@ -188,7 +188,7 @@ test "handshake: parse" {
 				_ = s.add(data[0..l]);
 				data = data[l..];
 			}
-			const request_buf = Request.read(&s, buf) catch unreachable;
+			const request_buf = Request.read(&s, buf, null) catch unreachable;
 			const h = Handshake.parse(request_buf, &headers) catch unreachable;
 			try t.expectString("1139329", h.key);
 			try t.expectString("/", h.url);
@@ -224,6 +224,6 @@ fn testHandshake(input: []const u8, buf: []u8, headers: *KeyValue) !Handshake {
 	_ = s.add(input);
 
 	defer s.deinit();
-	const request_buf = try Request.read( &s, buf);
+	const request_buf = try Request.read(&s, buf, null);
 	return Handshake.parse(request_buf, headers);
 }

@@ -18,6 +18,7 @@ pub const Config = struct {
 	address: []const u8 = "127.0.0.1",
 	handshake_max_size: usize = 1024,
 	handshake_pool_size: usize = 50,
+	handshake_timeout_ms: ?u32 = 10_000,
 };
 
 const Allocator = std.mem.Allocator;
@@ -39,6 +40,7 @@ pub fn listen(comptime H: type, allocator: Allocator, context: anytype, config: 
 	const client_config = client.Config{
 		.max_size = config.max_size,
 		.buffer_size = config.buffer_size,
+		.handshake_timeout_ms = config.handshake_timeout_ms,
 	};
 
 	while (true) {

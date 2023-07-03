@@ -21,6 +21,7 @@ pub fn main() !void {
 		.port = 9223,
 
 		.address = "127.0.0.1",
+		.handshake_timeout_ms = 3000,
 
 		// We initialize and keep in memory `handshake_pool_size` buffers, each of
 		// `handshake_max_size` at all time. This is used to parse the initial
