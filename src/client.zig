@@ -148,6 +148,10 @@ fn handleLoop(comptime H: type, allocator: Allocator, context: anytype, stream: 
 		state.fragment.deinit();
 	}
 
+	if (comptime std.meta.trait.hasFn("afterInit")(H)) {
+		try handler.afterInit();
+	}
+
 	while (true) {
 		buf.next();
 		const result = readFrame(stream, state) catch |err| {
