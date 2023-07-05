@@ -47,6 +47,9 @@ const Handler = struct {
         };
     }
 
+    // optional hook that, if present, will be called after initialization is complete
+    pub fn afterInit(self: *Handler) !void {}
+
     pub fn handle(self: *Handler, message: Message) !void {
         const data = message.data;
         try self.client.write(data); // echo the message back
