@@ -137,6 +137,10 @@ fn handleLoop(comptime H: type, allocator: Allocator, context: anytype, stream: 
 
 	defer handler.close();
 
+	if (comptime std.meta.trait.hasFn("afterInit")(H)) {
+		try handler.afterInit();
+	}
+
 	var buf = try Buffer.init(allocator, config.buffer_size, config.max_size);
 	var fragment = Fragmented.init(allocator);
 	var state = &ReadState{
@@ -147,10 +151,6 @@ fn handleLoop(comptime H: type, allocator: Allocator, context: anytype, stream: 
 	defer {
 		buf.deinit();
 		state.fragment.deinit();
-	}
-
-	if (comptime std.meta.trait.hasFn("afterInit")(H)) {
-		try handler.afterInit();
 	}
 
 	while (true) {
