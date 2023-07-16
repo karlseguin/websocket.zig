@@ -101,6 +101,7 @@ pub const Client = struct {
 };
 
 pub fn handle(comptime H: type, allocator: Allocator, context: anytype, conn: Conn, config: Config, pool: *Pool) void {
+	std.os.maybeIgnoreSigpipe();
 	const stream = if (comptime builtin.is_test) conn else conn.stream;
 	defer stream.close();
 	handleLoop(H, allocator, context, stream, config, pool) catch return;
