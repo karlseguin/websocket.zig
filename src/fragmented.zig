@@ -1,10 +1,8 @@
 const std = @import("std");
-const t = @import("t.zig");
-const client = @import("client.zig");
+const lib = @import("lib.zig");
 
 const Allocator = std.mem.Allocator;
-const MessageType = client.MessageType;
-const Error = client.Error;
+const MessageType = lib.MessageType;
 
 pub const Fragmented = struct {
 	buf: []u8,
@@ -65,6 +63,7 @@ pub const Fragmented = struct {
 	}
 };
 
+const t = lib.testing;
 test "fragmented" {
 	{
 		var f = Fragmented.init(t.allocator);

@@ -1,6 +1,6 @@
 const std = @import("std");
-const t = @import("t.zig");
-const client = @import("client.zig");
+const lib = @import("lib.zig");
+const t = lib.testing;
 
 pub fn init() *Testing {
 	var stream = t.allocator.create(t.Stream) catch unreachable;
@@ -12,7 +12,7 @@ pub fn init() *Testing {
 		.read_index = 0,
 		.stream = stream,
 		.received = null,
-		.client = client.Client{
+		.conn = lib.Conn{
 			.closed = false,
 			.stream = stream,
 		},
@@ -23,7 +23,7 @@ pub fn init() *Testing {
 
 pub const Testing = struct {
 	stream: *t.Stream,
-	client: client.Client,
+	conn: lib.Conn,
 	received: ?t.Received,
 	read_index: usize,
 
@@ -37,7 +37,7 @@ pub const Testing = struct {
 		t.allocator.destroy(self);
 	}
 
-	pub fn textMessage(_: Testing, data: []const u8) client.Message {
+	pub fn textMessage(_: Testing, data: []const u8) lib.Message {
 		return .{
 			.data = data,
 			.type = .text,
@@ -57,7 +57,7 @@ pub const Testing = struct {
 		self.read_index = read_index + 1;
 
 		const msg = messages[read_index];
-		try t.expectEqual(@as(client.MessageType, .text), msg.type);
+		try t.expectEqual(@as(lib.MessageType, .text), msg.type);
 		try t.expectString(expected, msg.data);
 	}
 

@@ -1,8 +1,6 @@
 const std = @import("std");
-const builtin = @import("builtin");
+const lib = @import("lib.zig");
 
-const t = @import("t.zig");
-const client = @import("client.zig");
 const Request = @import("request.zig").Request;
 const KeyValue = @import("key_value.zig").KeyValue;
 
@@ -10,18 +8,8 @@ const mem = std.mem;
 const net = std.net;
 const ascii = std.ascii;
 const Allocator = std.mem.Allocator;
-const Stream = if (builtin.is_test) *t.Stream else std.net.Stream;
 
-const HandshakeError = error{
-	Empty,
-	InvalidProtocol,
-	InvalidRequestLine,
-	InvalidHeader,
-	InvalidUpgrade,
-	InvalidVersion,
-	InvalidConnection,
-	MissingHeaders,
-};
+const Stream = lib.Stream;
 
 pub const Handshake = struct {
 	url: []const u8,
@@ -31,14 +19,14 @@ pub const Handshake = struct {
 	raw_header: []const u8,
 
 	pub fn parse(buf: []u8, headers: *KeyValue) !Handshake {
-		@setRuntimeSafety(builtin.is_test);
+		@setRuntimeSafety(lib.is_test);
 
 		var data = buf;
 		const request_line_end = mem.indexOfScalar(u8, data, '\r') orelse unreachable;
 		var request_line = data[0..request_line_end];
 
 		if (!ascii.endsWithIgnoreCase(request_line, "http/1.1")) {
-			return HandshakeError.InvalidProtocol;
+			return error.InvalidProtocol;
 		}
 
 		var key: []const u8 = "";
@@ -50,7 +38,7 @@ pub const Handshake = struct {
 
 		while (data.len > 4) {
 			const index = mem.indexOfScalar(u8, data, '\r') orelse unreachable;
-			const separator = mem.indexOfScalar(u8, data[0..index], ':') orelse return HandshakeError.InvalidHeader;
+			const separator = mem.indexOfScalar(u8, data[0..index], ':') orelse return error.InvalidHeader;
 
 			const name = mem.trim(u8, toLower(data[0..separator]), &ascii.whitespace);
 			const value = mem.trim(u8, data[(separator + 1)..index], &ascii.whitespace);
@@ -58,19 +46,19 @@ pub const Handshake = struct {
 
 			if (mem.eql(u8, "upgrade", name)) {
 				if (!ascii.eqlIgnoreCase("websocket", value)) {
-					return HandshakeError.InvalidUpgrade;
+					return error.InvalidUpgrade;
 				}
 				required_headers |= 1;
 			} else if (mem.eql(u8, "sec-websocket-version", name)) {
 				if (!mem.eql(u8, "13", value)) {
-					return HandshakeError.InvalidVersion;
+					return error.InvalidVersion;
 				}
 				required_headers |= 2;
 			} else if (mem.eql(u8, "connection", name)) {
 				// find if connection header has upgrade in it, example header: 
 				//		Connection: keep-alive, Upgrade
 				if (ascii.indexOfIgnoreCase(value, "upgrade") == null) {
-					return HandshakeError.InvalidConnection;
+					return error.InvalidConnection;
 				}
 				required_headers |= 4;
 			} else if (mem.eql(u8, "sec-websocket-key", name)) {
@@ -83,12 +71,12 @@ pub const Handshake = struct {
 		}
 
 		if (required_headers != 15) {
-			return HandshakeError.MissingHeaders;
+			return error.MissingHeaders;
 		}
 
 		// we already established that request_line ends with http/1.1, so this buys
 		// us some leeway into parsing it
-		const separator = mem.indexOfScalar(u8, request_line, ' ') orelse return HandshakeError.InvalidRequestLine;
+		const separator = mem.indexOfScalar(u8, request_line, ' ') orelse return error.InvalidRequestLine;
 		const method = request_line[0..separator];
 		const url = mem.trim(u8, request_line[separator + 1 .. request_line.len - 9], &ascii.whitespace);
 
@@ -147,17 +135,18 @@ fn toLower(str: []u8) []u8 {
 	return str;
 }
 
+const t = lib.testing;
 test "handshake: parse" {
 	var buffer: [512]u8 = undefined;
 	var buf = buffer[0..];
 	var headers = try KeyValue.init(t.allocator, 10);
 	defer headers.deinit(t.allocator);
 
-	try t.expectEqual(testHandshake("GET / HTTP/1.0\r\n\r\n", buf, &headers), HandshakeError.InvalidProtocol);
-	try t.expectEqual(testHandshake("GET / HTTP/1.1\r\n\r\n", buf, &headers), HandshakeError.MissingHeaders);
-	try t.expectEqual(testHandshake("GET / HTTP/1.1\r\nConnection:  upgrade\r\n\r\n", buf, &headers), HandshakeError.MissingHeaders);
-	try t.expectEqual(testHandshake("GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n", buf, &headers), HandshakeError.MissingHeaders);
-	try t.expectEqual(testHandshake("GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nsec-websocket-version:13\r\n\r\n", buf, &headers), HandshakeError.MissingHeaders);
+	try t.expectEqual(testHandshake("GET / HTTP/1.0\r\n\r\n", buf, &headers), error.InvalidProtocol);
+	try t.expectEqual(testHandshake("GET / HTTP/1.1\r\n\r\n", buf, &headers), error.MissingHeaders);
+	try t.expectEqual(testHandshake("GET / HTTP/1.1\r\nConnection:  upgrade\r\n\r\n", buf, &headers), error.MissingHeaders);
+	try t.expectEqual(testHandshake("GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n", buf, &headers), error.MissingHeaders);
+	try t.expectEqual(testHandshake("GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nsec-websocket-version:13\r\n\r\n", buf, &headers), error.MissingHeaders);
 
 	{
 		headers.reset();

@@ -1,24 +1,24 @@
 const std = @import("std");
-const t = @import("t.zig");
-const client = @import("client.zig");
+const lib = @import("lib.zig");
 
-const l = @import("listen.zig");
-
-pub const listen = l.listen;
-pub const Config = l.Config;
-pub const Client = client.Client;
-pub const Message = client.Message;
 pub const testing = @import("testing.zig");
-pub const Handshake = @import("handshake.zig").Handshake;
+pub const listen = @import("listen.zig").listen;
+
+pub const Conn = lib.Conn;
+pub const Message = lib.Message;
+pub const Handshake = lib.Handshake;
+
+pub const Config = struct{
+	pub const Server = @import("listen.zig").Config;
+};
 
 pub fn frameText(comptime msg: []const u8) [frameLen(msg)]u8 {
-	return frameMsg(msg, client.TEXT_FRAME);
+	return frameMsg(msg, lib.TEXT_FRAME);
 }
 
 pub fn frameBin(comptime msg: []const u8) [frameLen(msg)]u8 {
-	return frameMsg(msg, client.BIN_FRAME);
+	return frameMsg(msg, lib.BIN_FRAME);
 }
-
 
 fn frameMsg(comptime msg: []const u8, op_code: u8) [frameLen(msg)]u8 {
 	var framed: [frameLen(msg)]u8 = undefined;
@@ -58,6 +58,7 @@ comptime {
 	std.testing.refAllDecls(@This());
 }
 
+const t = lib.testing;
 test "frameText" {
 	{
 		// short

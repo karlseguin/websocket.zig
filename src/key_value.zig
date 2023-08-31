@@ -1,5 +1,5 @@
 const std = @import("std");
-const t = @import("t.zig");
+const lib = @import("lib.zig");
 
 const mem = std.mem;
 const ascii = std.ascii;
@@ -56,6 +56,7 @@ pub const KeyValue = struct {
 	}
 };
 
+const t = lib.testing;
 test "key_value: get" {
 	var allocator = t.allocator;
 	var kv = try KeyValue.init(allocator, 2);

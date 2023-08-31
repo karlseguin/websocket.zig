@@ -1,5 +1,5 @@
 const std = @import("std");
-const client = @import("client.zig");
+const lib = @import("lib.zig");
 
 const mem = std.mem;
 const ArrayList = std.ArrayList;
@@ -16,6 +16,10 @@ pub fn getRandom() std.rand.DefaultPrng {
 	std.os.getrandom(std.mem.asBytes(&seed)) catch unreachable;
 	return std.rand.DefaultPrng.init(seed);
 }
+
+pub const NetConn = struct {
+	stream: *Stream,
+};
 
 pub const Stream = struct {
 	closed: bool,
@@ -279,8 +283,8 @@ pub const Stream = struct {
 };
 
 pub const Received = struct {
-	_ptr: []client.Message,
-	messages: []client.Message,
+	_ptr: []lib.Message,
+	messages: []lib.Message,
 
 	// We make some big assumptions about these messages.
 	// Namely, we know that there's no websocket fragmentation, there's no
@@ -310,14 +314,14 @@ pub const Received = struct {
 		var frame_index: usize = 0;
 		var message_index: usize = 0;
 
-		var messages = allocator.alloc(client.Message, frames.len) catch unreachable;
+		var messages = allocator.alloc(lib.Message, frames.len) catch unreachable;
 		while (frame_index < frames.len) : (frame_index += 1) {
 			var f = frames[frame_index];
 			const message_type = switch (f[0] & 15) {
-				1 => client.MessageType.text,
-				2 => client.MessageType.binary,
-				8 => client.MessageType.close,
-				10 => client.MessageType.pong,
+				1 => lib.MessageType.text,
+				2 => lib.MessageType.binary,
+				8 => lib.MessageType.close,
+				10 => lib.MessageType.pong,
 				else => unreachable,
 			};
 
@@ -346,7 +350,7 @@ pub const Received = struct {
 				payload = f;
 			}
 
-			messages[message_index] = client.Message{
+			messages[message_index] = lib.Message{
 				.data = payload,
 				.type = message_type,
 			};

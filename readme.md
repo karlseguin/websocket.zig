@@ -1,13 +1,13 @@
 A zig websocket server.
 
-Zig 0.11-dev is rapidly changing and constantly breaking features. I'll try to keep this up to date as much as possible. Note that 0.11-dev currently does not support async, so I've reverted to threads.
+Zig 0.12-dev is rapidly changing and constantly breaking features. I'll try to keep this up to date as much as possible. Note that 0.12-dev currently does not support async, so I've reverted to threads.
 
 See the [v0.10.1-compat](https://github.com/karlseguin/websocket.zig/tree/v0.10.1-compat) tag for a release that's compatible with Zig 0.10.1.
 
 ## Example
 ```zig
 const websocket = @import("websocket");
-const Client = websocket.Client;
+const Conn = websocket.Conn;
 const Message = websocket.Message;
 const Handshake = websocket.Handshake;
 
@@ -31,10 +31,10 @@ pub fn main() !void {
 }
 
 const Handler = struct {
-    client: *Client,
+    conn: *Conn,
     context: *Context,
 
-    pub fn init(h: Handshake, client: *Client, context: *Context) !Handler {
+    pub fn init(h: Handshake, conn: *Conn, context: *Context) !Handler {
         // `h` contains the initial websocket "handshake" request
         // It can be used to apply application-specific logic to verify / allow
         // the connection (e.g. valid url, query string parameters, or headers)
@@ -42,7 +42,7 @@ const Handler = struct {
         _ = h; // we're not using this in our simple case
 
         return Handler{
-            .client = client,
+            .conn = conn,
             .context = context,
         };
     }
@@ -52,7 +52,7 @@ const Handler = struct {
 
     pub fn handle(self: *Handler, message: Message) !void {
         const data = message.data;
-        try self.client.write(data); // echo the message back
+        try self.conn.write(data); // echo the message back
     }
 
     // called whenever the connection is closed, can do some cleanup in here
@@ -61,7 +61,7 @@ const Handler = struct {
 ```
 
 ### init
-The `init` method is called with a `websocket.Handshake`, a `*websocket.Client` and whatever `context` value was passed as the 3rd parameter to `websocket.listen`.
+The `init` method is called with a `websocket.Handshake`, a `*websocket.Conn` and whatever `context` value was passed as the 3rd parameter to `websocket.listen`.
 
 The websocket specification requires the initial "handshake" to contain certain headers and values. The library validates these headers. However applications may have additional requirements before allowing the connection to be "upgraded" to a websocket connection. For example, a one-time-use token could be required in the querystring. Applications should use the provided `websocket.Handshake` to apply any application-specific verification and optionally return an error to terminate the connection.
 
@@ -93,10 +93,10 @@ If `handle` returns an error, the connection is closed.
 ### close
 Called whenever the connection terminates. By the time `close` is called, there is no guarantee about the state of the underlying TCP connection (it may or may not be closed).
 
-## websocket.Client
-The call to `init` includes a `*websocket.Client`. It is expected that handlers will keep a reference to it. The main purpose of the `*Client` is to write data via `client.write([]const u8)` and `client.writeBin([]const u8)`. The websocket protocol differentiates between a "text" and "binary" message, with the only difference that "text" must be valid UTF-8. This library does not enforce this. Which you use really depends on what your client expects. For browsers, text messages appear as strings, and binary messages appear as a Blob or ArrayBuffer (depending on how the client is configured).
+## websocket.Conn
+The call to `init` includes a `*websocket.Conn`. It is expected that handlers will keep a reference to it. The main purpose of the `*Conn` is to write data via `conn.write([]const u8)` and `conn.writeBin([]const u8)`. The websocket protocol differentiates between a "text" and "binary" message, with the only difference that "text" must be valid UTF-8. This library does not enforce this. Which you use really depends on what your client expects. For browsers, text messages appear as strings, and binary messages appear as a Blob or ArrayBuffer (depending on how the client is configured).
 
-`client.close()` can also be called to close the connection. Calling `client.close()` **will** result in the handler's `close` callback being called.
+`conn.close()` can also be called to close the connection. Calling `conn.close()` **will** result in the handler's `close` callback being called.
 
 ## Autobahn
 Every mandatory [Autobahn Testsuite](https://github.com/crossbario/autobahn-testsuite) case is passing. (Three fragmented UTF-8 are flagged as non-strict and as compression is not implemented, these are all flagged as "Unimplemented").
@@ -126,7 +126,7 @@ Websockets have their own fragmentation "feature" (not the same as TCP fragmenta
 ## Advanced
 
 ### Pre-Framed Comptime Message
-Websocket message have their own special framing. When you use `client.write` or `client.writeBin` the data you provide is "framed" into a correct websocket message. Framing is fast and cheap (e.g., it DOES NOT require an O(N) loop through the data). Nonetheless, there may be be cases where pre-framing messages at compile-time is desired. The `websocket.frameText` and `websocket.frameBin` can be used for this purpose:
+Websocket message have their own special framing. When you use `conn.write` or `conn.writeBin` the data you provide is "framed" into a correct websocket message. Framing is fast and cheap (e.g., it DOES NOT require an O(N) loop through the data). Nonetheless, there may be be cases where pre-framing messages at compile-time is desired. The `websocket.frameText` and `websocket.frameBin` can be used for this purpose:
 
 ```zig
 const UNKNOWN_COMMAND = websocket.frameText("unknown command");
@@ -139,7 +139,7 @@ pub fn handle(self: *Handler, message: Message) !void {
     } else if (std.mem.startsWith(u8, data, "leave: ")) {
         self.handleLead(data)
     } else {
-        try self.client.writeFramed(UNKNOWN_COMMAND);
+        try self.conn.writeFramed(UNKNOWN_COMMAND);
     }
 }
 ```
@@ -155,7 +155,7 @@ test "handler invalid message" {
     defer wtt.deinit();
 
     var handler = MyAppHandler{
-        .client = &wtt.client,
+        .conn = &wtt.conn,
     }
 
     handler.handle(wtt.textMessage("hack"));
@@ -165,7 +165,7 @@ test "handler invalid message" {
 
 For testing websockets, you usually care about two things: emulating incoming messages and asserting the messages sent to the client.
 
-`wtt.client` is an instance of a `websocket.Client` which is usually passed to your handler's `init` function. For testing purposes, you can inject thing directly into your handler. The `wtt.expectText` asserts that the expected message was sent to the client. 
+`wtt.conn` is an instance of a `websocket.Conn` which is usually passed to your handler's `init` function. For testing purposes, you can inject it directly into your handler. The `wtt.expectText` asserts that the expected message was sent to the conn. 
 
 The `wtt.textMessage` generates a message that you can pass into your handle's `handle` function.
 

@@ -3,7 +3,7 @@ const websocket = @import("./src/websocket.zig");
 
 const Allocator = std.mem.Allocator;
 
-const Client = websocket.Client;
+const Conn = websocket.Conn;
 const Message = websocket.Message;
 const Handshake = websocket.Handshake;
 
@@ -17,7 +17,7 @@ pub fn main() !void {
 	// abitrary context object that will get passed to your handler
 	var context = Context{};
 
-	const config = websocket.Config{
+	const config = websocket.Config.Server{
 		.port = 9223,
 
 		.address = "127.0.0.1",
@@ -58,12 +58,12 @@ pub fn main() !void {
 const Context = struct {};
 
 const Handler = struct {
-	client: *Client,
+	conn: *Conn,
 	context: *Context,
 
-	pub fn init(_: Handshake, client: *Client, context: *Context) !Handler {
+	pub fn init(_: Handshake, conn: *Conn, context: *Context) !Handler {
 		return Handler{
-			.client = client,
+			.conn = conn,
 			.context = context,
 		};
 	}
@@ -71,12 +71,12 @@ const Handler = struct {
 	pub fn handle(self: *Handler, message: Message) !void {
 		const data = message.data;
 		switch (message.type) {
-			.binary => try self.client.writeBin(data),
+			.binary => try self.conn.writeBin(data),
 			.text => {
 				if (std.unicode.utf8ValidateSlice(data)) {
-					try self.client.write(data);
+					try self.conn.write(data);
 				} else {
-					self.client.close();
+					self.conn.close();
 				}
 			},
 			else => unreachable,
