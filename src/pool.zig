@@ -112,15 +112,15 @@ test "pool: acquire and release" {
 
 	try t.expectEqual(false, &hs1a.buffer[0] == &hs2a.buffer[0]);
 	try t.expectEqual(false, &hs2a.buffer[0] == &hs3a.buffer[0]);
-	try t.expectEqual(@as(usize, 10), hs1a.buffer.len);
-	try t.expectEqual(@as(usize, 10), hs2a.buffer.len);
-	try t.expectEqual(@as(usize, 10), hs3a.buffer.len);
-	try t.expectEqual(@as(usize, 0), hs1a.headers.len);
-	try t.expectEqual(@as(usize, 0), hs2a.headers.len);
-	try t.expectEqual(@as(usize, 0), hs3a.headers.len);
-	try t.expectEqual(@as(usize, 3), hs1a.headers.keys.len);
-	try t.expectEqual(@as(usize, 3), hs2a.headers.keys.len);
-	try t.expectEqual(@as(usize, 3), hs3a.headers.keys.len);
+	try t.expectEqual(10, hs1a.buffer.len);
+	try t.expectEqual(10, hs2a.buffer.len);
+	try t.expectEqual(10, hs3a.buffer.len);
+	try t.expectEqual(0, hs1a.headers.len);
+	try t.expectEqual(0, hs2a.headers.len);
+	try t.expectEqual(0, hs3a.headers.len);
+	try t.expectEqual(3, hs1a.headers.keys.len);
+	try t.expectEqual(3, hs2a.headers.keys.len);
+	try t.expectEqual(3, hs3a.headers.keys.len);
 
 	p.release(hs1a);
 

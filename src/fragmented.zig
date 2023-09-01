@@ -7,13 +7,11 @@ const MessageType = lib.MessageType;
 pub const Fragmented = struct {
 	buf: []u8,
 	len: usize,
-	type: MessageType,
 	allocator: Allocator,
+	type: MessageType,
 
-	const Self = @This();
-
-	pub fn init(allocator: Allocator) Self {
-		return Self{
+	pub fn init(allocator: Allocator) Fragmented {
+		return .{
 			.len = 0,
 			.buf = undefined,
 			.allocator = allocator,
@@ -21,20 +19,19 @@ pub const Fragmented = struct {
 		};
 	}
 
-	pub fn is_fragmented(self: Self) bool {
-		return self.type != MessageType.invalid;
+	pub fn is_fragmented(self: Fragmented) bool {
+		return self.type != .invalid;
 	}
 
-	pub fn new(self: *Self, message_type: MessageType, value: []const u8) !void {
+	pub fn new(self: *Fragmented, message_type: MessageType, value: []const u8) !void {
 		const l = value.len;
 		self.type = message_type;
-		self.buf = try self.allocator.alloc(u8, l);
-		std.mem.copy(u8, self.buf, value);
+		self.buf = try self.allocator.dupe(u8, value);
 		self.len = l;
 	}
 
-	pub fn add(self: *Self, value: []const u8) !bool {
-		if (self.type == MessageType.invalid) {
+	pub fn add(self: *Fragmented, value: []const u8) !bool {
+		if (self.type == .invalid) {
 			return false;
 		}
 
@@ -49,16 +46,16 @@ pub const Fragmented = struct {
 		return true;
 	}
 
-	pub fn reset(self: *Self) void {
-		if (self.type == MessageType.invalid) {
+	pub fn reset(self: *Fragmented) void {
+		if (self.type == .invalid) {
 			return;
 		}
 		self.len = 0;
 		self.allocator.free(self.buf);
-		self.type = MessageType.invalid;
+		self.type = .invalid;
 	}
 
-	pub fn deinit(self: *Self) void {
+	pub fn deinit(self: *Fragmented) void {
 		self.reset();
 	}
 };
@@ -70,13 +67,13 @@ test "fragmented" {
 		defer f.reset();
 
 		try f.new(MessageType.text, "hello");
-		try t.expectString(f.buf, "hello");
+		try t.expectString("hello", f.buf);
 
-		try t.expectEqual(f.add(" "), true);
+		try t.expectEqual(true, f.add(" "));
 		try t.expectString(f.buf, "hello ");
 
-		try t.expectEqual(f.add("world"), true);
-		try t.expectString(f.buf, "hello world");
+		try t.expectEqual(true, f.add("world"));
+		try t.expectString("hello world", f.buf);
 	}
 
 	{
@@ -100,7 +97,7 @@ test "fragmented" {
 					try f.new(MessageType.binary, buf[0..c]);
 				} else {
 					// add to our fragmented
-					try t.expectEqual(f.add(buf[0..c]), true);
+					try t.expectEqual(true, f.add(buf[0..c]));
 				}
 
 				// add to our control

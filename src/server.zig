@@ -1,11 +1,11 @@
 const std = @import("std");
 const lib = @import("lib.zig");
 
-const Conn = lib.Conn;
-const Pool = lib.Pool;
+const Pool = @import("pool.zig").Pool;
+
+const Reader = lib.Reader;
 const NetConn = lib.NetConn;
-const Request = lib.Request;
-const Handshake = lib.Handshake;
+const framing = lib.framing;
 
 const os = std.os;
 const net = std.net;
@@ -39,7 +39,6 @@ pub fn listen(comptime H: type, allocator: Allocator, context: anytype, config: 
 	// }
 	try os.setsockopt(server.sockfd.?, os.IPPROTO.TCP, 1, &std.mem.toBytes(@as(c_int, 1)));
 
-
 	while (true) {
 		if (server.accept()) |conn| {
 			const args = .{ H, allocator, context, conn, &config, &pool };
@@ -55,7 +54,9 @@ pub fn listen(comptime H: type, allocator: Allocator, context: anytype, config: 
 	}
 }
 
-pub fn clientLoop(comptime H: type, allocator: Allocator, context: anytype, net_conn: NetConn, config: *const Config, pool: *Pool) void {
+fn clientLoop(comptime H: type, allocator: Allocator, context: anytype, net_conn: NetConn, config: *const Config, pool: *Pool) void {
+	const Handshake = lib.Handshake;
+
 	std.os.maybeIgnoreSigpipe();
 
 	const stream = net_conn.stream;
@@ -72,8 +73,14 @@ pub fn clientLoop(comptime H: type, allocator: Allocator, context: anytype, net_
 		};
 		defer pool.release(handshake_state);
 
-		const request = Request.read(stream, handshake_state.buffer, config.handshake_timeout_ms) catch |err| {
-			Request.close(stream, err) catch {};
+		const request = readRequest(stream, handshake_state.buffer, config.handshake_timeout_ms) catch |err| {
+			const s = switch (err) {
+				error.Invalid => "HTTP/1.1 400 Invalid\r\nerror: invalid\r\ncontent-length: 0\r\n\r\n",
+				error.TooLarge => "HTTP/1.1 400 Invalid\r\nerror: too large\r\ncontent-length: 0\r\n\r\n",
+				error.Timeout => "HTTP/1.1 400 Invalid\r\nerror: timeout\r\ncontent-length: 0\r\n\r\n",
+				else => "HTTP/1.1 400 Invalid\r\nerror: unknown\r\ncontent-length: 0\r\n\r\n",
+			};
+			stream.writeAll(s) catch {};
 			return;
 		};
 
@@ -99,14 +106,187 @@ pub fn clientLoop(comptime H: type, allocator: Allocator, context: anytype, net_
 	if (comptime std.meta.trait.hasFn("afterInit")(H)) {
 		try handler.afterInit();
 	}
+	conn.readLoop(H, allocator, handler, config) catch {};
+}
 
-	const conn_config = Conn.Config{
-		.max_size = config.max_size,
-		.buffer_size = config.buffer_size,
-		.handshake_timeout_ms = config.handshake_timeout_ms,
-	};
+pub const Conn = struct {
+	stream: lib.Stream,
+	closed: bool = false,
 
-	conn.readLoop(H, allocator, handler, conn_config) catch {};
+	pub fn writeBin(self: Conn, data: []const u8) !void {
+		try writeFrame(framing.BIN, data, self.stream);
+	}
+
+	pub fn write(self: Conn, data: []const u8) !void {
+		try writeFrame(framing.TEXT, data, self.stream);
+	}
+
+	pub fn writeFramed(self: Conn, data: []const u8) !void {
+		try self.steam.writeAll(data);
+	}
+
+	pub fn close(self: *Conn) void {
+		self.closed = true;
+	}
+
+	fn readLoop(self: *Conn, comptime H: type, allocator: Allocator, handler: H, config: *const Config) !void {
+		var reader = try Reader.init(allocator, config.buffer_size, config.max_size);
+		defer reader.deinit();
+
+		var h = handler;
+		const stream = self.stream;
+
+		while (true) {
+			const result = reader.read(stream) catch |err| {
+				switch (err) {
+					error.LargeControl => try stream.writeAll(CLOSE_PROTOCOL_ERROR),
+					error.ReservedFlags => try stream.writeAll(CLOSE_PROTOCOL_ERROR),
+					else => {},
+				}
+				return;
+			};
+
+			if (result) |message| {
+				switch (message.type) {
+					.text, .binary => {
+						try h.handle(message);
+						reader.fragment.reset();
+						if (self.closed) {
+							return;
+						}
+					},
+					.pong => {
+						// TODO update aliveness?
+					},
+					.ping => try handlePong(stream, message.data),
+					.close => {
+						try handleClose(stream, message.data);
+						return;
+					},
+					else => unreachable,
+				}
+			}
+		}
+	}
+};
+
+// used in handshake tests
+pub fn readRequest(stream: anytype, buf: []u8, timeout: ?u32) ![]u8 {
+	var poll_fd = [_]os.pollfd{os.pollfd{
+		.fd = stream.handle,
+		.events = os.POLL.IN,
+		.revents = undefined,
+	}};
+	var deadline: ?i64 = null;
+	var read_timeout: i32 = 0;
+	if (timeout) |ms| {
+		// our timeout for each individual read
+		read_timeout = @intCast(ms);
+		// our absolute deadline for reading the header
+		deadline = std.time.milliTimestamp() + ms;
+	}
+
+	var total: usize = 0;
+	while (true) {
+		if (total == buf.len) {
+			return error.TooLarge;
+		}
+
+		if (read_timeout != 0) {
+			if (try os.poll(&poll_fd, read_timeout) == 0) {
+				return error.Timeout;
+			}
+		}
+
+		var n = try stream.read(buf[total..]);
+		if (n == 0) {
+			return error.Invalid;
+		}
+		total += n;
+		const request = buf[0..total];
+		if (std.mem.endsWith(u8, request, "\r\n\r\n")) {
+			return request;
+		}
+
+		if (deadline) |dl| {
+			if (std.time.milliTimestamp() > dl) {
+				return error.Timeout;
+			}
+		}
+	}
+}
+
+const EMPTY_PONG = ([2]u8{ framing.PONG, 0 })[0..];
+fn handlePong(stream: anytype, data: []const u8) !void {
+	if (data.len == 0) {
+		try stream.writeAll(EMPTY_PONG);
+	} else {
+		try writeFrame(framing.PONG, data, stream);
+	}
+}
+
+// CLOSE, 2 length, code
+const CLOSE_NORMAL = ([_]u8{ framing.CLOSE, 2, 3, 232 })[0..]; // code: 1000
+const CLOSE_PROTOCOL_ERROR = ([_]u8{ framing.CLOSE, 2, 3, 234 })[0..]; //code: 1002
+
+fn handleClose(stream: anytype, data: []const u8) !void {
+	const l = data.len;
+
+	if (l == 0) {
+		return try stream.writeAll(CLOSE_NORMAL);
+	}
+	if (l == 1) {
+		// close with a payload always has to have at least a 2-byte payload,
+		// since a 2-byte code is required
+		return try stream.writeAll(CLOSE_PROTOCOL_ERROR);
+	}
+	const code = @as(u16, @intCast(data[1])) | (@as(u16, @intCast(data[0])) << 8);
+	if (code < 1000 or code == 1004 or code == 1005 or code == 1006 or (code > 1013 and code < 3000)) {
+		return try stream.writeAll(CLOSE_PROTOCOL_ERROR);
+	}
+
+	if (l == 2) {
+		return try stream.writeAll(CLOSE_NORMAL);
+	}
+
+	const payload = data[2..];
+	if (!std.unicode.utf8ValidateSlice(payload)) {
+		// if we have a payload, it must be UTF8 (why?!)
+		return try stream.writeAll(CLOSE_PROTOCOL_ERROR);
+	}
+	return try stream.writeAll(CLOSE_NORMAL);
+}
+
+fn writeFrame(op_code: u8, data: []const u8, stream: anytype) !void {
+	const l = data.len;
+
+	// maximum possible prefix length. op_code + length_type + 8byte length
+	var buf: [10]u8 = undefined;
+	buf[0] = op_code;
+
+	if (l <= 125) {
+		buf[1] = @intCast(l);
+		try stream.writeAll(buf[0..2]);
+	} else if (l < 65536) {
+		buf[1] = 126;
+		buf[2] = @intCast((l >> 8) & 0xFF);
+		buf[3] = @intCast(l & 0xFF);
+		try stream.writeAll(buf[0..4]);
+	} else {
+		buf[1] = 127;
+		buf[2] = @intCast((l >> 56) & 0xFF);
+		buf[3] = @intCast((l >> 48) & 0xFF);
+		buf[4] = @intCast((l >> 40) & 0xFF);
+		buf[5] = @intCast((l >> 32) & 0xFF);
+		buf[6] = @intCast((l >> 24) & 0xFF);
+		buf[7] = @intCast((l >> 16) & 0xFF);
+		buf[8] = @intCast((l >> 8) & 0xFF);
+		buf[9] = @intCast(l & 0xFF);
+		try stream.writeAll(buf[0..]);
+	}
+	if (l > 0) {
+		try stream.writeAll(data);
+	}
 }
 
 const t = lib.testing;
@@ -347,7 +527,7 @@ const TestContext = struct {};
 const TestHandler = struct {
 	conn: *Conn,
 
-	pub fn init(_: Handshake, conn: *Conn, _: TestContext) !TestHandler {
+	pub fn init(_: anytype, conn: *Conn, _: TestContext) !TestHandler {
 		return TestHandler{
 			.conn = conn,
 		};
@@ -367,8 +547,8 @@ const TestHandler = struct {
 };
 
 const Expect = struct {
-	type: lib.MessageType,
 	data: []const u8,
+	type: lib.MessageType,
 
 	fn text(data: []const u8) Expect {
 		return .{

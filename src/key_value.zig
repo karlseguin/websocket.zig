@@ -23,7 +23,6 @@ pub const KeyValue = struct {
 	}
 
 	pub fn deinit(self: *Self, allocator: Allocator) void {
-
 		allocator.free(self.keys);
 		allocator.free(self.values);
 	}
@@ -63,12 +62,12 @@ test "key_value: get" {
 	var key = "content-type".*;
 	kv.add(&key, "application/json");
 
-	try t.expectEqual(@as(?[]const u8, "application/json"), kv.get("content-type"));
+	try t.expectString("application/json", kv.get("content-type").?);
 
 	kv.reset();
-	try t.expectEqual(@as(?[]const u8, null), kv.get("content-type"));
+	try t.expectEqual(null, kv.get("content-type"));
 	kv.add(&key, "application/json2");
-	try t.expectEqual(@as(?[]const u8, "application/json2"), kv.get("content-type"));
+	try t.expectString("application/json2", kv.get("content-type").?);
 
 	kv.deinit(t.allocator);
 	// allocator.free(key);
@@ -85,9 +84,9 @@ test "key_value: ignores beyond max" {
 	var n3 = "authorization".*;
 	kv.add(&n3, "hack");
 
-	try t.expectEqual(@as(?[]const u8, "cl"), kv.get("content-length"));
-	try t.expectEqual(@as(?[]const u8, "www"), kv.get("host"));
-	try t.expectEqual(@as(?[]const u8, null), kv.get("authorization"));
+	try t.expectString("cl", kv.get("content-length").?);
+	try t.expectString("www", kv.get("host").?);
+	try t.expectEqual(null, kv.get("authorization"));
 
 	kv.deinit(t.allocator);
 }

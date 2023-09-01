@@ -3,7 +3,7 @@ set -o errexit
 set -o nounset
 
 root=$(dirname $(realpath $BASH_SOURCE))
-zig run autobahn.zig &
+zig run autobahn_server.zig &
 pid=$!
 sleep 2 # give chance for socket to listen
 
@@ -17,7 +17,7 @@ docker run --rm \
   crossbario/autobahn-testsuite \
   /opt/pypy/bin/wstest --mode fuzzingclient --spec /ab/config.json;
 
-if grep FAILED support/autobahn/reports/index.json*; then
+if grep FAILED support/autobahn/server/reports/index.json*; then
   exit 1
 else
   exit 0

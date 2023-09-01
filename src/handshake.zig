@@ -1,15 +1,12 @@
 const std = @import("std");
 const lib = @import("lib.zig");
 
-const Request = @import("request.zig").Request;
 const KeyValue = @import("key_value.zig").KeyValue;
 
 const mem = std.mem;
 const net = std.net;
 const ascii = std.ascii;
 const Allocator = std.mem.Allocator;
-
-const Stream = lib.Stream;
 
 pub const Handshake = struct {
 	url: []const u8,
@@ -89,7 +86,7 @@ pub const Handshake = struct {
 		};
 	}
 
-	pub fn close(stream: Stream, err: anyerror) !void {
+	pub fn close(stream: anytype, err: anyerror) !void {
 		try stream.writeAll("HTTP/1.1 400 Invalid\r\nerror: ");
 		const s = switch (err) {
 			error.Empty => "empty",
@@ -106,9 +103,13 @@ pub const Handshake = struct {
 		try stream.writeAll("\r\n\r\n");
 	}
 
-	pub fn reply(self: Handshake, stream: Stream) !void {
+	pub fn reply(self: Handshake, stream: anytype) !void {
 		var h: [20]u8 = undefined;
-		//"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: upgrade\r\nSec-Websocket-Accept: BASE64_ENCODED_KEY_HASH_PLACEHOLDER_000\r\n\r\n";
+
+		// HTTP/1.1 101 Switching Protocols\r\n
+		// Upgrade: websocket\r\n
+		// Connection: upgrade\r\n
+		// Sec-Websocket-Accept: BASE64_ENCODED_KEY_HASH_PLACEHOLDER_000\r\n\r\n
 		var buf = [_]u8{
 			'H','T','T','P','/','1','.','1',' ', '1','0','1',' ', 'S','w','i','t','c','h','i','n','g',' ','P','r','o','t','o','c','o','l','s', '\r','\n',
 			'U','p','g','r','a','d','e',':',' ','w','e','b','s','o','c','k','e','t','\r','\n',
@@ -136,17 +137,18 @@ fn toLower(str: []u8) []u8 {
 }
 
 const t = lib.testing;
+const readRequest = @import("server.zig").readRequest;
 test "handshake: parse" {
 	var buffer: [512]u8 = undefined;
 	var buf = buffer[0..];
 	var headers = try KeyValue.init(t.allocator, 10);
 	defer headers.deinit(t.allocator);
 
-	try t.expectEqual(testHandshake("GET / HTTP/1.0\r\n\r\n", buf, &headers), error.InvalidProtocol);
-	try t.expectEqual(testHandshake("GET / HTTP/1.1\r\n\r\n", buf, &headers), error.MissingHeaders);
-	try t.expectEqual(testHandshake("GET / HTTP/1.1\r\nConnection:  upgrade\r\n\r\n", buf, &headers), error.MissingHeaders);
-	try t.expectEqual(testHandshake("GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n", buf, &headers), error.MissingHeaders);
-	try t.expectEqual(testHandshake("GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nsec-websocket-version:13\r\n\r\n", buf, &headers), error.MissingHeaders);
+	try t.expectError(error.InvalidProtocol, testHandshake("GET / HTTP/1.0\r\n\r\n", buf, &headers));
+	try t.expectError(error.MissingHeaders, testHandshake("GET / HTTP/1.1\r\n\r\n", buf, &headers));
+	try t.expectError(error.MissingHeaders, testHandshake("GET / HTTP/1.1\r\nConnection:  upgrade\r\n\r\n", buf, &headers));
+	try t.expectError(error.MissingHeaders, testHandshake("GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n", buf, &headers));
+	try t.expectError(error.MissingHeaders, testHandshake("GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nsec-websocket-version:13\r\n\r\n", buf, &headers));
 
 	{
 		headers.reset();
@@ -177,7 +179,7 @@ test "handshake: parse" {
 				_ = s.add(data[0..l]);
 				data = data[l..];
 			}
-			const request_buf = Request.read(&s, buf, null) catch unreachable;
+			const request_buf = readRequest(&s, buf, null) catch unreachable;
 			const h = Handshake.parse(request_buf, &headers) catch unreachable;
 			try t.expectString("1139329", h.key);
 			try t.expectString("/", h.url);
@@ -213,6 +215,6 @@ fn testHandshake(input: []const u8, buf: []u8, headers: *KeyValue) !Handshake {
 	_ = s.add(input);
 
 	defer s.deinit();
-	const request_buf = try Request.read(&s, buf, null);
+	const request_buf = try readRequest(&s, buf, null);
 	return Handshake.parse(request_buf, headers);
 }

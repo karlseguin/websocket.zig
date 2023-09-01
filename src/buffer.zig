@@ -1,18 +1,12 @@
 const std = @import("std");
+const lib = @import("lib.zig");
 const builtin = @import("builtin");
 
-const t = @import("t.zig");
-
 const Allocator = std.mem.Allocator;
-const Stream = if (builtin.is_test) *t.Stream else std.net.Stream;
-
-pub const BufferError = error{
-	TooLarge,
-};
 
 // Somewhat generic wrapper around a re-usable "static" buffer which can switch
 // to a larger dynamically allocated buffer as needed. Specifically designed
-// to read data from a socket witha known length (e.g. length-prefixed).
+// to read data from a socket with a known length (e.g. length-prefixed).
 pub const Buffer = struct {
 	// Start position in buf of active data
 	start: usize,
@@ -21,7 +15,7 @@ pub const Buffer = struct {
 	// buf[start..start + len]
 	len: usize,
 
-	// Length of active message. message_len is always <= read_len
+	// Length of active message. message_len is always <= len
 	// buf[start..start + message_len]
 	message_len: usize,
 
@@ -55,7 +49,7 @@ pub const Buffer = struct {
 
 	// Reads at least to_read bytes and returns true
 	// When read fails, returns false
-	pub fn read(self: *Buffer, stream: Stream, to_read: usize) !bool {
+	pub fn read(self: *Buffer, stream: anytype, to_read: usize) !bool {
 		var len = self.len;
 
 		if (to_read < len) {
@@ -66,14 +60,15 @@ pub const Buffer = struct {
 		const missing = to_read - len;
 
 		var buf = self.buf;
+		const start = self.start;
 		const message_len = self.message_len;
-		var read_start = self.start + len;
+		var read_start = start + len;
 
 		if (missing > buf.len - read_start) {
 			if (to_read <= buf.len) {
 				// We have enough space to read this message in our
 				// current buffer, but we need to recompact it.
-				std.mem.copy(u8, buf[0..], buf[self.start..read_start]);
+				std.mem.copyForwards(u8, buf[0..], buf[start..read_start]);
 				self.start = 0;
 				read_start = len;
 			} else if (to_read <= self.max_size) {
@@ -81,7 +76,7 @@ pub const Buffer = struct {
 
 				var dyn = try self.allocator.alloc(u8, to_read);
 				if (len > 0) {
-					std.mem.copy(u8, dyn, buf[self.start .. self.start + len]);
+					@memcpy(dyn[0 .. len], buf[start .. start + len]);
 				}
 
 				buf = dyn;
@@ -92,7 +87,7 @@ pub const Buffer = struct {
 				self.dynamic = dyn;
 				self.len = message_len;
 			} else {
-				return BufferError.TooLarge;
+				return error.TooLarge;
 			}
 		}
 
@@ -110,7 +105,7 @@ pub const Buffer = struct {
 		return true;
 	}
 
-	// Returns a message, the length of which is based the sum
+	// Returns a message, the length of which is based on  the sum
 	// of `to_read` passed to `read` since the last next (or
 	// since first use)
 	pub fn message(self: Buffer) []u8 {
@@ -148,6 +143,7 @@ pub const Buffer = struct {
 	}
 };
 
+const t = lib.testing;
 test "exact read into static with no overflow" {
 	// exact read into static with no overflow
 	var s = t.Stream.init();
@@ -216,11 +212,11 @@ test "reads too learge" {
 
 	var b1 = try Buffer.init(t.allocator, 5, 5);
 	defer b1.deinit();
-	try t.expectError(BufferError.TooLarge, b1.read(&s, 6));
+	try t.expectError(error.TooLarge, b1.read(&s, 6));
 
 	var b2 = try Buffer.init(t.allocator, 5, 10);
 	defer b2.deinit();
-	try t.expectError(BufferError.TooLarge, b2.read(&s, 11));
+	try t.expectError(error.TooLarge, b2.read(&s, 11));
 }
 
 test "reads message larger than static" {

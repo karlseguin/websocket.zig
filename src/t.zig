@@ -7,7 +7,10 @@ const ArrayList = std.ArrayList;
 pub const expect = std.testing.expect;
 pub const allocator = std.testing.allocator;
 
-pub const expectEqual = std.testing.expectEqual;
+pub fn expectEqual(expected: anytype, actual: anytype) !void {
+	try std.testing.expectEqual(@as(@TypeOf(actual), expected), actual);
+}
+
 pub const expectError = std.testing.expectError;
 pub const expectString = std.testing.expectEqualStrings;
 
@@ -21,6 +24,39 @@ pub const NetConn = struct {
 	stream: *Stream,
 };
 
+// wraps a stream so that it can be used as a writer
+pub const StreamWrap = struct {
+	stream: *Stream,
+	handle: c_int = 0,
+
+	pub const Error = std.os.WriteError;
+
+	pub fn read(self: StreamWrap, buf: []u8) !usize {
+		return self.stream.read(buf);
+	}
+
+	pub fn poll(_: StreamWrap, _: i32) !usize {
+		return 1;
+	}
+
+	pub fn close(self: StreamWrap) void {
+		return self.stream.close();
+	}
+
+	pub fn writeAll(self: StreamWrap, data: []const u8) !void {
+		return self.stream.writeAll(data);
+	}
+
+	pub fn write(self: StreamWrap, data: []const u8) !usize {
+		try self.stream.writeAll(data);
+		return data.len;
+	}
+};
+
+pub fn wrap(stream: *Stream) StreamWrap {
+	return .{.stream = stream};
+}
+
 pub const Stream = struct {
 	closed: bool,
 	buf_index: usize,
@@ -31,6 +67,7 @@ pub const Stream = struct {
 	to_read: ArrayList([]const u8),
 	random: std.rand.DefaultPrng,
 	received: ArrayList([]const u8),
+	received_flatten: ArrayList(u8),
 
 	pub fn init() Stream {
 		return .{
@@ -42,6 +79,7 @@ pub const Stream = struct {
 			.handshake_index = null,
 			.to_read = ArrayList([]const u8).init(allocator),
 			.received = ArrayList([]const u8).init(allocator),
+			.received_flatten = ArrayList(u8).init(allocator),
 		};
 	}
 
@@ -66,8 +104,7 @@ pub const Stream = struct {
 	pub fn add(self: *Stream, value: []const u8) *Stream {
 		// Take ownership of this data so that we can consistently free each
 		// (necessary because we need to allocate data for frames)
-		var copy = allocator.alloc(u8, value.len) catch unreachable;
-		mem.copy(u8, copy, value);
+		const copy = allocator.dupe(u8, value) catch unreachable;
 		self.to_read.append(copy) catch unreachable;
 		return self;
 	}
@@ -234,13 +271,17 @@ pub const Stream = struct {
 	// store messages that are written to the stream
 	pub fn writeAll(self: *Stream, data: []const u8) !void {
 		std.debug.assert(!self.closed);
-		var copy = allocator.alloc(u8, data.len) catch unreachable;
-		mem.copy(u8, copy, data);
+		const copy = allocator.dupe(u8, data) catch unreachable;
 		self.received.append(copy) catch unreachable;
+		self.received_flatten.appendSlice(copy) catch unreachable;
 	}
 
 	pub fn asReceived(self: Stream, skip_handshake: bool) Received {
 		return Received.init(self.received.items, skip_handshake);
+	}
+
+	pub fn allReceived(self: Stream) []u8 {
+		return self.received_flatten.items;
 	}
 
 	pub fn close(self: *Stream) void {
@@ -271,12 +312,13 @@ pub const Stream = struct {
 			self.frames = null;
 		}
 
+		self.received_flatten.deinit();
 		if (self.received.items.len > 0) {
 			for (self.received.items) |buf| {
 				allocator.free(buf);
 			}
-			self.received.deinit();
 		}
+		self.received.deinit();
 
 		self.* = undefined;
 	}

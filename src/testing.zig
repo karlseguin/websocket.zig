@@ -57,7 +57,7 @@ pub const Testing = struct {
 		self.read_index = read_index + 1;
 
 		const msg = messages[read_index];
-		try t.expectEqual(@as(lib.MessageType, .text), msg.type);
+		try t.expectEqual(lib.MessageType.text, msg.type);
 		try t.expectString(expected, msg.data);
 	}
 
