@@ -115,7 +115,7 @@ pub fn Client(comptime T: type) type {
 
 			while (true) {
 				const result = reader.read(stream) catch |err| switch (err) {
-					error.Closed => {
+					error.Closed, error.ConnectionResetByPeer, error.BrokenPipe => {
 						if (@cmpxchgStrong(bool, &self._closed, false, true, .Monotonic, .Monotonic) == null) {
 							return err;
 						}
@@ -151,8 +151,13 @@ pub fn Client(comptime T: type) type {
 			}
 		}
 
-		pub fn readLoopInNewThread(self: *Self, h: anytype) !void {
-			return try std.Thread.spawn(.{}, readLoop, .{self, h});
+		pub fn readLoopInNewThread(self: *Self, h: anytype) !std.Thread {
+			return std.Thread.spawn(.{}, readLoopOwnedThread, .{self, h});
+		}
+
+		fn readLoopOwnedThread(self: *Self, h: anytype) void {
+			std.os.maybeIgnoreSigpipe();
+			self.readLoop(h) catch {};
 		}
 
 		pub fn write(self: *Self, data: []u8) !void {
