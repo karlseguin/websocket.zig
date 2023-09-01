@@ -4,6 +4,9 @@ Zig 0.12-dev is rapidly changing and constantly breaking features. I'll try to k
 
 See the [v0.10.1-compat](https://github.com/karlseguin/websocket.zig/tree/v0.10.1-compat) tag for a release that's compatible with Zig 0.10.1.
 
+# Server
+The server is meant to be flexible and easy to use. Until async is re-added to zig, every connection spawns a thread. We try to limit the creation of resources until after a successful handshake (this can be fine-tuned via the configuration).
+
 ## Example
 ```zig
 const websocket = @import("websocket");
@@ -98,11 +101,6 @@ The call to `init` includes a `*websocket.Conn`. It is expected that handlers wi
 
 `conn.close()` can also be called to close the connection. Calling `conn.close()` **will** result in the handler's `close` callback being called.
 
-## Autobahn
-Every mandatory [Autobahn Testsuite](https://github.com/crossbario/autobahn-testsuite) case is passing. (Three fragmented UTF-8 are flagged as non-strict and as compression is not implemented, these are all flagged as "Unimplemented").
-
-You can see `autobahn.zig` in the root of the project for the handler that's used for the autobahn tests.
-
 ## Config
 The 4th parameter to `websocket.listen` is a configuration object. 
 
@@ -168,6 +166,73 @@ For testing websockets, you usually care about two things: emulating incoming me
 `wtt.conn` is an instance of a `websocket.Conn` which is usually passed to your handler's `init` function. For testing purposes, you can inject it directly into your handler. The `wtt.expectText` asserts that the expected message was sent to the conn. 
 
 The `wtt.textMessage` generates a message that you can pass into your handle's `handle` function.
+
+# Client
+The websocket client implementation is currently a work in progress. Feedback on the API is welcome.
+
+## Example
+```zig
+var client = try websocket.connect(allocator, "localhost", 9001, .{});
+defer client.deinit();
+
+try client.handshake(path, .{
+    .timeout_ms = 5000,
+    .headers = "host: localhost:9001\r\n",
+});
+
+const handler = Handler{.client = &client};
+const thread = try client.readLoopInNewThread(handler);
+thread.detach();
+
+...
+const Handler = struct {
+    client: *websocket.Client,
+
+    pub fn handle(self: Handler, message: websocket.Message) !void {
+        const data = message.data;
+        try self.client.write(data); // echo the message back
+    }
+
+    pub fn close(_: Handler) void {
+    }
+};
+```
+
+## Config
+The 3rd parameter to `connect` is a configuration object. 
+
+* `max_size` - Maximum incoming message size to allow. The library will dynamically allocate up to this much space per request. Default: `65536`.
+* `buffer_size` - Size of the static buffer that's available for the client to process incoming messages. While there's other overhead, the minimal memory usage of the server will be `# of active clients * buffer_size`. Default: `4096`.
+* `tls` - Whether or not to connect over TLS. Only TLS 1.3 is supported. Default: `false`.
+* `ca_bundle` - Provide a custom `std.crypto.Certificate.Bundle`. Only meaningful when `tls = true`. Default: `null`.
+
+Setting `max_size == buffer_size` is valid and will ensure that no dynamic memory allocation occurs once the connection is established.
+
+Zig only supports TLS 1.3, so this library can only connect to hosts using TLS 1.3. If no `ca_bundle` is provided, the library will create a default bundle per connection. For a high number of connections, it might be beneficial to manage our own CA bundle:
+
+```zig
+// some global data
+var ca_bundle = std.crypto.Certificate.Bundle{}
+try ca_bundle.rescan(allocator);
+defer ca_bundle.deinit(allocator);
+```
+
+And then assign this `ca_bundle` into the the configuration's `ca_bundle`field.
+ 
+## Handshake
+The handshake sends the initial HTTP-like request to the server. A `timeout` in milliseconds can be specified. You can pass arbitrary headers to the backend via the `headers` option. However, the full handshake request must fit within the configured `buffer_size`. By default, the request size is about 150 bytes (plus the length of the URL).
+
+## Handler and Read Loop
+A websocket client typically listens for messages from the server, within a blocking loop. The `readLoop` function begins such a loop and will block until the connection is closed (either by the server, or by calling `close`). As an alternative, `readLoopInNewThread` can be called which will start the `readLoop` in a new thread and return a `std.thread.Thread`. Typically one would call `detach` on this thread. Both `readLoop` and `readLoopInNewThread` takes an arbitrary handler will will be called with any received messages. This handler must implement the `handle` and `close` methods as shown in the above example.
+
+`close` will always be called when the read loop exits.
+
+It is safe to call `client.write`, `client.writeBin` and `client.close` from a thread other than the read loop thread.
+
+# Autobahn
+Every mandatory [Autobahn Testsuite](https://github.com/crossbario/autobahn-testsuite) case is passing. (Three fragmented UTF-8 are flagged as non-strict and as compression is not implemented, these are all flagged as "Unimplemented").
+
+You can see `autobahn_server.zig` and `autobahn_client.zig` in the root of the project for the handler that's used for the autobahn tests.
 
 ## http.zig
 I'm also working on an HTTP 1.1 server for zig: [https://github.com/karlseguin/http.zig](https://github.com/karlseguin/http.zig).

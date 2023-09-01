@@ -112,15 +112,12 @@ pub fn Client(comptime T: type) type {
 		pub fn readLoop(self: *Self, h: anytype) !void {
 			var reader = &self._reader;
 			var stream = &self.stream;
+			defer h.close();
 
 			while (true) {
 				const result = reader.read(stream) catch |err| switch (err) {
 					error.Closed, error.ConnectionResetByPeer, error.BrokenPipe => {
-						if (@cmpxchgStrong(bool, &self._closed, false, true, .Monotonic, .Monotonic) == null) {
-							return err;
-						}
-						// we already know this is closed, we might even have closed it,
-						// so not an error
+						_ = @cmpxchgStrong(bool, &self._closed, false, true, .Monotonic, .Monotonic);
 						return;
 					},
 					else => {
@@ -296,6 +293,11 @@ fn sendHandshake(path: []const u8, key: []const u8, buf: []u8, opts: *const Hand
 		end = pos + extra_headers.len;
 		@memcpy(buf[pos..end], extra_headers);
 		pos = end;
+		if (!std.mem.endsWith(u8, extra_headers, "\r\n")) {
+			buf[pos] = '\r';
+			buf[pos+1] = '\n';
+			pos += 2;
+		}
 	}
 	buf[pos] = '\r';
 	buf[pos+1] = '\n';
@@ -558,7 +560,6 @@ test "client: handshake" {
 		defer client.deinit();
 		try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
 	}
-
 
 	{
 		// wrong Sec-Websocket-Accept header

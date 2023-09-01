@@ -112,4 +112,8 @@ const Handler = struct {
 			else => unreachable,
 		}
 	}
+
+	pub fn close(_: Handler) void {
+
+	}
 };
