@@ -11,6 +11,7 @@ pub const connect = client.connect;
 pub const Conn = server.Conn;
 pub const Message = lib.Message;
 pub const Handshake = lib.Handshake;
+pub const OpCode = lib.framing.OpCode;
 pub const Client = client.Client(client.Stream);
 
 pub const Config = struct{
@@ -19,11 +20,11 @@ pub const Config = struct{
 };
 
 pub fn frameText(comptime msg: []const u8) [lib.framing.frameLen(msg)]u8 {
-	return lib.framing.frame(lib.framing.TEXT, msg);
+	return lib.framing.frame(.text, msg);
 }
 
 pub fn frameBin(comptime msg: []const u8) [lib.framing.frameLen(msg)]u8 {
-	return lib.framing.frame(lib.framing.BIN, msg);
+	return lib.framing.frame(.binary, msg);
 }
 
 comptime {

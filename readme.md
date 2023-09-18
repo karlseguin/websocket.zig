@@ -198,6 +198,38 @@ const Handler = struct {
 };
 ```
 
+### Client
+The main methods of `*websocket.Client` are:
+
+* `writeBin([]u8)` - To write binary data
+* `writeText([]u8)` - To write text data
+* `write([]u8)` - Alias to `writeText`
+* `close()` - Sends a close message and closes the connection
+
+More advanced methods are:
+* `closeWithCode(u16)` - Sends a close message with the specified code and closes the connection
+* `writePing([]u8)` - Writes a ping frame
+* `writePong([]u8)` - Writes a pong frame
+* `writeFrame(websocket.OpCode, []u8) - Writes an arbitrary frame`. `OpCode` is an enum with possible values of: `text`, `binary`, `close`, `ping`, `pong`
+
+### Pings, Pongs and Close
+By default, the client answers incoming `ping` messages with a corresponging `pong`. By default, when the client receives a `close` message, it calls `client.close() which replies with a `close` frame and closes the underlying socket.
+
+When configured with `handle_ping` and/or `handle_pong` and/or `handle_close`, the messages are passed to the `handle` method and no automatic handling is done. 
+
+This is an advanced feature. Handlers are strongly encourages to call `client.writePong` in response to a `ping` and to call `client.close` in response to a `close`.
+
+```zig
+pub fn handle(self: Handler, message: websocket.Message) !void {
+    switch (message.type) {
+        .binary, text => try self.client.write(message.data); // echo the message back
+        .ping => try self.client.writePong(@constCast(message.data)), // @constCast is safe
+        .pong => {}, // noop
+        .close => client.close(),
+    }
+}
+```
+
 ## Config
 The 3rd parameter to `connect` is a configuration object. 
 
@@ -205,6 +237,9 @@ The 3rd parameter to `connect` is a configuration object.
 * `buffer_size` - Size of the static buffer that's available for the client to process incoming messages. While there's other overhead, the minimal memory usage of the server will be `# of active clients * buffer_size`. Default: `4096`.
 * `tls` - Whether or not to connect over TLS. Only TLS 1.3 is supported. Default: `false`.
 * `ca_bundle` - Provide a custom `std.crypto.Certificate.Bundle`. Only meaningful when `tls = true`. Default: `null`.
+* `handle_ping` - Whether ping messages should be sent to the handler. When true, the client will not automatically answer with a pong. Default: `false`.
+* `handle_pong` - Whether pong messages should be sent to the handler. 
+* `handle_close` - Whether close messages should be sent to the handler.  When true, the client will not automatically answer with a corresponding `close` and will not close the underlying socket. However, the readLoop will still exists. If `true`, handlers are strongly encouraged to call `client.close()` when receiving a close message.
 
 Setting `max_size == buffer_size` is valid and will ensure that no dynamic memory allocation occurs once the connection is established.
 
@@ -223,7 +258,7 @@ And then assign this `ca_bundle` into the the configuration's `ca_bundle`field.
 The handshake sends the initial HTTP-like request to the server. A `timeout` in milliseconds can be specified. You can pass arbitrary headers to the backend via the `headers` option. However, the full handshake request must fit within the configured `buffer_size`. By default, the request size is about 150 bytes (plus the length of the URL).
 
 ## Handler and Read Loop
-A websocket client typically listens for messages from the server, within a blocking loop. The `readLoop` function begins such a loop and will block until the connection is closed (either by the server, or by calling `close`). As an alternative, `readLoopInNewThread` can be called which will start the `readLoop` in a new thread and return a `std.thread.Thread`. Typically one would call `detach` on this thread. Both `readLoop` and `readLoopInNewThread` takes an arbitrary handler will will be called with any received messages. This handler must implement the `handle` and `close` methods as shown in the above example.
+A websocket client typically listens for messages from the server, within a blocking loop. The `readLoop` function begins such a loop and will block until the connection is closed (either by the server, or by calling `close`). As an alternative, `readLoopInNewThread` can be called which will start the `readLoop` in a new thread and return a `std.thread.Thread`. Typically one would call `detach` on this thread. Both `readLoop` and `readLoopInNewThread` take an arbitrary handler which will be called with any received messages. This handler must implement the `handle` and `close` methods as shown in the above example.
 
 `close` will always be called when the read loop exits.
 

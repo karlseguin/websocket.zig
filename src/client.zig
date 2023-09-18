@@ -4,6 +4,7 @@ const lib = @import("lib.zig");
 const framing = lib.framing;
 const Reader = lib.Reader;
 const Message = lib.Message;
+const OpCode = framing.OpCode;
 
 const os = std.os;
 const net = std.net;
@@ -17,6 +18,9 @@ pub const Config = struct {
 	mask_fn: *const fn() [4]u8 = generateMask,
 	tls: bool = false,
 	ca_bundle: ?Bundle = null,
+	handle_ping: bool = false,
+	handle_pong: bool = false,
+	handle_close: bool = false,
 };
 
 pub const HandshakeOpts = struct {
@@ -51,6 +55,9 @@ pub fn Client(comptime T: type) type {
 		stream: T,
 		_reader: Reader,
 		_closed: bool,
+		_handle_ping: bool,
+		_handle_pong: bool,
+		_handle_close: bool,
 		_mask_fn: *const fn() [4]u8,
 
 		const Self = @This();
@@ -60,6 +67,9 @@ pub fn Client(comptime T: type) type {
 				.stream = stream,
 				._closed = false,
 				._mask_fn = config.mask_fn,
+				._handle_ping = config.handle_ping,
+				._handle_pong = config.handle_pong,
+				._handle_close = config.handle_close,
 				._reader = try Reader.init(allocator, config.buffer_size, config.max_size),
 			};
 		}
@@ -67,23 +77,6 @@ pub fn Client(comptime T: type) type {
 		pub fn deinit(self: *Self) void {
 			self._reader.deinit();
 			self.close();
-		}
-
-		pub fn close(self: *Self) void {
-			if (@cmpxchgStrong(bool, &self._closed, false, true, .Monotonic, .Monotonic) == null) {
-				self.writeFrame(framing.CLOSE, "") catch {};
-				self.stream.close();
-			}
-		}
-
-		pub fn closeWithCode(self: *Self, code: u16) void {
-			if (@cmpxchgStrong(bool, &self._closed, false, true, .Monotonic, .Monotonic) == null) {
-				var buf: [2]u8 = undefined;
-				buf[0] = @intCast((code >> 8) & 0xFF);
-				buf[1] = @intCast(code & 0xFF);
-				self.writeFrame(framing.CLOSE, &buf) catch {};
-				self.stream.close();
-			}
 		}
 
 		pub fn handshake(self: *Self, path: []const u8, opts: HandshakeOpts) !void {
@@ -114,6 +107,10 @@ pub fn Client(comptime T: type) type {
 			var stream = &self.stream;
 			defer h.close();
 
+			const handle_ping = self._handle_ping;
+			const handle_pong = self._handle_pong;
+			const handle_close = self._handle_close;
+
 			while (true) {
 				const result = reader.read(stream) catch |err| switch (err) {
 					error.Closed, error.ConnectionResetByPeer, error.BrokenPipe => {
@@ -133,15 +130,27 @@ pub fn Client(comptime T: type) type {
 							reader.fragment.reset();
 						},
 						.ping => {
-							// @constCast is safe because we know message.data points to
-							// reader.buffer.buf, which we own and which can be mutated
-							try self.writeFrame(framing.PONG, @constCast(message.data));
+							if (handle_ping) {
+								try h.handle(message);
+							} else {
+								// @constCast is safe because we know message.data points to
+								// reader.buffer.buf, which we own and which can be mutated
+								try self.writeFrame(.pong, @constCast(message.data));
+							}
 						},
 						.close => {
-							self.close();
+							if (handle_close) {
+								try h.handle(message);
+							} else {
+								self.close();
+							}
 							return;
 						},
-						.pong => {},
+						.pong => {
+								if (handle_pong) {
+									try h.handle(message);
+								}
+							},
 						else => unreachable,
 					}
 				}
@@ -158,21 +167,29 @@ pub fn Client(comptime T: type) type {
 		}
 
 		pub fn write(self: *Self, data: []u8) !void {
-			return self.writeFrame(framing.TEXT, data);
+			return self.writeFrame(.text, data);
 		}
 
 		pub fn writeBin(self: *Self, data: []u8) !void {
-			return self.writeFrame(framing.BIN, data);
+			return self.writeFrame(.binary, data);
 		}
 
-		fn writeFrame(self: *Self, op_code: u8, data: []u8) !void {
+		pub fn writePing(self: *Self, data: []u8) !void {
+			return self.writeFrame(.ping, data);
+		}
+
+		pub fn writePong(self: *Self, data: []u8) !void {
+			return self.writeFrame(.pong, data);
+		}
+
+		pub fn writeFrame(self: *Self, op_code: OpCode, data: []u8) !void {
 			const l = data.len;
 			const mask = self._mask_fn();
 			var stream = &self.stream;
 
 			// maximum possible prefix length. op_code + length_type + 8byte length + 4 byte mask
 			var buf: [14]u8 = undefined;
-			buf[0] = op_code;
+			buf[0] = @intFromEnum(op_code);
 
 			if (l <= 125) {
 				buf[1] = @as(u8, @intCast(l)) | 128;
@@ -200,6 +217,23 @@ pub fn Client(comptime T: type) type {
 			if (l > 0) {
 				framing.mask(&mask, data);
 				try stream.writeAll(data);
+			}
+		}
+
+		pub fn close(self: *Self) void {
+			if (@cmpxchgStrong(bool, &self._closed, false, true, .Monotonic, .Monotonic) == null) {
+				self.writeFrame(.close, "") catch {};
+				self.stream.close();
+			}
+		}
+
+		pub fn closeWithCode(self: *Self, code: u16) void {
+			if (@cmpxchgStrong(bool, &self._closed, false, true, .Monotonic, .Monotonic) == null) {
+				var buf: [2]u8 = undefined;
+				buf[0] = @intCast((code >> 8) & 0xFF);
+				buf[1] = @intCast(code & 0xFF);
+				self.writeFrame(.close, &buf) catch {};
+				self.stream.close();
 			}
 		}
 	};

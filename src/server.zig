@@ -3,9 +3,10 @@ const lib = @import("lib.zig");
 
 const Pool = @import("pool.zig").Pool;
 
+const framing = lib.framing;
 const Reader = lib.Reader;
 const NetConn = lib.NetConn;
-const framing = lib.framing;
+const OpCode = framing.OpCode;
 
 const os = std.os;
 const net = std.net;
@@ -114,11 +115,11 @@ pub const Conn = struct {
 	closed: bool = false,
 
 	pub fn writeBin(self: Conn, data: []const u8) !void {
-		try writeFrame(framing.BIN, data, self.stream);
+		try writeFrame(.binary, data, self.stream);
 	}
 
 	pub fn write(self: Conn, data: []const u8) !void {
-		try writeFrame(framing.TEXT, data, self.stream);
+		try writeFrame(.text, data, self.stream);
 	}
 
 	pub fn writeFramed(self: Conn, data: []const u8) !void {
@@ -216,18 +217,18 @@ pub fn readRequest(stream: anytype, buf: []u8, timeout: ?u32) ![]u8 {
 	}
 }
 
-const EMPTY_PONG = ([2]u8{ framing.PONG, 0 })[0..];
+const EMPTY_PONG = ([2]u8{ @intFromEnum(OpCode.pong), 0 })[0..];
 fn handlePong(stream: anytype, data: []const u8) !void {
 	if (data.len == 0) {
 		try stream.writeAll(EMPTY_PONG);
 	} else {
-		try writeFrame(framing.PONG, data, stream);
+		try writeFrame(.pong, data, stream);
 	}
 }
 
 // CLOSE, 2 length, code
-const CLOSE_NORMAL = ([_]u8{ framing.CLOSE, 2, 3, 232 })[0..]; // code: 1000
-const CLOSE_PROTOCOL_ERROR = ([_]u8{ framing.CLOSE, 2, 3, 234 })[0..]; //code: 1002
+const CLOSE_NORMAL = ([_]u8{ @intFromEnum(OpCode.close), 2, 3, 232 })[0..]; // code: 1000
+const CLOSE_PROTOCOL_ERROR = ([_]u8{ @intFromEnum(OpCode.close), 2, 3, 234 })[0..]; //code: 1002
 
 fn handleClose(stream: anytype, data: []const u8) !void {
 	const l = data.len;
@@ -257,12 +258,12 @@ fn handleClose(stream: anytype, data: []const u8) !void {
 	return try stream.writeAll(CLOSE_NORMAL);
 }
 
-fn writeFrame(op_code: u8, data: []const u8, stream: anytype) !void {
+fn writeFrame(op_code: OpCode, data: []const u8, stream: anytype) !void {
 	const l = data.len;
 
 	// maximum possible prefix length. op_code + length_type + 8byte length
 	var buf: [10]u8 = undefined;
-	buf[0] = op_code;
+	buf[0] = @intFromEnum(op_code);
 
 	if (l <= 125) {
 		buf[1] = @intCast(l);

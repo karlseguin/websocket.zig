@@ -1,11 +1,14 @@
 const std = @import("std");
 const lib = @import("lib.zig");
 
-pub const TEXT = 128 | 1;
-pub const BIN = 128 | 2;
-pub const CLOSE = 128 | 8;
-pub const PING = 128 | 9;
-pub const PONG = 128 | 10;
+pub const OpCode = enum(u8) {
+	text = 128 | 1,
+	binary = 128 | 2,
+	close = 128 | 8,
+	ping = 128 | 9,
+	pong = 128 | 10,
+};
+
 
 pub fn mask(m: []const u8, payload: []u8) void {
 	@setRuntimeSafety(false);
@@ -50,9 +53,9 @@ fn simpleMask(m: []const u8, payload: []u8) void {
 	}
 }
 
-pub fn frame(op_code: u8, comptime msg: []const u8) [frameLen(msg)]u8 {
+pub fn frame(op_code: OpCode, comptime msg: []const u8) [frameLen(msg)]u8 {
 	var framed: [frameLen(msg)]u8 = undefined;
-	framed[0] = op_code;
+	framed[0] = @intFromEnum(op_code);
 
 	const len = msg.len;
 	if (len <= 125) {
