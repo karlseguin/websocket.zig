@@ -11,6 +11,7 @@ const OpCode = framing.OpCode;
 const os = std.os;
 const net = std.net;
 const Loop = std.event.Loop;
+const log = std.log.scoped(.websocket);
 
 const Allocator = std.mem.Allocator;
 
@@ -32,7 +33,6 @@ pub fn listen(comptime H: type, allocator: Allocator, context: anytype, config: 
 	var handshake_pool = try HandshakePool.init(allocator, config.handshake_pool_size, config.handshake_max_size, config.max_headers);
 	defer handshake_pool.deinit();
 
-
 	try server.listen(net.Address.parseIp(config.address, config.port) catch unreachable);
 	// TODO: I believe this should work, but it currently doesn't on 0.11-dev. Instead I have to
 	// hardcode 1 for the setsocopt NODELAY option
@@ -51,7 +51,7 @@ pub fn listen(comptime H: type, allocator: Allocator, context: anytype, config: 
 				thread.detach();
 			}
 		} else |err| {
-			std.log.err("failed to accept connection {}", .{err});
+			log.err("failed to accept connection {}", .{err});
 		}
 	}
 }
@@ -70,7 +70,7 @@ fn clientLoop(comptime H: type, allocator: Allocator, context: anytype, net_conn
 	{
 		// This block represents handshake_state's lifetime
 		var handshake_state = handshake_pool.acquire() catch |err| {
-			std.log.err("websocket.zig: Failed to get a handshake state from the handshake pool, connection is being closed. The error was: {}", .{err});
+			log.err("Failed to get a handshake state from the handshake pool, connection is being closed. The error was: {}", .{err});
 			return;
 		};
 		defer handshake_pool.release(handshake_state);
@@ -106,9 +106,15 @@ fn clientLoop(comptime H: type, allocator: Allocator, context: anytype, net_conn
 
 	defer handler.close();
 	if (comptime std.meta.trait.hasFn("afterInit")(H)) {
-		try handler.afterInit();
+		handler.afterInit() catch return;
 	}
-	conn.readLoop(H, allocator, handler, config) catch {};
+
+	var reader = Reader.init(allocator, config.buffer_size, config.max_size) catch |err| {
+		log.err("Failed to create a Reader, connection is being closed. The error was: {}", .{err});
+		return;
+	};
+	defer reader.deinit();
+	conn.readLoop(H, handler, &reader) catch {};
 }
 
 pub const Conn = struct {
@@ -131,11 +137,7 @@ pub const Conn = struct {
 		self.closed = true;
 	}
 
-	fn readLoop(self: *Conn, comptime H: type, allocator: Allocator, handler: H, config: *const Config) !void {
-		var reader = try Reader.init(allocator, config.buffer_size, config.max_size);
-		defer reader.deinit();
-
-		var h = handler;
+	fn readLoop(self: *Conn, comptime H: type, handler: H, reader: *Reader) !void {
 		const stream = self.stream;
 
 		while (true) {
@@ -151,7 +153,7 @@ pub const Conn = struct {
 			if (result) |message| {
 				switch (message.type) {
 					.text, .binary => {
-						try h.handle(message);
+						try handler.handle(message);
 						reader.fragment.reset();
 						if (self.closed) {
 							return;

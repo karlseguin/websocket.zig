@@ -46,7 +46,6 @@ pub const KeyValue = struct {
 				return self.values[i];
 			}
 		}
-
 		return null;
 	}
 
