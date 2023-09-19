@@ -85,7 +85,7 @@ pub fn Client(comptime T: type) type {
 
 			// we've already setup our reader, and the reader has a static buffer
 			// we might as well use it!
-			var buf = self._reader.buffer.static;
+			var buf = self._reader.static;
 
 			const key = blk: {
 				const bin_key = generateKey();
@@ -99,7 +99,7 @@ pub fn Client(comptime T: type) type {
 			// We might have read more than handshake response. If so, readHandshakeReply
 			// has positioned the extra data at the start of the buffer, but we need
 			// to set the length.
-			self._reader.buffer.len = over_read;
+			self._reader.len = over_read;
 		}
 
 		pub fn readLoop(self: *Self, h: anytype) !void {
@@ -112,7 +112,7 @@ pub fn Client(comptime T: type) type {
 			const handle_close = self._handle_close;
 
 			while (true) {
-				const result = reader.read(stream) catch |err| switch (err) {
+				const result = reader.readMessage(stream) catch |err| switch (err) {
 					error.Closed, error.ConnectionResetByPeer, error.BrokenPipe => {
 						_ = @cmpxchgStrong(bool, &self._closed, false, true, .Monotonic, .Monotonic);
 						return;
@@ -613,7 +613,7 @@ test "client: handshake" {
 		var client = try TestClient.init(t.allocator, t.wrap(&stream), .{});
 		defer client.deinit();
 		try client.handshake("/", .{});
-		try t.expectEqual(0, client._reader.buffer.len);
+		try t.expectEqual(0, client._reader.len);
 	}
 
 	{
@@ -624,7 +624,7 @@ test "client: handshake" {
 		var client = try TestClient.init(t.allocator, t.wrap(&stream), .{});
 		defer client.deinit();
 		try client.handshake("/", .{});
-		try t.expectEqual(50, client._reader.buffer.len);
+		try t.expectEqual(50, client._reader.len);
 	}
 }
 

@@ -12,7 +12,10 @@ pub const io_mode = .evented;
 
 pub fn main() !void {
 	var general_purpose_allocator = std.heap.GeneralPurposeAllocator(.{}){};
+	defer _ = general_purpose_allocator.detectLeaks();
+
 	const allocator = general_purpose_allocator.allocator();
+
 
 	// abitrary context object that will get passed to your handler
 	var context = Context{};
