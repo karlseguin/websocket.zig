@@ -22,15 +22,18 @@ pub const Config = struct {
 	buffer_size: usize = 4096,
 	address: []const u8 = "127.0.0.1",
 	handshake_max_size: usize = 1024,
-	handshake_pool_size: usize = 50,
+	handshake_pool_count: usize = 50,
 	handshake_timeout_ms: ?u32 = 10_000,
+	handle_ping: bool = false,
+	handle_pong: bool = false,
+	handle_close: bool = false,
 };
 
 pub fn listen(comptime H: type, allocator: Allocator, context: anytype, config: Config) !void {
 	var server = net.StreamServer.init(.{ .reuse_address = true });
 	defer server.deinit();
 
-	var handshake_pool = try HandshakePool.init(allocator, config.handshake_pool_size, config.handshake_max_size, config.max_headers);
+	var handshake_pool = try HandshakePool.init(allocator, config.handshake_pool_count, config.handshake_max_size, config.max_headers);
 	defer handshake_pool.deinit();
 
 	try server.listen(net.Address.parseIp(config.address, config.port) catch unreachable);
@@ -65,7 +68,12 @@ fn clientLoop(comptime H: type, allocator: Allocator, context: anytype, net_conn
 	defer stream.close();
 
 	var handler: H = undefined;
-	var conn = Conn{.stream = stream};
+	var conn = Conn{
+		.stream = stream,
+		._handle_ping = config.handle_ping,
+		._handle_pong = config.handle_pong,
+		._handle_close = config.handle_close,
+	};
 
 	{
 		// This block represents handshake_state's lifetime
@@ -117,16 +125,79 @@ fn clientLoop(comptime H: type, allocator: Allocator, context: anytype, net_conn
 	conn.readLoop(H, handler, &reader) catch {};
 }
 
+const EMPTY_PONG = ([2]u8{ @intFromEnum(OpCode.pong), 0 })[0..];
+// CLOSE, 2 length, code
+const CLOSE_NORMAL = ([_]u8{ @intFromEnum(OpCode.close), 2, 3, 232 })[0..]; // code: 1000
+const CLOSE_PROTOCOL_ERROR = ([_]u8{ @intFromEnum(OpCode.close), 2, 3, 234 })[0..]; //code: 1002
+
 pub const Conn = struct {
 	stream: lib.Stream,
 	closed: bool = false,
+	_handle_pong: bool = false,
+	_handle_ping: bool = false,
+	_handle_close: bool = false,
 
 	pub fn writeBin(self: Conn, data: []const u8) !void {
-		try writeFrame(.binary, data, self.stream);
+		return self.writeFrame(.binary, data);
+	}
+
+	pub fn writeText(self: Conn, data: []const u8) !void {
+		return self.writeFrame(.text, data);
 	}
 
 	pub fn write(self: Conn, data: []const u8) !void {
-		try writeFrame(.text, data, self.stream);
+		return self.writeFrame(.text, data);
+	}
+
+	pub fn writePing(self: *Conn, data: []u8) !void {
+		return self.writeFrame(.ping, data);
+	}
+
+	pub fn writePong(self: *Conn, data: []u8) !void {
+		return self.writeFrame(.pong, data);
+	}
+
+	pub fn writeClose(self: *Conn) !void {
+		return self.stream.writeAll(CLOSE_NORMAL);
+	}
+
+	pub fn writeCloseWithCode(self: *Conn, code: u16) !void {
+		var buf: [2]u8 = undefined;
+		std.mem.writeInt(u16, &buf, code, .Big);
+		return self.writeFrame(.close, &buf);
+	}
+
+	pub fn writeFrame(self: Conn, op_code: OpCode, data: []const u8) !void {
+		const stream = self.stream;
+		const l = data.len;
+
+		// maximum possible prefix length. op_code + length_type + 8byte length
+		var buf: [10]u8 = undefined;
+		buf[0] = @intFromEnum(op_code);
+
+		if (l <= 125) {
+			buf[1] = @intCast(l);
+			try stream.writeAll(buf[0..2]);
+		} else if (l < 65536) {
+			buf[1] = 126;
+			buf[2] = @intCast((l >> 8) & 0xFF);
+			buf[3] = @intCast(l & 0xFF);
+			try stream.writeAll(buf[0..4]);
+		} else {
+			buf[1] = 127;
+			buf[2] = @intCast((l >> 56) & 0xFF);
+			buf[3] = @intCast((l >> 48) & 0xFF);
+			buf[4] = @intCast((l >> 40) & 0xFF);
+			buf[5] = @intCast((l >> 32) & 0xFF);
+			buf[6] = @intCast((l >> 24) & 0xFF);
+			buf[7] = @intCast((l >> 16) & 0xFF);
+			buf[8] = @intCast((l >> 8) & 0xFF);
+			buf[9] = @intCast(l & 0xFF);
+			try stream.writeAll(buf[0..]);
+		}
+		if (l > 0) {
+			try stream.writeAll(data);
+		}
 	}
 
 	pub fn writeFramed(self: Conn, data: []const u8) !void {
@@ -138,7 +209,11 @@ pub const Conn = struct {
 	}
 
 	fn readLoop(self: *Conn, comptime H: type, handler: H, reader: *Reader) !void {
+		var h = handler;
 		const stream = self.stream;
+		const handle_ping = self._handle_ping;
+		const handle_pong = self._handle_pong;
+		const handle_close = self._handle_close;
 
 		while (true) {
 			const result = reader.readMessage(stream) catch |err| {
@@ -153,21 +228,63 @@ pub const Conn = struct {
 			if (result) |message| {
 				switch (message.type) {
 					.text, .binary => {
-						try handler.handle(message);
+						try h.handle(message);
 						reader.fragment.reset();
 						if (self.closed) {
 							return;
 						}
 					},
 					.pong => {
-						// TODO update aliveness?
+						if (handle_pong) {
+							try h.handle(message);
+						}
 					},
-					.ping => try handlePong(stream, message.data),
+					.ping => {
+						if (handle_ping) {
+							try h.handle(message);
+						} else {
+							const data = message.data;
+							if (data.len == 0) {
+								try stream.writeAll(EMPTY_PONG);
+							} else {
+								try self.writeFrame(.pong, data);
+							}
+						}
+					},
 					.close => {
-						try handleClose(stream, message.data);
-						return;
+						if (handle_close) {
+							return h.handle(message);
+						}
+
+						const data = message.data;
+						const l = data.len;
+
+						if (l == 0) {
+							return self.writeClose();
+						}
+
+						if (l == 1) {
+							// close with a payload always has to have at least a 2-byte payload,
+							// since a 2-byte code is required
+							return stream.writeAll(CLOSE_PROTOCOL_ERROR);
+						}
+
+						const code = @as(u16, @intCast(data[1])) | (@as(u16, @intCast(data[0])) << 8);
+						if (code < 1000 or code == 1004 or code == 1005 or code == 1006 or (code > 1013 and code < 3000)) {
+							return stream.writeAll(CLOSE_PROTOCOL_ERROR);
+						}
+
+						if (l == 2) {
+							return try stream.writeAll(CLOSE_NORMAL);
+						}
+
+						const payload = data[2..];
+						if (!std.unicode.utf8ValidateSlice(payload)) {
+							// if we have a payload, it must be UTF8 (why?!)
+							return try stream.writeAll(CLOSE_PROTOCOL_ERROR);
+						}
+						return self.writeClose();
 					},
-					else => unreachable,
 				}
 			}
 		}
@@ -217,79 +334,6 @@ pub fn readRequest(stream: anytype, buf: []u8, timeout: ?u32) ![]u8 {
 				return error.Timeout;
 			}
 		}
-	}
-}
-
-const EMPTY_PONG = ([2]u8{ @intFromEnum(OpCode.pong), 0 })[0..];
-fn handlePong(stream: anytype, data: []const u8) !void {
-	if (data.len == 0) {
-		try stream.writeAll(EMPTY_PONG);
-	} else {
-		try writeFrame(.pong, data, stream);
-	}
-}
-
-// CLOSE, 2 length, code
-const CLOSE_NORMAL = ([_]u8{ @intFromEnum(OpCode.close), 2, 3, 232 })[0..]; // code: 1000
-const CLOSE_PROTOCOL_ERROR = ([_]u8{ @intFromEnum(OpCode.close), 2, 3, 234 })[0..]; //code: 1002
-
-fn handleClose(stream: anytype, data: []const u8) !void {
-	const l = data.len;
-
-	if (l == 0) {
-		return try stream.writeAll(CLOSE_NORMAL);
-	}
-	if (l == 1) {
-		// close with a payload always has to have at least a 2-byte payload,
-		// since a 2-byte code is required
-		return try stream.writeAll(CLOSE_PROTOCOL_ERROR);
-	}
-	const code = @as(u16, @intCast(data[1])) | (@as(u16, @intCast(data[0])) << 8);
-	if (code < 1000 or code == 1004 or code == 1005 or code == 1006 or (code > 1013 and code < 3000)) {
-		return try stream.writeAll(CLOSE_PROTOCOL_ERROR);
-	}
-
-	if (l == 2) {
-		return try stream.writeAll(CLOSE_NORMAL);
-	}
-
-	const payload = data[2..];
-	if (!std.unicode.utf8ValidateSlice(payload)) {
-		// if we have a payload, it must be UTF8 (why?!)
-		return try stream.writeAll(CLOSE_PROTOCOL_ERROR);
-	}
-	return try stream.writeAll(CLOSE_NORMAL);
-}
-
-fn writeFrame(op_code: OpCode, data: []const u8, stream: anytype) !void {
-	const l = data.len;
-
-	// maximum possible prefix length. op_code + length_type + 8byte length
-	var buf: [10]u8 = undefined;
-	buf[0] = @intFromEnum(op_code);
-
-	if (l <= 125) {
-		buf[1] = @intCast(l);
-		try stream.writeAll(buf[0..2]);
-	} else if (l < 65536) {
-		buf[1] = 126;
-		buf[2] = @intCast((l >> 8) & 0xFF);
-		buf[3] = @intCast(l & 0xFF);
-		try stream.writeAll(buf[0..4]);
-	} else {
-		buf[1] = 127;
-		buf[2] = @intCast((l >> 56) & 0xFF);
-		buf[3] = @intCast((l >> 48) & 0xFF);
-		buf[4] = @intCast((l >> 40) & 0xFF);
-		buf[5] = @intCast((l >> 32) & 0xFF);
-		buf[6] = @intCast((l >> 24) & 0xFF);
-		buf[7] = @intCast((l >> 16) & 0xFF);
-		buf[8] = @intCast((l >> 8) & 0xFF);
-		buf[9] = @intCast(l & 0xFF);
-		try stream.writeAll(buf[0..]);
-	}
-	if (l > 0) {
-		try stream.writeAll(data);
 	}
 }
 

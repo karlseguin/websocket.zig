@@ -147,11 +147,10 @@ pub fn Client(comptime T: type) type {
 							return;
 						},
 						.pong => {
-								if (handle_pong) {
-									try h.handle(message);
-								}
-							},
-						else => unreachable,
+							if (handle_pong) {
+								try h.handle(message);
+							}
+						},
 					}
 				}
 			}

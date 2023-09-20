@@ -17,13 +17,11 @@ pub const Reader = @import("reader.zig").Reader;
 pub const Handshake = @import("handshake.zig").Handshake;
 
 pub const MessageType = enum {
-	continuation,
 	text,
 	binary,
 	close,
 	ping,
 	pong,
-	invalid,
 };
 
 pub const Message = struct {

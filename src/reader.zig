@@ -92,7 +92,8 @@ pub const Reader = struct {
 		var length_of_length: usize = 0;
 
 		var masked = true;
-		var message_type = MessageType.invalid;
+		var is_continuation = false;
+		var message_type: MessageType = undefined;
 
 		self.prepareForNewMessage();
 
@@ -119,15 +120,16 @@ pub const Reader = struct {
 					}
 					data_needed = header_length;
 
-					message_type = switch (byte1 & 15) {
-						0 => MessageType.continuation,
-						1 => MessageType.text,
-						2 => MessageType.binary,
-						8 => MessageType.close,
-						9 => MessageType.ping,
-						10 => MessageType.pong,
+					switch (byte1 & 15) {
+						0 => is_continuation = true,
+						1 => message_type = .text,
+						2 => message_type = .binary,
+						8 => message_type = .close,
+						9 => message_type = .ping,
+						10 => message_type = .pong,
 						else => return error.InvalidMessageType,
-					};
+					}
+
 
 					// FIN, RSV1, RSV2, RSV3, OP,OP,OP,OP
 					// none of the RSV bits should be set
@@ -135,7 +137,7 @@ pub const Reader = struct {
 						return error.ReservedFlags;
 					}
 
-					if (length_of_length != 0 and (message_type == .ping or message_type == .close or message_type == .pong)) {
+					if (!is_continuation and length_of_length != 0 and (message_type == .ping or message_type == .close or message_type == .pong)) {
 						return error.LargeControl;
 					}
 				},
@@ -153,20 +155,21 @@ pub const Reader = struct {
 					const msg = self.currentMessage();
 					const fin = msg[0] & 128 == 128;
 					var payload = msg[header_length..];
+
 					if (masked) {
 						const mask = msg[header_length - 4 .. header_length];
 						framing.mask(mask, payload);
 					}
 
 					if (fin) {
-						if (message_type == .continuation) {
+						if (is_continuation) {
 							if (try fragment.add(payload)) {
-								return Message{ .type = fragment.type, .data = fragment.buf };
+								return Message{ .type = fragment.type.?, .data = fragment.buf };
 							}
 							return error.UnfragmentedContinuation;
 						}
 
-						if (fragment.is_fragmented() and (message_type == .text or message_type == .binary)) {
+						if (fragment.isFragmented() and (message_type == .text or message_type == .binary)) {
 							return error.NestedFragment;
 						}
 
@@ -174,25 +177,20 @@ pub const Reader = struct {
 						return Message{ .type = message_type, .data = payload };
 					}
 
-					switch (message_type) {
-						.continuation => {
-							if (try fragment.add(payload)) {
-								return null;
-							}
-							return error.UnfragmentedContinuation;
-						},
-						.text, .binary => {
-							if (fragment.is_fragmented()) {
-								return error.NestedFragment;
-							}
-							try fragment.new(message_type, payload);
+					if (is_continuation) {
+						if (try fragment.add(payload)) {
 							return null;
-
-							// we're going to get a fragmented message
-							// var frag_buf = ArrayList(u8).init(allocator);
-						},
-						else => return error.FragmentedControl,
+						}
+						return error.UnfragmentedContinuation;
+					} else if (message_type != .text and message_type != .binary) {
+						return error.FragmentedControl;
 					}
+
+					if (fragment.isFragmented()) {
+						return error.NestedFragment;
+					}
+					try fragment.new(message_type, payload);
+					return null;
 				},
 			}
 		}

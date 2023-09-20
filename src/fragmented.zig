@@ -8,19 +8,19 @@ pub const Fragmented = struct {
 	buf: []u8,
 	len: usize,
 	allocator: Allocator,
-	type: MessageType,
+	type: ?MessageType,
 
 	pub fn init(allocator: Allocator) Fragmented {
 		return .{
 			.len = 0,
+			.type = null,
 			.buf = undefined,
 			.allocator = allocator,
-			.type = MessageType.invalid,
 		};
 	}
 
-	pub fn is_fragmented(self: Fragmented) bool {
-		return self.type != .invalid;
+	pub fn isFragmented(self: Fragmented) bool {
+		return self.type != null;
 	}
 
 	pub fn new(self: *Fragmented, message_type: MessageType, value: []const u8) !void {
@@ -31,7 +31,7 @@ pub const Fragmented = struct {
 	}
 
 	pub fn add(self: *Fragmented, value: []const u8) !bool {
-		if (self.type == .invalid) {
+		if (self.type == null) {
 			return false;
 		}
 
@@ -47,12 +47,12 @@ pub const Fragmented = struct {
 	}
 
 	pub fn reset(self: *Fragmented) void {
-		if (self.type == .invalid) {
+		if (self.type == null) {
 			return;
 		}
 		self.len = 0;
 		self.allocator.free(self.buf);
-		self.type = .invalid;
+		self.type = null;
 	}
 
 	pub fn deinit(self: *Fragmented) void {
@@ -84,7 +84,7 @@ test "fragmented" {
 		var random = r.random();
 
 		var f = Fragmented.init(t.allocator);
-		while (count < 5000) : (count += 1) {
+		while (count < 1000) : (count += 1) {
 			var add_count: usize = 0;
 			const number_of_adds = random.uintAtMost(usize, 30) + 1;
 

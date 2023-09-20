@@ -30,7 +30,7 @@ pub fn main() !void {
 		// `handshake_max_size` at all time. This is used to parse the initial
 		// handshake request. If the pool is empty and new connections come in,
 		// then buffers of `handshake_max_size` are dynamically allocated as needed.
-		.handshake_pool_size = 10,
+		.handshake_pool_count = 10,
 
 		// See handshake_pool_size
 		.handshake_max_size = 1024,
@@ -77,7 +77,7 @@ const Handler = struct {
 			.binary => try self.conn.writeBin(data),
 			.text => {
 				if (std.unicode.utf8ValidateSlice(data)) {
-					try self.conn.write(data);
+					try self.conn.writeText(data);
 				} else {
 					self.conn.close();
 				}
