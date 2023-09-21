@@ -6,6 +6,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub const testing = @import("t.zig");
+pub const buffer = @import("buffer.zig");
 pub const framing = @import("framing.zig");
 
 pub const is_test = builtin.is_test;

@@ -88,7 +88,7 @@ pub fn Client(comptime T: type) type {
 
 			// we've already setup our reader, and the reader has a static buffer
 			// we might as well use it!
-			var buf = self._reader.static;
+			var buf = self._reader.static.buffer;
 
 			const key = blk: {
 				const bin_key = generateKey();
@@ -115,7 +115,7 @@ pub fn Client(comptime T: type) type {
 			const handle_close = self._handle_close;
 
 			while (true) {
-				const result = reader.readMessage(stream) catch |err| switch (err) {
+				const message = reader.readMessage(stream) catch |err| switch (err) {
 					error.Closed, error.ConnectionResetByPeer, error.BrokenPipe => {
 						_ = @cmpxchgStrong(bool, &self._closed, false, true, .Monotonic, .Monotonic);
 						return;
@@ -126,35 +126,33 @@ pub fn Client(comptime T: type) type {
 					},
 				};
 
-				if (result) |message| {
-					switch (message.type) {
-						.text, .binary => {
+				switch (message.type) {
+					.text, .binary => {
+						try h.handle(message);
+						reader.handled();
+					},
+					.ping => {
+						if (handle_ping) {
 							try h.handle(message);
-							reader.fragment.reset();
-						},
-						.ping => {
-							if (handle_ping) {
-								try h.handle(message);
-							} else {
-								// @constCast is safe because we know message.data points to
-								// reader.buffer.buf, which we own and which can be mutated
-								try self.writeFrame(.pong, @constCast(message.data));
-							}
-						},
-						.close => {
-							if (handle_close) {
-								try h.handle(message);
-							} else {
-								self.close();
-							}
-							return;
-						},
-						.pong => {
-							if (handle_pong) {
-								try h.handle(message);
-							}
-						},
-					}
+						} else {
+							// @constCast is safe because we know message.data points to
+							// reader.buffer.buf, which we own and which can be mutated
+							try self.writeFrame(.pong, @constCast(message.data));
+						}
+					},
+					.close => {
+						if (handle_close) {
+							try h.handle(message);
+						} else {
+							self.close();
+						}
+						return;
+					},
+					.pong => {
+						if (handle_pong) {
+							try h.handle(message);
+						}
+					},
 				}
 			}
 		}

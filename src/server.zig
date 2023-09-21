@@ -216,7 +216,7 @@ pub const Conn = struct {
 		const handle_close = self._handle_close;
 
 		while (true) {
-			const result = reader.readMessage(stream) catch |err| {
+			const message = reader.readMessage(stream) catch |err| {
 				switch (err) {
 					error.LargeControl => try stream.writeAll(CLOSE_PROTOCOL_ERROR),
 					error.ReservedFlags => try stream.writeAll(CLOSE_PROTOCOL_ERROR),
@@ -225,67 +225,65 @@ pub const Conn = struct {
 				return;
 			};
 
-			if (result) |message| {
-				switch (message.type) {
-					.text, .binary => {
+			switch (message.type) {
+				.text, .binary => {
+					try h.handle(message);
+					reader.handled();
+					if (self.closed) {
+						return;
+					}
+				},
+				.pong => {
+					if (handle_pong) {
 						try h.handle(message);
-						reader.fragment.reset();
-						if (self.closed) {
-							return;
-						}
-					},
-					.pong => {
-						if (handle_pong) {
-							try h.handle(message);
-						}
-					},
-					.ping => {
-						if (handle_ping) {
-							try h.handle(message);
-						} else {
-							const data = message.data;
-							if (data.len == 0) {
-								try stream.writeAll(EMPTY_PONG);
-							} else {
-								try self.writeFrame(.pong, data);
-							}
-						}
-					},
-					.close => {
-						if (handle_close) {
-							return h.handle(message);
-						}
-
+					}
+				},
+				.ping => {
+					if (handle_ping) {
+						try h.handle(message);
+					} else {
 						const data = message.data;
-						const l = data.len;
-
-						if (l == 0) {
-							return self.writeClose();
+						if (data.len == 0) {
+							try stream.writeAll(EMPTY_PONG);
+						} else {
+							try self.writeFrame(.pong, data);
 						}
+					}
+				},
+				.close => {
+					if (handle_close) {
+						return h.handle(message);
+					}
 
-						if (l == 1) {
-							// close with a payload always has to have at least a 2-byte payload,
-							// since a 2-byte code is required
-							return stream.writeAll(CLOSE_PROTOCOL_ERROR);
-						}
+					const data = message.data;
+					const l = data.len;
 
-						const code = @as(u16, @intCast(data[1])) | (@as(u16, @intCast(data[0])) << 8);
-						if (code < 1000 or code == 1004 or code == 1005 or code == 1006 or (code > 1013 and code < 3000)) {
-							return stream.writeAll(CLOSE_PROTOCOL_ERROR);
-						}
-
-						if (l == 2) {
-							return try stream.writeAll(CLOSE_NORMAL);
-						}
-
-						const payload = data[2..];
-						if (!std.unicode.utf8ValidateSlice(payload)) {
-							// if we have a payload, it must be UTF8 (why?!)
-							return try stream.writeAll(CLOSE_PROTOCOL_ERROR);
-						}
+					if (l == 0) {
 						return self.writeClose();
-					},
-				}
+					}
+
+					if (l == 1) {
+						// close with a payload always has to have at least a 2-byte payload,
+						// since a 2-byte code is required
+						return stream.writeAll(CLOSE_PROTOCOL_ERROR);
+					}
+
+					const code = @as(u16, @intCast(data[1])) | (@as(u16, @intCast(data[0])) << 8);
+					if (code < 1000 or code == 1004 or code == 1005 or code == 1006 or (code > 1013 and code < 3000)) {
+						return stream.writeAll(CLOSE_PROTOCOL_ERROR);
+					}
+
+					if (l == 2) {
+						return try stream.writeAll(CLOSE_NORMAL);
+					}
+
+					const payload = data[2..];
+					if (!std.unicode.utf8ValidateSlice(payload)) {
+						// if we have a payload, it must be UTF8 (why?!)
+						return try stream.writeAll(CLOSE_PROTOCOL_ERROR);
+					}
+					return self.writeClose();
+				},
 			}
 		}
 	}
@@ -411,7 +409,7 @@ test "read messages" {
 	}
 
 	{
-		// Simple fragmented (websocket fragementation)
+		// Simple fragmented (websocket fragmentation)
 		var expected = [_]Expect{Expect.text("over 9000!")};
 		var stream = t.Stream.handshake();
 		try testReadFrames(stream
@@ -420,7 +418,7 @@ test "read messages" {
 	}
 
 	{
-		// large fragmented (websocket fragementation)
+		// large fragmented (websocket fragmentation)
 		const msg = [_]u8{'a'} ** (TEST_BUFFER_SIZE * 2 + 600);
 		var expected  = [_]Expect{Expect.text(msg[0..])};
 		var stream = t.Stream.handshake();
@@ -475,7 +473,7 @@ test "read messages" {
 
 test "readFrame errors" {
 	{
-		// Nested non-control fragmented (websocket fragementation)
+		// Nested non-control fragmented (websocket fragmentation)
 		var expected = [_]Expect{};
 		var s = t.Stream.handshake();
 		try testReadFrames(s
@@ -484,7 +482,7 @@ test "readFrame errors" {
 	}
 
 	{
-		// Nested non-control fragmented FIN (websocket fragementation)
+		// Nested non-control fragmented FIN (websocket fragmentation)
 		var expected = [_]Expect{};
 		var s = t.Stream.handshake();
 		try testReadFrames(s
