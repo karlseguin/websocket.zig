@@ -35,7 +35,7 @@ pub const StreamWrap = struct {
 		return self.stream.read(buf);
 	}
 
-	pub fn poll(_: StreamWrap, _: i32) !usize {
+	pub fn readPoll(_: StreamWrap, _: i32) !usize {
 		return 1;
 	}
 
@@ -43,14 +43,16 @@ pub const StreamWrap = struct {
 		return self.stream.close();
 	}
 
-	pub fn writeAll(self: StreamWrap, data: []const u8) !void {
+	pub fn writeAll(self: StreamWrap, data: []const u8, timeout: u32) !void {
+		_ = timeout;
 		return self.stream.writeAll(data);
 	}
 
-	pub fn write(self: StreamWrap, data: []const u8) !usize {
-		try self.stream.writeAll(data);
-		return data.len;
-	}
+	// pub fn write(self: StreamWrap, data: []const u8) !usize {
+	// 	_ = timeout;
+	// 	try self.stream.writeAll(data);
+	// 	return data.len;
+	// }
 };
 
 pub fn wrap(stream: *Stream) StreamWrap {

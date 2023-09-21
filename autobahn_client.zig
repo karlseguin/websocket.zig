@@ -70,6 +70,7 @@ pub fn main() !void {
 
 		var client = try websocket.connect(allocator, "localhost", 9001, .{
 			.max_size = 20_000_000,
+			.write_timeout_ms = 5000,
 		});
 		defer client.deinit();
 		const handler = Handler{.client = &client};
