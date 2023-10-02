@@ -197,6 +197,7 @@ The websocket client implementation is currently a work in progress. Feedback on
 var client = try websocket.connect(allocator, "localhost", 9001, .{});
 defer client.deinit();
 
+const path = "/";
 try client.handshake(path, .{
     .timeout_ms = 5000,
     .headers = "host: localhost:9001\r\n",
@@ -227,6 +228,8 @@ The main methods of `*websocket.Client` are:
 * `writeText([]u8)` - To write text data
 * `write([]u8)` - Alias to `writeText`
 * `close()` - Sends a close message and closes the connection
+
+As you can see, these methods take a `[]u8`, not a `[]const u8` as they **will** mutate the data (websocket payloads are always masked).
 
 More advanced methods are:
 * `closeWithCode(u16)` - Sends a close message with the specified code and closes the connection
