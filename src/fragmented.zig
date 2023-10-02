@@ -1,7 +1,8 @@
 const std = @import("std");
 const lib = @import("lib.zig");
 
-const Buffer = lib.buffer.Buffer;
+const buffer = lib.buffer;
+
 const Allocator = std.mem.Allocator;
 const MessageType = lib.MessageType;
 
@@ -9,26 +10,26 @@ pub const Fragmented = struct {
 	buf: []u8,
 	len: usize,
 	type: MessageType,
-	allocator: Allocator,
+	bp: *buffer.Provider,
 
-	pub fn init(allocator: Allocator, message_type: MessageType, value: []const u8) !Fragmented {
+	pub fn init(bp: *buffer.Provider, message_type: MessageType, value: []const u8) !Fragmented {
 		return .{
+			.bp = bp,
 			.len = value.len,
 			.type = message_type,
-			.allocator = allocator,
-			.buf = try allocator.dupe(u8, value),
+			.buf = try bp.allocator.dupe(u8, value),
 		};
 	}
 
 	pub fn deinit(self: Fragmented) void {
-		self.allocator.free(self.buf);
+		self.bp.allocator.free(self.buf);
 	}
 
 	pub fn add(self: *Fragmented, value: []const u8) !void {
 		const len = self.len;
 		const new_len = len + value.len;
 
-		const buf = try self.allocator.realloc(self.buf, new_len);
+		const buf = try self.bp.allocator.realloc(self.buf, new_len);
 		std.mem.copy(u8, buf[len..], value);
 
 		self.buf = buf;
@@ -38,8 +39,11 @@ pub const Fragmented = struct {
 
 const t = lib.testing;
 test "fragmented" {
+	var bp = try buffer.Provider.init(t.allocator);
+	defer bp.deinit();
+
 	{
-		var f = try Fragmented.init(t.allocator, .text, "hello");
+		var f = try Fragmented.init(bp, .text, "hello");
 		defer f.deinit();
 
 		try t.expectString("hello", f.buf);
@@ -62,7 +66,7 @@ test "fragmented" {
 			var payload = buf[0..random.uintAtMost(usize, 99) + 1];
 			random.bytes(payload);
 
-			var f = try Fragmented.init(t.allocator, .binary, payload);
+			var f = try Fragmented.init(bp, .binary, payload);
 			defer f.deinit();
 
 			var expected = std.ArrayList(u8).init(t.allocator);

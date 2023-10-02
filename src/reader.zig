@@ -17,6 +17,10 @@ const ParsePhase = enum {
 };
 
 pub const Reader = struct {
+	// Where we go to get buffers. Hides the buffer-getting details, which is
+	// based on both how we're configured as well as how large a buffer we need
+	bp: *buffer.Provider,
+
 	// Start position in buf of active data
 	start: usize,
 
@@ -38,41 +42,36 @@ pub const Reader = struct {
 	// Our static buffer. Initialized upfront.
 	static: buffer.Buffer,
 
-	allocator: Allocator,
-
 	// If we're dealing with a fragmented message (websocket fragment, not tcp
 	// fragment), the state of the fragmented message is maintained here.)
 	fragment: ?Fragmented,
 
-	pub fn init(allocator: Allocator, buffer_size: usize, max_size: usize) !Reader {
-		const static = try buffer.static(allocator, buffer_size);
+	pub fn init(buffer_size: usize, max_size: usize, bp: *buffer.Provider) !Reader {
+		const static = try bp.static(buffer_size);
 
 		return .{
-			.start = 0,
+			.bp = bp,
 			.len = 0,
-			.message_len = 0,
+			.start = 0,
 			.buf = static,
 			.static = static,
+			.message_len = 0,
 			.fragment = null,
 			.max_size = max_size,
-			.allocator = allocator,
 		};
 	}
 
 	pub fn deinit(self: *Reader) void {
-		const allocator = self.allocator;
-
 		if (self.fragment) |f| {
 			f.deinit();
 		}
 
-		// release won't free the static buffer
-		_ = self.buf.release(allocator);
+		if (self.buf.type != .static) {
+			self.bp.free(self.buf);
+		}
 
-		// so we're sure this isn't a double free
-		allocator.free(self.static.buffer);
-
-		self.* = undefined;
+		// the reader owns static, when it goes, static goes
+		self.bp.free(self.static);
 	}
 
 	pub fn handled(self: *Reader) void {
@@ -197,42 +196,8 @@ pub const Reader = struct {
 						if (self.fragment != null) {
 							return error.NestedFragment;
 						}
-						self.fragment = try Fragmented.init(self.allocator, message_type, payload);
+						self.fragment = try Fragmented.init(self.bp, message_type, payload);
 						continue :outer;
-
-						// if (fin) {
-						// 	if (self.fragment) |*fragment| {
-						// 		if (is_continuation) {
-						// 			try fragment.add(payload);
-						// 			return Message{.type = fragment.type, .data = fragment.buf};
-						// 		}
-						// 		if (message_type == .text or message_type == .binary) {
-						// 			return error.NestedFragment;
-						// 		}
-						// 		// A control messge, allowed inside a fragmented message
-						// 		return Message{.type = message_type, .data = payload};
-						// 	} else if (is_continuation) {
-						// 		// got a continuation frame without having a previously fragmented
-						// 		// start message.
-						// 		return error.UnfragmentedContinuation;
-						// 	} else {
-						// 		// Any message within an unfragmented message is valid
-						// 		return Message{.type = message_type, .data = payload};
-						// 	}
-						// } else if (is_continuation) {
-						// 	if (self.fragment) |*fragment| {
-						// 		try fragment.add(payload);
-						// 		continue :outer;
-						// 	} else {
-						// 		return error.UnfragmentedContinuation;
-						// 	}
-						// }
-
-						// if (self.fragment != null) {
-						// 	return error.NestedFragment;
-						// }
-						// self.fragment = try Fragmented.init(self.allocator, message_type, payload);
-						// continue :outer;
 					},
 				}
 			}
@@ -240,10 +205,8 @@ pub const Reader = struct {
 	}
 
 	fn prepareForNewMessage(self: *Reader) void {
-		// Returns true if buf was released, which means it was either a dynamic
-		// or pooled buffer. In either case, we can revert to our static buffer
-		// since neither can overread.
-		if (self.buf.release(self.allocator)) {
+		if (self.buf.type != .static) {
+			self.bp.free(self.buf);
 			self.buf = self.static;
 			self.len = 0;
 			self.start = 0;
@@ -277,7 +240,7 @@ pub const Reader = struct {
 		}
 		const missing = to_read - len;
 
-		var buf = self.buf.buffer;
+		var buf = self.buf.data;
 		const start = self.start;
 		const message_len = self.message_len;
 		var read_start = start + len;
@@ -290,18 +253,16 @@ pub const Reader = struct {
 				self.start = 0;
 				read_start = len;
 			} else if (to_read <= self.max_size) {
-
-
-				const dyn = try buffer.dynamic(self.allocator, to_read);
+				const new_buf = try self.bp.alloc(to_read);
 				if (len > 0) {
-					@memcpy(dyn.buffer[0 .. len], buf[start .. start + len]);
+					@memcpy(new_buf.data[0 .. len], buf[start .. start + len]);
 				}
 
-				buf = dyn.buffer;
+				buf = new_buf.data;
 				read_start = len;
 
 				self.start = 0;
-				self.buf = dyn;
+				self.buf = new_buf;
 				self.len = message_len;
 			} else {
 				return error.TooLarge;
@@ -324,7 +285,7 @@ pub const Reader = struct {
 
 	fn currentMessage(self: *Reader) []u8 {
 		const start = self.start;
-		return self.buf.buffer[start .. start + self.message_len];
+		return self.buf.data[start .. start + self.message_len];
 	}
 };
 
@@ -335,7 +296,10 @@ test "Reader: exact read into static with no overflow" {
 	_ = s.add("hello1");
 	defer s.deinit();
 
-	var r = try Reader.init(t.allocator, 20, 20);
+	const bp = try buffer.Provider.init(t.allocator);
+	defer bp.deinit();
+
+	var r = try Reader.init(20, 20, bp);
 	defer r.deinit();
 
 	try t.expectEqual(true, try r.read(&s, 6));
@@ -348,7 +312,10 @@ test "Reader: overread into static with no overflow" {
 	_ = s.add("hello1world");
 	defer s.deinit();
 
-	var r = try Reader.init(t.allocator, 20, 20);
+	const bp = try buffer.Provider.init(t.allocator);
+	defer bp.deinit();
+
+	var r = try Reader.init(20, 20, bp);
 	defer r.deinit();
 
 	try t.expectEqual(true, try r.read(&s, 6));
@@ -365,7 +332,10 @@ test "Reader: incremental read of message" {
 	_ = s.add("12345");
 	defer s.deinit();
 
-	var r = try Reader.init(t.allocator, 20, 20);
+	const bp = try buffer.Provider.init(t.allocator);
+	defer bp.deinit();
+
+	var r = try Reader.init(20, 20, bp);
 	defer r.deinit();
 
 	try t.expectEqual(true, try r.read(&s, 2));
@@ -381,7 +351,10 @@ test "Reader: reads with overflow" {
 	defer s.deinit();
 
 
-	var r = try Reader.init(t.allocator, 6, 5);
+	const bp = try buffer.Provider.init(t.allocator);
+	defer bp.deinit();
+
+	var r = try Reader.init(6, 5, bp);
 	defer r.deinit();
 
 	try t.expectEqual(true, try r.read(&s, 5));
@@ -398,11 +371,14 @@ test "Reader: reads too large" {
 	_ = s.add("12356");
 	defer s.deinit();
 
-	var r1 = try Reader.init(t.allocator, 5, 5);
+	const bp = try buffer.Provider.init(t.allocator);
+	defer bp.deinit();
+
+	var r1 = try Reader.init(5, 5, bp);
 	defer r1.deinit();
 	try t.expectError(error.TooLarge, r1.read(&s, 6));
 
-	var r2 = try Reader.init(t.allocator, 5, 10);
+	var r2 = try Reader.init(5, 10, bp);
 	defer r2.deinit();
 	try t.expectError(error.TooLarge, r2.read(&s, 11));
 }
@@ -412,7 +388,10 @@ test "Reader: reads message larger than static" {
 	_ = s.add("hello world");
 	defer s.deinit();
 
-	var r = try Reader.init(t.allocator, 5, 20);
+	const bp = try buffer.Provider.init(t.allocator);
+	defer bp.deinit();
+
+	var r = try Reader.init(5, 20, bp);
 	defer r.deinit();
 
 	try t.expectEqual(true, try r.read(&s, 11));
@@ -424,7 +403,10 @@ test "Reader: reads fragmented message larger than static" {
 	_ = s.add("hello").add(" ").add("world!").add("nice");
 	defer s.deinit();
 
-	var r = try Reader.init(t.allocator, 5, 20);
+	const bp = try buffer.Provider.init(t.allocator);
+	defer bp.deinit();
+
+	var r = try Reader.init(5, 20, bp);
 	defer r.deinit();
 
 	try t.expectEqual(true, try r.read(&s, 12));
@@ -441,7 +423,10 @@ test "Reader: reads large fragmented message after small message" {
 	_ = s.add("nice").add("hello").add(" ").add("world!");
 	defer s.deinit();
 
-	var r = try Reader.init(t.allocator, 5, 20);
+	const bp = try buffer.Provider.init(t.allocator);
+	defer bp.deinit();
+
+	var r = try Reader.init(5, 20, bp);
 	defer r.deinit();
 
 	try t.expectEqual(true, try r.read(&s, 4));
@@ -458,7 +443,10 @@ test "Reader: reads large fragmented message fragmented with small message" {
 	_ = s.add("nicehel").add("lo").add(" ").add("world!");
 	defer s.deinit();
 
-	var r = try Reader.init(t.allocator, 7, 20);
+	const bp = try buffer.Provider.init(t.allocator);
+	defer bp.deinit();
+
+	var r = try Reader.init(7, 20, bp);
 	defer r.deinit();
 
 	try t.expectEqual(true, try r.read(&s, 4));
@@ -475,7 +463,10 @@ test "Reader: reads large fragmented message with a small message when static bu
 	_= s.add("nicehel").add("lo").add(" ").add("world!");
 	defer s.deinit();
 
-	var r = try Reader.init(t.allocator, 5, 20);
+	const bp = try buffer.Provider.init(t.allocator);
+	defer bp.deinit();
+
+	var r = try Reader.init(5, 20, bp);
 	defer r.deinit();
 
 	try t.expectEqual(true, try r.read(&s, 4));
@@ -492,7 +483,10 @@ test "Reader: reads large fragmented message" {
 	_ = s.add("0").add("123456").add("789ABCabc").add("defghijklmn");
 	defer s.deinit();
 
-	var r = try Reader.init(t.allocator, 5, 20);
+	const bp = try buffer.Provider.init(t.allocator);
+	defer bp.deinit();
+
+	var r = try Reader.init(5, 20, bp);
 	defer r.deinit();
 
 	try t.expectEqual(true, try r.read(&s, 1));
@@ -547,7 +541,10 @@ test "Reader: fuzz" {
 			var s = stream.clone();
 			defer s.deinit();
 
-			var r = try Reader.init(t.allocator, 40, 101);
+			const bp = try buffer.Provider.init(t.allocator);
+			defer bp.deinit();
+
+			var r = try Reader.init(40, 101, bp);
 			defer r.deinit();
 
 			for (messages) |m| {

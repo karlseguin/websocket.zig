@@ -1,104 +1,86 @@
 const std = @import("std");
+const lib = @import("lib.zig");
 
-const Mutex = std.Thread.Mutex;
 const Allocator = std.mem.Allocator;
 
-const BufferType = enum {
-	pooled,
-	static,
-	dynamic,
-};
-
-pub fn static(allocator: Allocator, size: usize) !Buffer {
-	return .{
-		.type = .static,
-		.buffer = try allocator.alloc(u8, size),
-	};
-}
-
-pub fn dynamic(allocator: Allocator, size: usize) !Buffer {
-	return .{
-		.type = .dynamic,
-		.buffer = try allocator.alloc(u8, size),
-	};
-}
-
 pub const Buffer = struct {
-	buffer: []u8,
-	type: BufferType,
+	data: []u8,
+	type: Type,
 
-	pub fn release(self: Buffer, allocator: Allocator) bool {
-		switch (self.type) {
-			.static => return false,
-			.dynamic => {
-				allocator.free(self.buffer);
-				return true;
-			},
-			.pooled => unreachable,
-		}
-	}
+	const Type = enum{
+		static,
+		dynamic,
+	};
 };
 
-pub const Pool = struct {
-	mutex: Mutex,
-	available: usize,
+// Provider manages all buffer access and types. It's where code goes to ask
+// for and release buffers. One of the main reasons this exists is to handle
+// the case where no Pool is configured, which is the default with client
+// connections (unless a Pool is passed in the client config). Our reader
+// doesn't really have to deal with that, it just calls provider.acquire()
+// and it gets a buffer from somewhere.
+pub const Provider = struct {
 	allocator: Allocator,
-	buffer_size: usize,
-	buffers: []Buffer,
 
-	pub fn init(allocator: Allocator, count: usize, buffer_size: usize) !Pool {
-		const buffers = try allocator.alloc(Buffer, count);
-
-		for (0..count) |i| {
-			buffers[i] = .{
-				.type = .pooled,
-				.buffer = try allocator.alloc(u8, buffer_size),
-			};
-		}
-
-		return .{
-			.mutex = Mutex{},
-			.buffers = buffers,
-			.available = count,
+	pub fn init(allocator: Allocator) !*Provider {
+		const provider = try allocator.create(Provider);
+		provider.* = .{
 			.allocator = allocator,
+		};
+		return provider;
+	}
+
+	pub fn deinit(self: *Provider) void {
+		self.allocator.destroy(self);
+	}
+
+	pub fn static(self: Provider, size: usize) !Buffer {
+		return .{
+			.type = .static,
+			.data = try self.allocator.alloc(u8, size),
 		};
 	}
 
-	pub fn deinit(self: *Pool) void {
-		const allocator = self.allocator;
-		for (self.buffers) |buf| {
-			allocator.free(buf.buffer);
-		}
-		allocator.free(self.buffers);
+	pub fn alloc(self: Provider, size: usize) !Buffer {
+		return .{
+			.type = .dynamic,
+			.data = try self.allocator.alloc(u8, size),
+		};
 	}
 
-	// The caller must make sure that size <= the configured buffer_size.
-	// If the pool is depleted, a buffer of exactly size will be created and
-	// returned as type = .dynamic.
-	pub fn acquire(self: *Pool, size: usize) !Buffer {
-		const buffers = self.buffers;
-
-		self.mutex.lock();
-		const available = self.available;
-		if (available == 0) {
-			// dont hold the lock over factory
-			self.mutex.unlock();
-			return dynamic(self.allocator, size);
-		}
-		const index = available - 1;
-		const buffer = buffers[index];
-		self.available = index;
-		self.mutex.unlock();
-
-		return buffer;
+	pub fn free(self: Provider, buffer: Buffer) void {
+		self.allocator.free(buffer.data);
 	}
 
-	pub fn release(self: *Pool, buffer: Buffer) void {
-		std.debug.assert(buffer.type == .pooled);
-		self.mutex.lock();
-		defer self.mutex.unlock();
-		const available = self.available;
-		self.buffers[available] = buffer;
-		self.available = available + 1;
+	pub fn release(self: Provider, buffer: Buffer) void {
+		switch (buffer.type) {
+			.static => {},
+			.dynamic => self.allocator.free(buffer.data),
+		}
 	}
 };
+
+const t = lib.testing;
+test "buffer provider: alloc" {
+	var p = try Provider.init(t.allocator);
+	defer p.deinit();
+
+	const buffer = try p.alloc(100);
+	defer p.free(buffer);
+	try t.expectEqual(.dynamic, buffer.type);
+	try t.expectEqual(100, buffer.data.len);
+}
+
+test "buffer provider: static release " {
+	var p = try Provider.init(t.allocator);
+	defer p.deinit();
+
+	const buffer = try p.static(20);
+	defer p.free(buffer);
+
+	try t.expectEqual(.static, buffer.type);
+	try t.expectEqual(20, buffer.data.len);
+
+	p.release(buffer); // noop for static
+	buffer.data[0] = 'a';
+}

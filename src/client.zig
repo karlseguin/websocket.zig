@@ -1,6 +1,7 @@
 const std = @import("std");
 const lib = @import("lib.zig");
 
+const buffer = lib.buffer;
 const framing = lib.framing;
 const Reader = lib.Reader;
 const Message = lib.Message;
@@ -51,6 +52,10 @@ pub fn connect(allocator: Allocator, host: []const u8, port: u16, config: Config
 	return Client(Stream).init(allocator, stream, config);
 }
 
+// var default_buffer_provider_loaded = false;
+// var default_buffer_provider_lock = std.Thread.Mutex{};
+// const default_buffer_provider: *buffer.Provider = undefined;
+
 pub fn Client(comptime T: type) type {
 	return struct {
 		stream: T,
@@ -61,10 +66,13 @@ pub fn Client(comptime T: type) type {
 		_handle_close: bool,
 		_write_timeout_ms: u32,
 		_mask_fn: *const fn() [4]u8,
+		_buffer_provider: *buffer.Provider,
 
 		const Self = @This();
 
 		pub fn init(allocator: Allocator, stream: T, config: Config) !Self {
+			const buffer_provider = try buffer.Provider.init(allocator);
+
 			return .{
 				.stream = stream,
 				._closed = false,
@@ -72,13 +80,15 @@ pub fn Client(comptime T: type) type {
 				._handle_ping = config.handle_ping,
 				._handle_pong = config.handle_pong,
 				._handle_close = config.handle_close,
+				._buffer_provider = buffer_provider,
 				._write_timeout_ms = config.write_timeout_ms,
-				._reader = try Reader.init(allocator, config.buffer_size, config.max_size),
+				._reader = try Reader.init(config.buffer_size, config.max_size, buffer_provider),
 			};
 		}
 
 		pub fn deinit(self: *Self) void {
 			self._reader.deinit();
+			self._buffer_provider.deinit();
 			self.close();
 		}
 
@@ -88,7 +98,7 @@ pub fn Client(comptime T: type) type {
 
 			// we've already setup our reader, and the reader has a static buffer
 			// we might as well use it!
-			var buf = self._reader.static.buffer;
+			var buf = self._reader.static.data;
 
 			const key = blk: {
 				const bin_key = generateKey();

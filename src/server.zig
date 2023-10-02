@@ -2,6 +2,7 @@ const std = @import("std");
 const lib = @import("lib.zig");
 
 const HandshakePool = @import("handshake.zig").Pool;
+const BufferProvider = @import("buffer.zig").Provider;
 
 const framing = lib.framing;
 const Reader = lib.Reader;
@@ -27,26 +28,33 @@ pub const Config = struct {
 	handle_ping: bool = false,
 	handle_pong: bool = false,
 	handle_close: bool = false,
+	large_buffer_pool_count: u18 = 32,
+	large_buffer_size: usize = 32768,
 };
 
 pub fn listen(comptime H: type, allocator: Allocator, context: anytype, config: Config) !void {
 	var server = net.StreamServer.init(.{ .reuse_address = true });
 	defer server.deinit();
 
-	var handshake_pool = try HandshakePool.init(allocator, config.handshake_pool_count, config.handshake_max_size, config.max_headers);
-	defer handshake_pool.deinit();
+	//, config.large_buffer_pool_count, config.large_buffer_size
+	var bp = try BufferProvider.init(allocator);
+	defer bp.deinit();
+
+	var hp = try HandshakePool.init(allocator, config.handshake_pool_count, config.handshake_max_size, config.max_headers);
+	defer hp.deinit();
 
 	try server.listen(net.Address.parseIp(config.address, config.port) catch unreachable);
-	// TODO: I believe this should work, but it currently doesn't on 0.11-dev. Instead I have to
-	// hardcode 1 for the setsocopt NODELAY option
+
+	// TODO: Broken on darwin:
+	// https://github.com/ziglang/zig/issues/17260
 	// if (@hasDecl(os.TCP, "NODELAY")) {
-	// 	try os.setsockopt(server.sockfd.?, os.IPPROTO.TCP, os.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1)));
+	// 	try os.setsockopt(socket.sockfd.?, os.IPPROTO.TCP, os.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1)));
 	// }
 	try os.setsockopt(server.sockfd.?, os.IPPROTO.TCP, 1, &std.mem.toBytes(@as(c_int, 1)));
 
 	while (true) {
 		if (server.accept()) |conn| {
-			const args = .{ H, allocator, context, conn, &config, &handshake_pool };
+			const args = .{H, context, conn, &config, &hp, bp};
 			if (comptime std.io.is_async) {
 				try Loop.instance.?.runDetached(allocator, clientLoop, args);
 			} else {
@@ -59,11 +67,10 @@ pub fn listen(comptime H: type, allocator: Allocator, context: anytype, config: 
 	}
 }
 
-fn clientLoop(comptime H: type, allocator: Allocator, context: anytype, net_conn: NetConn, config: *const Config, handshake_pool: *HandshakePool) void {
-	const Handshake = lib.Handshake;
-
+fn clientLoop(comptime H: type, context: anytype, net_conn: NetConn, config: *const Config, hp: *HandshakePool, bp: *BufferProvider) void {
 	std.os.maybeIgnoreSigpipe();
 
+	const Handshake = lib.Handshake;
 	const stream = net_conn.stream;
 	defer stream.close();
 
@@ -77,11 +84,11 @@ fn clientLoop(comptime H: type, allocator: Allocator, context: anytype, net_conn
 
 	{
 		// This block represents handshake_state's lifetime
-		var handshake_state = handshake_pool.acquire() catch |err| {
+		var handshake_state = hp.acquire() catch |err| {
 			log.err("Failed to get a handshake state from the handshake pool, connection is being closed. The error was: {}", .{err});
 			return;
 		};
-		defer handshake_pool.release(handshake_state);
+		defer hp.release(handshake_state);
 
 		const request = readRequest(stream, handshake_state.buffer, config.handshake_timeout_ms) catch |err| {
 			const s = switch (err) {
@@ -117,7 +124,7 @@ fn clientLoop(comptime H: type, allocator: Allocator, context: anytype, net_conn
 		handler.afterInit() catch return;
 	}
 
-	var reader = Reader.init(allocator, config.buffer_size, config.max_size) catch |err| {
+	var reader = Reader.init(config.buffer_size, config.max_size, bp) catch |err| {
 		log.err("Failed to create a Reader, connection is being closed. The error was: {}", .{err});
 		return;
 	};
@@ -525,9 +532,6 @@ test "readFrame errors" {
 
 fn testReadFrames(s: *t.Stream, expected: []Expect) !void {
 	defer s.deinit();
-	errdefer s.deinit();
-
-	var count: usize = 0;
 
 	// we don't currently use this
 	var context = TestContext{};
@@ -544,9 +548,12 @@ fn testReadFrames(s: *t.Stream, expected: []Expect) !void {
 	var handshake_pool = try HandshakePool.init(t.allocator, 10, 512, 10);
 	defer handshake_pool.deinit();
 
-	while (count < 100) : (count += 1) {
+	var buffer_provider = try BufferProvider.init(t.allocator);
+	defer buffer_provider.deinit();
+
+	for (0..100) |_| {
 		var stream = s.clone();
-		clientLoop(TestHandler, t.allocator, context, NetConn{.stream = &stream}, &config, &handshake_pool);
+		clientLoop(TestHandler, context, NetConn{.stream = &stream}, &config, &handshake_pool, buffer_provider);
 		try t.expectEqual(stream.closed, true);
 
 		const r = stream.asReceived(true);
@@ -555,7 +562,6 @@ fn testReadFrames(s: *t.Stream, expected: []Expect) !void {
 		errdefer stream.deinit();
 
 		try t.expectEqual(expected.len, messages.len);
-
 		var i: usize = 0;
 		while (i < expected.len) : (i += 1) {
 			const e = expected[i];
