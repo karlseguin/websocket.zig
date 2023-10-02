@@ -180,6 +180,10 @@ pub fn Client(comptime T: type) type {
 			return self.writeFrame(.text, data);
 		}
 
+		pub fn writeText(self: *Self, data: []u8) !void {
+			return self.writeFrame(.text, data);
+		}
+
 		pub fn writeBin(self: *Self, data: []u8) !void {
 			return self.writeFrame(.binary, data);
 		}
