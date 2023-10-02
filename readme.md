@@ -15,6 +15,8 @@ const Message = websocket.Message;
 const Handshake = websocket.Handshake;
 
 // Define a struct for "global" data passed into your websocket handler
+// This is whatever you want. You pass it to `listen` and the library will
+// pass it back to your handler's `init`. For simple cases, this could be empty
 const Context = struct {
 
 };
@@ -64,7 +66,7 @@ const Handler = struct {
 ```
 
 ### init
-The `init` method is called with a `websocket.Handshake`, a `*websocket.Conn` and whatever `context` value was passed as the 3rd parameter to `websocket.listen`.
+The `init` method is called with a `websocket.Handshake`, a `*websocket.Conn` and whatever `context` value was passed as the 3rd parameter to `websocket.listen`. If you were building a chat application, you might have a ChannelManager that you want your handler to interact with. You would create a context with your `channel_manager`, pass that context to `listen`, and get that context back in `init`, where you can do with it what you want (e.g. store it as a field of your handler and use it in the `handle` function).
 
 The websocket specification requires the initial "handshake" to contain certain headers and values. The library validates these headers. However applications may have additional requirements before allowing the connection to be "upgraded" to a websocket connection. For example, a one-time-use token could be required in the querystring. Applications should use the provided `websocket.Handshake` to apply any application-specific verification and optionally return an error to terminate the connection.
 
@@ -102,7 +104,7 @@ The call to `init` includes a `*websocket.Conn`. It is expected that handlers wi
 `conn.close()` can also be called to close the connection. Calling `conn.close()` **will** result in the handler's `close` callback being called.
 
 ### Pings, Pongs and Close
-By default, the library answers incoming `ping` messages with a corresponging `pong`. Similarly, when a `close` message is received, a `close` reply is sent (as per the spec)..
+By default, the library answers incoming `ping` messages with a corresponging `pong`. Similarly, when a `close` message is received, a `close` reply is sent (as per the spec).
 
 When configured with `handle_ping` and/or `handle_pong` and/or `handle_close`, the messages are passed to the `handle` method and no automatic handling is done. 
 
@@ -139,7 +141,7 @@ Setting `max_size == buffer_size` is valid and will ensure that no dynamic memor
 
 The server allocates and keep around `handshake_pool_size * handshake_max_size` bytes at all times. If the handshake buffer pool is empty, new buffers of `handshake_max_size` are dynamically created.
 
-The handshake pool/buffer is separate from the main `buffer_size` to reduce the memory cost of invalid handshakes. Unless you're expecting a very large handshake request (a large URL, querystring or headers), the initial handshake is usually < 1KB. This data is also short-lived. Once the websocket is established however, you may want a larger buffer for handling incoming requests (and this buffer is generally much longer lived). By using a small pooled buffer for the initial handshake, invalid connections don't use up [as much] memory and thus the server may be more resilient to basic DOS attacks. Keep in mind that the websocket protocol requires a number of mandatory headers, so `handshake_max_size` can't be set to a super small value. Also keep in mind that the current pool implementation does not block when empty, but rather created dynamic buffers of `handshake_max_size`.
+The handshake pool/buffer is separate from the main `buffer_size` to reduce the memory cost of invalid handshakes. Unless you're expecting a very large handshake request (a large URL, querystring or headers), the initial handshake is usually < 1KB. This data is also short-lived. Once the websocket is established however, you may want a larger buffer for handling incoming requests (and this buffer is generally much longer lived). By using a small pooled buffer for the initial handshake, invalid connections don't use up [as much] memory and thus the server may be more resilient to basic DOS attacks. Keep in mind that the websocket protocol requires a number of mandatory headers, so `handshake_max_size` can't be set to a super small value. Also keep in mind that the current pool implementation does not block when empty, but rather creates dynamic buffers of `handshake_max_size`.
 
 Websockets have their own fragmentation "feature" (not the same as TCP fragmentation) which this library could handle more efficiently. However, I'm not aware of any client (e.g. browsers) which use this feature at all.
 
@@ -194,14 +196,69 @@ The websocket client implementation is currently a work in progress. Feedback on
 
 ## Example
 ```zig
+const std = @import("std");
+const websocket = @import("websocket");
+
+const Handler = struct {
+    client: websocket.Client,
+
+    pub fn init(allocator: std.mem.Allocator, host: []const u8, port: u16) !Handler {
+        return .{
+            .client = try websocket.connect(allocator, host, port, .{}),
+        };
+    }
+
+    pub fn deinit(self: *Handler) void {
+        self.client.deinit();
+    }
+
+    pub fn connect(self: *Handler, path: []const u8) !void {
+        try self.client.handshake(path, .{.timeout_ms = 5000});
+        const thread = try self.client.readLoopInNewThread(self);
+        thread.detach();
+    }
+
+    pub fn handle(_: Handler, message: websocket.Message) !void {
+        const data = message.data;
+        std.debug.print("CLIENT GOT: {any}\n", .{data});
+    }
+
+    pub fn write(self: *Handler, data: []u8) !void {
+        return self.client.write(data);
+    }
+
+    pub fn close(_: Handler) void {}
+};
+
+pub fn main() !void {
+    var general_purpose_allocator = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = general_purpose_allocator.allocator();
+
+    var handler = try Handler.init(allocator, "127.0.0.1", 9223);
+    defer handler.deinit();
+
+    // spins up a thread to listen to new messages
+    try handler.connect("/");
+
+    var data = try allocator.dupe(u8, "hello world");
+    try handler.write(data);
+
+    // without this, we'll exit immediately without having time to receive a
+    // message from the server
+    std.time.sleep(std.time.ns_per_s);
+}
+```
+
+The above is an example of how you might want to use `websocket.Client`. The link between the library's `websocket.Client` and your application's` `Handler` is very thin. Your handler will hold the client in order to write to the server and close the connection. But it is only the call to `client.readLoopInNewThread(HANDLER)` or `client.readLoop(HANDLER)` which connects the client to your handler.
+
+The above example could be rewritten to more cleanly separate the application's Handler and the library's Client:
+
+```zig
 var client = try websocket.connect(allocator, "localhost", 9001, .{});
 defer client.deinit();
 
 const path = "/";
-try client.handshake(path, .{
-    .timeout_ms = 5000,
-    .headers = "host: localhost:9001\r\n",
-});
+try client.handshake(path, .{.timeout_ms = 5000});
 
 const handler = Handler{.client = &client};
 const thread = try client.readLoopInNewThread(handler);
@@ -229,7 +286,7 @@ The main methods of `*websocket.Client` are:
 * `write([]u8)` - Alias to `writeText`
 * `close()` - Sends a close message and closes the connection
 
-As you can see, these methods take a `[]u8`, not a `[]const u8` as they **will** mutate the data (websocket payloads are always masked).
+As you can see, these methods take a `[]u8`, not a `[]const u8` as they **will** mutate the data (websocket payloads are always masked). If you don't want the data mutated, pass a dupe. (By not just automatically duping the data, the library allows the application to decide if whether the data can be mutated or not, and thus whether to pay the dupe performance cost or not).
 
 More advanced methods are:
 * `closeWithCode(u16)` - Sends a close message with the specified code and closes the connection
