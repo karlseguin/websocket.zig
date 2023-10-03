@@ -33,6 +33,16 @@ pub const Fragmented = struct {
 		}
 		try self.buf.appendSlice(value);
 	}
+
+	// Optimization so that we don't over-allocate on our last frame.
+	pub fn last(self: *Fragmented, value: []const u8) ![]u8 {
+		if (self.buf.items.len + value.len > self.max_size) {
+			return error.TooLarge;
+		}
+		try self.buf.ensureUnusedCapacity(value.len);
+		self.buf.appendSliceAssumeCapacity(value);
+		return self.buf.items;
+	}
 };
 
 const t = lib.testing;
@@ -76,15 +86,18 @@ test "fragmented" {
 			defer expected.deinit();
 			try expected.appendSlice(payload);
 
-			var add_count: usize = 0;
 			const number_of_adds = random.uintAtMost(usize, 30);
-			while (add_count < number_of_adds) : (add_count += 1) {
+			for (0..number_of_adds) |_| {
 				payload = buf[0..random.uintAtMost(usize, 99) + 1];
 				random.bytes(payload);
 				try f.add(payload);
 				try expected.appendSlice(payload);
 			}
-			try t.expectString(expected.items, f.buf.items);
+			payload = buf[0..random.uintAtMost(usize, 99) + 1];
+			random.bytes(payload);
+			try expected.appendSlice(payload);
+
+			try t.expectString(expected.items, try f.last(payload));
 		}
 	}
 }

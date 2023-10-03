@@ -169,8 +169,7 @@ pub const Reader = struct {
 						if (fin) {
 							if (is_continuation) {
 								if (self.fragment) |*f| {
-									try f.add(payload);
-									return Message{ .type = f.type, .data = f.buf.items };
+									return Message{ .type = f.type, .data = try f.last(payload) };
 								}
 								return error.UnfragmentedContinuation;
 							}
