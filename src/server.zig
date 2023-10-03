@@ -28,7 +28,7 @@ pub const Config = struct {
 	handle_ping: bool = false,
 	handle_pong: bool = false,
 	handle_close: bool = false,
-	large_buffer_pool_count: u18 = 32,
+	large_buffer_pool_count: u16 = 32,
 	large_buffer_size: usize = 32768,
 };
 

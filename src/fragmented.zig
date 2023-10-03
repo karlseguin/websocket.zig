@@ -8,15 +8,17 @@ const MessageType = lib.MessageType;
 
 pub const Fragmented = struct {
 	type: MessageType,
+	max_size: usize,
 	buf: std.ArrayList(u8),
 
-	pub fn init(bp: *buffer.Provider, message_type: MessageType, value: []const u8) !Fragmented {
+	pub fn init(bp: *buffer.Provider, max_size: usize, message_type: MessageType, value: []const u8) !Fragmented {
 		var buf = std.ArrayList(u8).init(bp.allocator);
 		try buf.ensureTotalCapacity(value.len * 2);
 		buf.appendSliceAssumeCapacity(value);
 
 		return .{
 			.buf = buf,
+			.max_size = max_size,
 			.type = message_type,
 		};
 	}
@@ -26,6 +28,9 @@ pub const Fragmented = struct {
 	}
 
 	pub fn add(self: *Fragmented, value: []const u8) !void {
+		if (self.buf.items.len + value.len > self.max_size) {
+			return error.TooLarge;
+		}
 		try self.buf.appendSlice(value);
 	}
 };
@@ -35,7 +40,7 @@ test "fragmented" {
 	var bp = buffer.Provider.initNoPool(t.allocator);
 
 	{
-		var f = try Fragmented.init(&bp, .text, "hello");
+		var f = try Fragmented.init(&bp, 500, .text, "hello");
 		defer f.deinit();
 
 		try t.expectString("hello", f.buf.items);
@@ -48,17 +53,23 @@ test "fragmented" {
 	}
 
 	{
+		var f = try Fragmented.init(&bp, 10, .text, "hello");
+		defer f.deinit();
+		try f.add(" ");
+		try t.expectError(error.TooLarge, f.add("world"));
+	}
+
+	{
 		var r = std.rand.DefaultPrng.init(0);
 		var random = r.random();
 
 		var count: usize = 0;
 		var buf: [100]u8 = undefined;
 		while (count < 1000) : (count += 1) {
-
 			var payload = buf[0..random.uintAtMost(usize, 99) + 1];
 			random.bytes(payload);
 
-			var f = try Fragmented.init(&bp, .binary, payload);
+			var f = try Fragmented.init(&bp, 5000, .binary, payload);
 			defer f.deinit();
 
 			var expected = std.ArrayList(u8).init(t.allocator);

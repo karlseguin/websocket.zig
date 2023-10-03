@@ -166,7 +166,6 @@ pub const Reader = struct {
 							framing.mask(mask, payload);
 						}
 
-
 						if (fin) {
 							if (is_continuation) {
 								if (self.fragment) |*f| {
@@ -197,7 +196,7 @@ pub const Reader = struct {
 						if (self.fragment != null) {
 							return error.NestedFragment;
 						}
-						self.fragment = try Fragmented.init(self.bp, message_type, payload);
+						self.fragment = try Fragmented.init(self.bp, self.max_size, message_type, payload);
 						continue :outer;
 					},
 				}
@@ -294,6 +293,30 @@ pub const Reader = struct {
 };
 
 const t = lib.testing;
+test "Reader: readMessage too larrge" {
+	var s = t.Stream.init();
+	defer s.deinit();
+	_ = s.textFrame(true, "hello world");
+
+	var bp = buffer.Provider.initNoPool(t.allocator);
+	var r = try Reader.init(16, 16, &bp);
+	defer r.deinit();
+	try t.expectError(error.TooLarge, r.readMessage(&s));
+}
+
+test "Reader: readMessage too large over multiple fragments" {
+	var s = t.Stream.init();
+	defer s.deinit();
+	_ = s.textFrame(false, "hello world").
+		cont(false, " !!!_!!! ").
+		cont(true, "how are you doing?");
+
+	var bp = buffer.Provider.initNoPool(t.allocator);
+	var r = try Reader.init(32, 32, &bp);
+	defer r.deinit();
+	try t.expectError(error.TooLarge, r.readMessage(&s));
+}
+
 test "Reader: exact read into static with no overflow" {
 	// exact read into static with no overflow
 	var s = t.Stream.init();
