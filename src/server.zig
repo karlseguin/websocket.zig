@@ -87,7 +87,7 @@ fn clientLoop(comptime H: type, allocator: Allocator, context: anytype, net_conn
 			const s = switch (err) {
 				error.Invalid => "HTTP/1.1 400 Invalid\r\nerror: invalid\r\ncontent-length: 0\r\n\r\n",
 				error.TooLarge => "HTTP/1.1 400 Invalid\r\nerror: too large\r\ncontent-length: 0\r\n\r\n",
-				error.Timeout => "HTTP/1.1 400 Invalid\r\nerror: timeout\r\ncontent-length: 0\r\n\r\n",
+				error.Timeout, error.WouldBlock => "HTTP/1.1 400 Invalid\r\nerror: timeout\r\ncontent-length: 0\r\n\r\n",
 				else => "HTTP/1.1 400 Invalid\r\nerror: unknown\r\ncontent-length: 0\r\n\r\n",
 			};
 			stream.writeAll(s) catch {};
@@ -291,18 +291,21 @@ pub const Conn = struct {
 	}
 };
 
+const read_no_timeout = std.mem.toBytes(os.timeval{
+	.tv_sec = 0,
+	.tv_usec = 0,
+});
+
 // used in handshake tests
 pub fn readRequest(stream: anytype, buf: []u8, timeout: ?u32) ![]u8 {
-	var poll_fd = [_]os.pollfd{os.pollfd{
-		.fd = stream.handle,
-		.events = os.POLL.IN,
-		.revents = undefined,
-	}};
 	var deadline: ?i64 = null;
-	var read_timeout: i32 = 0;
+	var read_timeout: ?[@sizeOf(os.timeval)]u8 = null;
 	if (timeout) |ms| {
 		// our timeout for each individual read
-		read_timeout = @intCast(ms);
+		read_timeout = std.mem.toBytes(os.timeval{
+			.tv_sec = @intCast(@divTrunc(ms, 1000)),
+			.tv_usec = @intCast(@mod(ms, 1000) * 1000),
+		});
 		// our absolute deadline for reading the header
 		deadline = std.time.milliTimestamp() + ms;
 	}
@@ -313,10 +316,8 @@ pub fn readRequest(stream: anytype, buf: []u8, timeout: ?u32) ![]u8 {
 			return error.TooLarge;
 		}
 
-		if (read_timeout != 0) {
-			if (try os.poll(&poll_fd, read_timeout) == 0) {
-				return error.Timeout;
-			}
+		if (read_timeout) |to| {
+			try os.setsockopt(stream.handle, os.SOL.SOCKET, os.SO.RCVTIMEO, &to);
 		}
 
 		var n = try stream.read(buf[total..]);
@@ -326,6 +327,9 @@ pub fn readRequest(stream: anytype, buf: []u8, timeout: ?u32) ![]u8 {
 		total += n;
 		const request = buf[0..total];
 		if (std.mem.endsWith(u8, request, "\r\n\r\n")) {
+			if (read_timeout != null) {
+				try os.setsockopt(stream.handle, os.SOL.SOCKET, os.SO.RCVTIMEO, &read_no_timeout);
+			}
 			return request;
 		}
 

@@ -48,11 +48,10 @@ pub const StreamWrap = struct {
 		return self.stream.writeAll(data);
 	}
 
-	// pub fn write(self: StreamWrap, data: []const u8) !usize {
-	// 	_ = timeout;
-	// 	try self.stream.writeAll(data);
-	// 	return data.len;
-	// }
+	pub fn receiveTimeout(self: StreamWrap, ms: u32) !void {
+		_ = self;
+		_ = ms;
+	}
 };
 
 pub fn wrap(stream: *Stream) StreamWrap {
@@ -213,7 +212,7 @@ pub const Stream = struct {
 		return self;
 	}
 
-	pub fn read(self: *Stream, buf: []u8) !usize {
+	pub fn read(self: *Stream, buf: []u8) std.os.ReadError!usize {
 		std.debug.assert(!self.closed);
 
 		if (self.handshake_index) |index| {

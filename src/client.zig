@@ -245,7 +245,7 @@ pub fn Client(comptime T: type) type {
 	};
 }
 
-// wraps a net.Stream and optionall a tls.Client
+// wraps a net.Stream and optional a tls.Client
 pub const Stream = struct {
 	stream: net.Stream,
 	pfd_read: [1]os.pollfd,
@@ -325,6 +325,14 @@ pub const Stream = struct {
 			}
 		}
 	}
+
+	pub fn receiveTimeout(self: *Stream, ms: u32) !void {
+		const timeout = std.mem.toBytes(os.timeval{
+			.tv_sec = @intCast(@divTrunc(ms, 1000)),
+			.tv_usec = @intCast(@mod(ms, 1000) * 1000),
+		});
+		try os.setsockopt(self.stream.handle, os.SOL.SOCKET, os.SO.RCVTIMEO, &timeout);
+	}
 };
 
 fn generateKey() [16]u8 {
@@ -389,17 +397,12 @@ fn readHandshakeReply(buf: []u8, key: []const u8, opts: *const HandshakeOpts, st
 
 	const timeout_ms = opts.timeout_ms;
 	const deadline = std.time.milliTimestamp() + timeout_ms;
+	try stream.receiveTimeout(timeout_ms);
 
 	var pos: usize = 0;
 	var line_start: usize = 0;
-	const read_timeout: i32 = @intCast(timeout_ms);
-
 	var complete_response: u8 = 0;
 	while (true) {
-		if (try stream.readPoll(read_timeout) == 0) {
-			return error.Timeout;
-		}
-
 		var n = try stream.read(buf[pos..]);
 		if (n == 0) {
 			return error.ConnectionClosed;
@@ -413,6 +416,7 @@ fn readHandshakeReply(buf: []u8, key: []const u8, opts: *const HandshakeOpts, st
 				}
 				const over_read = pos - (line_start + 2);
 				std.mem.copyForwards(u8, buf[0..over_read], buf[line_start+2..pos]);
+				try stream.receiveTimeout(0);
 				return over_read;
 			}
 
