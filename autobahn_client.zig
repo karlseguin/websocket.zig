@@ -70,7 +70,6 @@ pub fn main() !void {
 
 		var client = try websocket.connect(allocator, "localhost", 9001, .{
 			.max_size = 20_000_000,
-			.write_timeout_ms = 5000,
 		});
 		defer client.deinit();
 		const handler = Handler{.client = &client};
@@ -80,6 +79,8 @@ pub fn main() !void {
 			.headers = "host: localhost:9001\r\n",
 		}) catch continue;
 
+		// optional, if you want to set a SO_SNDTIMEO on the socket
+		try client.stream.writeTimeout(5000);
 		try client.readLoop(handler);
 		if (@rem(i, 10) == 0) {
 			try updateReport(allocator);

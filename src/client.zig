@@ -21,7 +21,6 @@ pub const Config = struct {
 	handle_ping: bool = false,
 	handle_pong: bool = false,
 	handle_close: bool = false,
-	write_timeout_ms: u32 = 0,
 };
 
 pub const HandshakeOpts = struct {
@@ -59,7 +58,6 @@ pub fn Client(comptime T: type) type {
 		_handle_ping: bool,
 		_handle_pong: bool,
 		_handle_close: bool,
-		_write_timeout_ms: u32,
 		_mask_fn: *const fn() [4]u8,
 
 		const Self = @This();
@@ -72,7 +70,6 @@ pub fn Client(comptime T: type) type {
 				._handle_ping = config.handle_ping,
 				._handle_pong = config.handle_pong,
 				._handle_close = config.handle_close,
-				._write_timeout_ms = config.write_timeout_ms,
 				._reader = try Reader.init(allocator, config.buffer_size, config.max_size),
 			};
 		}
@@ -200,13 +197,13 @@ pub fn Client(comptime T: type) type {
 			if (l <= 125) {
 				buf[1] = @as(u8, @intCast(l)) | 128;
 				@memcpy(buf[2..6], &mask);
-				try stream.writeAll(buf[0..6], self._write_timeout_ms);
+				try stream.writeAll(buf[0..6]);
 			} else if (l < 65536) {
 				buf[1] = 254; // 126 | 128
 				buf[2] = @intCast((l >> 8) & 0xFF);
 				buf[3] = @intCast(l & 0xFF);
 				@memcpy(buf[4..8], &mask);
-				try stream.writeAll(buf[0..8], self._write_timeout_ms);
+				try stream.writeAll(buf[0..8]);
 			} else {
 				buf[1] = 255; // 127 | 128
 				buf[2] = @intCast((l >> 56) & 0xFF);
@@ -218,11 +215,11 @@ pub fn Client(comptime T: type) type {
 				buf[8] = @intCast((l >> 8) & 0xFF);
 				buf[9] = @intCast(l & 0xFF);
 				@memcpy(buf[10..], &mask);
-				try stream.writeAll(buf[0..], self._write_timeout_ms);
+				try stream.writeAll(buf[0..]);
 			}
 			if (l > 0) {
 				framing.mask(&mask, data);
-				try stream.writeAll(data, self._write_timeout_ms);
+				try stream.writeAll(data);
 			}
 		}
 
@@ -248,24 +245,12 @@ pub fn Client(comptime T: type) type {
 // wraps a net.Stream and optional a tls.Client
 pub const Stream = struct {
 	stream: net.Stream,
-	pfd_read: [1]os.pollfd,
-	pfd_write: [1]os.pollfd,
 	tls_client: ?tls.Client,
 
 	pub fn init(stream: net.Stream, tls_client: ?tls.Client) Stream {
 		return .{
 			.stream = stream,
 			.tls_client = tls_client,
-			.pfd_read = [1]os.pollfd{os.pollfd{
-				.fd = stream.handle,
-				.events = os.POLL.IN,
-				.revents = undefined,
-			}},
-			.pfd_write = [1]os.pollfd{os.pollfd{
-				.fd = stream.handle,
-				.events = os.POLL.OUT,
-				.revents = undefined,
-			}},
 		};
 	}
 
@@ -276,9 +261,6 @@ pub const Stream = struct {
 		self.stream.close();
 	}
 
-	pub fn readPoll(self: *Stream, timeout: i32) !usize {
-		return os.poll(&self.pfd_read, timeout);
-	}
 
 	pub fn read(self: *Stream, buf: []u8) !usize {
 		if (self.tls_client) |*tls_client| {
@@ -287,51 +269,40 @@ pub const Stream = struct {
 		return self.stream.read(buf);
 	}
 
-	pub fn writeAll(self: *Stream, data: []const u8, timeout_ms: u32) !void {
-		const stream = self.stream;
-
-		if (timeout_ms == 0) {
-			if (self.tls_client) |*tls_client| {
-				return tls_client.writeAll(stream, data);
-			}
-			return stream.writeAll(data);
-		}
-
-		// our write has to be done by deadline(ish).
-		const deadline = std.time.milliTimestamp() + timeout_ms;
-
+	pub fn writeAll(self: *Stream, data: []const u8) !void {
 		if (self.tls_client) |*tls_client| {
-			var index: usize = 0;
-			while (index < data.len) {
-				if (try os.poll(&self.pfd_write, @intCast(timeout_ms)) == 0) {
-					return error.Timeout;
-				}
-				index += try tls_client.write(stream, data[index..]);
-				if (std.time.milliTimestamp() > deadline) {
-					return error.Timeout;
-				}
-			}
-			return;
+			return tls_client.writeAll(self.stream, data);
 		}
-
-		var index: usize = 0;
-		while (index < data.len) {
-			if (try os.poll(&self.pfd_write, @intCast(timeout_ms)) == 0) {
-				return error.Timeout;
-			}
-			index += try stream.write(data[index..]);
-			if (std.time.milliTimestamp() > deadline) {
-				return error.Timeout;
-			}
-		}
+		return self.stream.writeAll(data);
 	}
 
-	pub fn receiveTimeout(self: *Stream, ms: u32) !void {
+	const zero_timeout = std.mem.toBytes(os.timeval{.tv_sec = 0, .tv_usec = 0});
+	pub fn writeTimeout(self: *const Stream, ms: u32) !void {
+		if (ms == 0) {
+			return self.setsockopt(os.SO.SNDTIMEO, &zero_timeout);
+		}
+
 		const timeout = std.mem.toBytes(os.timeval{
 			.tv_sec = @intCast(@divTrunc(ms, 1000)),
 			.tv_usec = @intCast(@mod(ms, 1000) * 1000),
 		});
-		try os.setsockopt(self.stream.handle, os.SOL.SOCKET, os.SO.RCVTIMEO, &timeout);
+		return self.setsockopt(os.SO.SNDTIMEO, &timeout);
+	}
+
+	pub fn receiveTimeout(self: *const Stream, ms: u32) !void {
+		if (ms == 0) {
+			return self.setsockopt(os.SO.RCVTIMEO, &zero_timeout);
+		}
+
+		const timeout = std.mem.toBytes(os.timeval{
+			.tv_sec = @intCast(@divTrunc(ms, 1000)),
+			.tv_usec = @intCast(@mod(ms, 1000) * 1000),
+		});
+		return self.setsockopt(os.SO.RCVTIMEO, &timeout);
+	}
+
+	pub fn setsockopt(self: *const Stream, optname: u32, value: []const u8) !void {
+		return os.setsockopt(self.stream.handle, os.SOL.SOCKET, optname, value);
 	}
 };
 
@@ -388,7 +359,9 @@ fn sendHandshake(path: []const u8, key: []const u8, buf: []u8, opts: *const Hand
 	buf[pos] = '\r';
 	buf[pos+1] = '\n';
 
-	try stream.writeAll(buf[0..pos + 2], opts.timeout_ms);
+	try stream.writeTimeout(opts.timeout_ms);
+	try stream.writeAll(buf[0..pos + 2]);
+	try stream.writeTimeout(0);
 }
 
 fn readHandshakeReply(buf: []u8, key: []const u8, opts: *const HandshakeOpts, stream: anytype) !usize {
