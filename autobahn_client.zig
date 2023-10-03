@@ -62,6 +62,9 @@ pub fn main() !void {
 	// wait 5 seconds for autobanh server to be up
 	std.time.sleep(5000000000);
 
+	const buffer_provider = try websocket.bufferProvider(allocator, 10, 32768);
+	defer buffer_provider.deinit();
+
 	for (cases, 0..) |case, i| {
 		std.debug.print("running case: {s}\n", .{case});
 		// if (!std.mem.eql(u8, case, "6.3.1")) continue;
@@ -72,6 +75,7 @@ pub fn main() !void {
 		var client = try websocket.connect(allocator, "localhost", 9001, .{
 			.max_size = 20_000_000,
 			.write_timeout_ms = 5000,
+			.buffer_provider = buffer_provider,
 		});
 		defer client.deinit();
 		const handler = Handler{.client = &client};

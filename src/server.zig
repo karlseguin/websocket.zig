@@ -2,8 +2,8 @@ const std = @import("std");
 const lib = @import("lib.zig");
 
 const HandshakePool = @import("handshake.zig").Pool;
-const BufferProvider = @import("buffer.zig").Provider;
 
+const buffer = lib.buffer;
 const framing = lib.framing;
 const Reader = lib.Reader;
 const NetConn = lib.NetConn;
@@ -36,9 +36,10 @@ pub fn listen(comptime H: type, allocator: Allocator, context: anytype, config: 
 	var server = net.StreamServer.init(.{ .reuse_address = true });
 	defer server.deinit();
 
-	//, config.large_buffer_pool_count, config.large_buffer_size
-	var bp = try BufferProvider.init(allocator);
-	defer bp.deinit();
+	var buffer_pool = try buffer.Pool.init(allocator, config.large_buffer_pool_count, config.large_buffer_size);
+	defer buffer_pool.deinit();
+
+	var bp = buffer.Provider.init(allocator, &buffer_pool, config.large_buffer_size);
 
 	var hp = try HandshakePool.init(allocator, config.handshake_pool_count, config.handshake_max_size, config.max_headers);
 	defer hp.deinit();
@@ -54,7 +55,7 @@ pub fn listen(comptime H: type, allocator: Allocator, context: anytype, config: 
 
 	while (true) {
 		if (server.accept()) |conn| {
-			const args = .{H, context, conn, &config, &hp, bp};
+			const args = .{H, context, conn, &config, &hp, &bp};
 			if (comptime std.io.is_async) {
 				try Loop.instance.?.runDetached(allocator, clientLoop, args);
 			} else {
@@ -67,7 +68,7 @@ pub fn listen(comptime H: type, allocator: Allocator, context: anytype, config: 
 	}
 }
 
-fn clientLoop(comptime H: type, context: anytype, net_conn: NetConn, config: *const Config, hp: *HandshakePool, bp: *BufferProvider) void {
+fn clientLoop(comptime H: type, context: anytype, net_conn: NetConn, config: *const Config, hp: *HandshakePool, bp: *buffer.Provider) void {
 	std.os.maybeIgnoreSigpipe();
 
 	const Handshake = lib.Handshake;
@@ -545,15 +546,14 @@ fn testReadFrames(s: *t.Stream, expected: []Expect) !void {
 		.handshake_timeout_ms = null,
 	};
 
-	var handshake_pool = try HandshakePool.init(t.allocator, 10, 512, 10);
-	defer handshake_pool.deinit();
+	var hp = try HandshakePool.init(t.allocator, 10, 512, 10);
+	defer hp.deinit();
 
-	var buffer_provider = try BufferProvider.init(t.allocator);
-	defer buffer_provider.deinit();
+	var bp = buffer.Provider.initNoPool(t.allocator);
 
 	for (0..100) |_| {
 		var stream = s.clone();
-		clientLoop(TestHandler, context, NetConn{.stream = &stream}, &config, &handshake_pool, buffer_provider);
+		clientLoop(TestHandler, context, NetConn{.stream = &stream}, &config, &hp, &bp);
 		try t.expectEqual(stream.closed, true);
 
 		const r = stream.asReceived(true);

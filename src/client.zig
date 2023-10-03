@@ -23,6 +23,7 @@ pub const Config = struct {
 	handle_pong: bool = false,
 	handle_close: bool = false,
 	write_timeout_ms: u32 = 0,
+	buffer_provider: ?*buffer.Provider = null,
 };
 
 pub const HandshakeOpts = struct {
@@ -64,31 +65,51 @@ pub fn Client(comptime T: type) type {
 		_handle_ping: bool,
 		_handle_pong: bool,
 		_handle_close: bool,
+		_bp: ?*buffer.Provider,
 		_write_timeout_ms: u32,
 		_mask_fn: *const fn() [4]u8,
-		_buffer_provider: *buffer.Provider,
 
 		const Self = @This();
 
 		pub fn init(allocator: Allocator, stream: T, config: Config) !Self {
-			const buffer_provider = try buffer.Provider.init(allocator);
+			var bp: *buffer.Provider = undefined;
+			var owned_bp: ?*buffer.Provider = null;
+
+			// If a buffer_provider is provided, we'll use that.
+			// If it isn't, we need to create one which also means we now "own" it
+			// and we're responsible for cleaning it up
+			if (config.buffer_provider) |shared_bp| {
+				bp = shared_bp;
+			} else {
+				bp = try allocator.create(buffer.Provider);
+				bp.* = buffer.Provider.initNoPool(allocator);
+				owned_bp = bp;
+			}
+
+			errdefer {
+				if (owned_bp) |obp| {
+					allocator.destroy(obp);
+				}
+			}
 
 			return .{
 				.stream = stream,
+				._bp = owned_bp,
 				._closed = false,
 				._mask_fn = config.mask_fn,
 				._handle_ping = config.handle_ping,
 				._handle_pong = config.handle_pong,
 				._handle_close = config.handle_close,
-				._buffer_provider = buffer_provider,
 				._write_timeout_ms = config.write_timeout_ms,
-				._reader = try Reader.init(config.buffer_size, config.max_size, buffer_provider),
+				._reader = try Reader.init(config.buffer_size, config.max_size, bp),
 			};
 		}
 
 		pub fn deinit(self: *Self) void {
 			self._reader.deinit();
-			self._buffer_provider.deinit();
+			if (self._bp) |bp| {
+				bp.allocator.destroy(bp);
+			}
 			self.close();
 		}
 

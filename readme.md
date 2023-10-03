@@ -136,6 +136,8 @@ The 4th parameter to `websocket.listen` is a configuration object.
  `handle_ping` - Whether ping messages should be sent to the handler. When true, the libray will not automatically answer with a pong. Default: `false`.
 * `handle_pong` - Whether pong messages should be sent to the handler. 
 * `handle_close` - Whether close messages should be sent to the handler.  When true, the library will not automatically answer with a corresponding `close` However, the readLoop will exists and the connection will be closed.
+* `large_buffer_pool_count` - The number of "large" buffers to keep pooled. Default: `32`.
+* `large_buffer_size` - The size of each large buffer. Default: `32768`
 
 Setting `max_size == buffer_size` is valid and will ensure that no dynamic memory allocation occurs once the connection is established.
 
@@ -144,6 +146,8 @@ The server allocates and keep around `handshake_pool_size * handshake_max_size` 
 The handshake pool/buffer is separate from the main `buffer_size` to reduce the memory cost of invalid handshakes. Unless you're expecting a very large handshake request (a large URL, querystring or headers), the initial handshake is usually < 1KB. This data is also short-lived. Once the websocket is established however, you may want a larger buffer for handling incoming requests (and this buffer is generally much longer lived). By using a small pooled buffer for the initial handshake, invalid connections don't use up [as much] memory and thus the server may be more resilient to basic DOS attacks. Keep in mind that the websocket protocol requires a number of mandatory headers, so `handshake_max_size` can't be set to a super small value. Also keep in mind that the current pool implementation does not block when empty, but rather creates dynamic buffers of `handshake_max_size`.
 
 Websockets have their own fragmentation "feature" (not the same as TCP fragmentation) which this library could handle more efficiently. However, I'm not aware of any client (e.g. browsers) which use this feature at all.
+
+The server also allocates around `large_buffer_pool_count * large_buffer_size` bytes at all time. The pool is shared by all connections and can be used for messages that exceed `buffer_size`. The large buffer pool allows the application to use a reasonable per-connection `buffer_size`, while having an efficient fallback for the occasional large message. If `max_size` is greater than `large_buffer_size` or if all pooled buffers are currently in-use, a buffer of the needed size is dynamically allocated.
 
 ## Advanced
 
@@ -326,7 +330,10 @@ The 3rd parameter to `connect` is a configuration object.
 
 Setting `max_size == buffer_size` is valid and will ensure that no dynamic memory allocation occurs once the connection is established.
 
-Zig only supports TLS 1.3, so this library can only connect to hosts using TLS 1.3. If no `ca_bundle` is provided, the library will create a default bundle per connection. For a high number of connections, it might be beneficial to manage our own CA bundle:
+Zig only supports TLS 1.3, so this library can only connect to hosts using TLS 1.3. If no `ca_bundle` is provided, the library will create a default bundle per connection.
+
+### Performance Optimization 1 - CA Bundle
+For a high number of connections, it might be beneficial to manage our own CA bundle:
 
 ```zig
 // some global data
@@ -335,7 +342,25 @@ try ca_bundle.rescan(allocator);
 defer ca_bundle.deinit(allocator);
 ```
 
-And then assign this `ca_bundle` into the the configuration's `ca_bundle`field.
+And then assign this `ca_bundle` into the the configuration's `ca_bundle` field. This way the library does not have to create and scan the installed CA certificates for each client connection.
+
+### Performance Optimization 2 - Buffer Provider
+For a high nummber of connections, or code that is especially sensitive to memory allocations, a large buffer pool can be created and provided to each client:
+
+```zig
+// Create a buffer pool of 10 buffers, each being 32K
+const buffer_provider = try websocket.bufferProvider(allocator, 10, 32768);
+defer buffer_provider.deinit();
+
+
+// create your client(s) using the above created buffer_provider
+var client = try websocket.connect(allocator, "localhost", 9001, .{
+    ...
+    .buffer_provider = buffer_provider,
+});
+```
+
+This allows each client to have a reasonable `buffer_size` that can accomodate most messages, while having an efficient fallback for the occasional large message. When `max_size` is greater than the large buffer pool size (32K in the above example) or when all pooled buffers are used, a dynamic buffer is created.
  
 ## Handshake
 The handshake sends the initial HTTP-like request to the server. A `timeout` in milliseconds can be specified. You can pass arbitrary headers to the backend via the `headers` option. However, the full handshake request must fit within the configured `buffer_size`. By default, the request size is about 150 bytes (plus the length of the URL).

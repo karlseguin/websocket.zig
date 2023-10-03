@@ -16,7 +16,6 @@ pub fn main() !void {
 
 	const allocator = general_purpose_allocator.allocator();
 
-
 	// abitrary context object that will get passed to your handler
 	var context = Context{};
 

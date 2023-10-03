@@ -2,6 +2,7 @@ const std = @import("std");
 const lib = @import("lib.zig");
 pub const testing = @import("testing.zig");
 
+const buffer = lib.buffer;
 const client = @import("client.zig");
 const server = @import("server.zig");
 
@@ -18,6 +19,16 @@ pub const Config = struct{
 	pub const Server = server.Config;
 	pub const Client = client.Config;
 };
+
+const Allocator = std.mem.Allocator;
+pub fn bufferProvider(allocator: Allocator, pool_buffer_count: u16, pool_buffer_size: usize) !*buffer.Provider {
+	const pool = try allocator.create(buffer.Pool);
+	pool.* = try buffer.Pool.init(allocator, pool_buffer_count, pool_buffer_size);
+
+	const provider = try allocator.create(buffer.Provider);
+	provider.* = buffer.Provider.init(allocator, pool, pool_buffer_size);
+	return provider;
+}
 
 pub fn frameText(comptime msg: []const u8) [lib.framing.frameLen(msg)]u8 {
 	return lib.framing.frame(.text, msg);

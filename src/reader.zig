@@ -166,11 +166,12 @@ pub const Reader = struct {
 							framing.mask(mask, payload);
 						}
 
+
 						if (fin) {
 							if (is_continuation) {
 								if (self.fragment) |*f| {
 									try f.add(payload);
-									return Message{ .type = f.type, .data = f.buf };
+									return Message{ .type = f.type, .data = f.buf.items };
 								}
 								return error.UnfragmentedContinuation;
 							}
@@ -206,7 +207,7 @@ pub const Reader = struct {
 
 	fn prepareForNewMessage(self: *Reader) void {
 		if (self.buf.type != .static) {
-			self.bp.free(self.buf);
+			self.bp.release(self.buf);
 			self.buf = self.static;
 			self.len = 0;
 			self.start = 0;
@@ -248,7 +249,7 @@ pub const Reader = struct {
 		if (missing > buf.len - read_start) {
 			if (to_read <= buf.len) {
 				// We have enough space to read this message in our
-				// current buffer, but we need to rcompact it.
+				// current buffer, but we need to compact it.
 				std.mem.copyForwards(u8, buf[0..], buf[start..read_start]);
 				self.start = 0;
 				read_start = len;
@@ -258,7 +259,10 @@ pub const Reader = struct {
 					@memcpy(new_buf.data[0 .. len], buf[start .. start + len]);
 				}
 
-				buf = new_buf.data;
+				// bp.alloc can return a larger buffer (e.g. from a pool). But we don't
+				// want to over-read data here, since we want to be able to cleanly
+				// revert back to our static buffer
+				buf = new_buf.data[0..to_read];
 				read_start = len;
 
 				self.start = 0;
@@ -296,10 +300,9 @@ test "Reader: exact read into static with no overflow" {
 	_ = s.add("hello1");
 	defer s.deinit();
 
-	const bp = try buffer.Provider.init(t.allocator);
-	defer bp.deinit();
+	var bp = buffer.Provider.initNoPool(t.allocator);
 
-	var r = try Reader.init(20, 20, bp);
+	var r = try Reader.init(20, 20, &bp);
 	defer r.deinit();
 
 	try t.expectEqual(true, try r.read(&s, 6));
@@ -312,10 +315,9 @@ test "Reader: overread into static with no overflow" {
 	_ = s.add("hello1world");
 	defer s.deinit();
 
-	const bp = try buffer.Provider.init(t.allocator);
-	defer bp.deinit();
+	var bp = buffer.Provider.initNoPool(t.allocator);
 
-	var r = try Reader.init(20, 20, bp);
+	var r = try Reader.init(20, 20, &bp);
 	defer r.deinit();
 
 	try t.expectEqual(true, try r.read(&s, 6));
@@ -332,10 +334,9 @@ test "Reader: incremental read of message" {
 	_ = s.add("12345");
 	defer s.deinit();
 
-	const bp = try buffer.Provider.init(t.allocator);
-	defer bp.deinit();
+	var bp = buffer.Provider.initNoPool(t.allocator);
 
-	var r = try Reader.init(20, 20, bp);
+	var r = try Reader.init(20, 20, &bp);
 	defer r.deinit();
 
 	try t.expectEqual(true, try r.read(&s, 2));
@@ -351,10 +352,9 @@ test "Reader: reads with overflow" {
 	defer s.deinit();
 
 
-	const bp = try buffer.Provider.init(t.allocator);
-	defer bp.deinit();
+	var bp = buffer.Provider.initNoPool(t.allocator);
 
-	var r = try Reader.init(6, 5, bp);
+	var r = try Reader.init(6, 5, &bp);
 	defer r.deinit();
 
 	try t.expectEqual(true, try r.read(&s, 5));
@@ -371,14 +371,13 @@ test "Reader: reads too large" {
 	_ = s.add("12356");
 	defer s.deinit();
 
-	const bp = try buffer.Provider.init(t.allocator);
-	defer bp.deinit();
+	var bp = buffer.Provider.initNoPool(t.allocator);
 
-	var r1 = try Reader.init(5, 5, bp);
+	var r1 = try Reader.init(5, 5, &bp);
 	defer r1.deinit();
 	try t.expectError(error.TooLarge, r1.read(&s, 6));
 
-	var r2 = try Reader.init(5, 10, bp);
+	var r2 = try Reader.init(5, 10, &bp);
 	defer r2.deinit();
 	try t.expectError(error.TooLarge, r2.read(&s, 11));
 }
@@ -388,25 +387,23 @@ test "Reader: reads message larger than static" {
 	_ = s.add("hello world");
 	defer s.deinit();
 
-	const bp = try buffer.Provider.init(t.allocator);
-	defer bp.deinit();
+	var bp = buffer.Provider.initNoPool(t.allocator);
 
-	var r = try Reader.init(5, 20, bp);
+	var r = try Reader.init(5, 20, &bp);
 	defer r.deinit();
 
 	try t.expectEqual(true, try r.read(&s, 11));
 	try t.expectString("hello world", r.currentMessage());
 }
 
-test "Reader: reads fragmented message larger than static" {
+test "Reader: reads fragmented message larger than static (no pool)" {
 	var s = t.Stream.init();
 	_ = s.add("hello").add(" ").add("world!").add("nice");
 	defer s.deinit();
 
-	const bp = try buffer.Provider.init(t.allocator);
-	defer bp.deinit();
+	var bp = buffer.Provider.initNoPool(t.allocator);
 
-	var r = try Reader.init(5, 20, bp);
+	var r = try Reader.init(5, 20, &bp);
 	defer r.deinit();
 
 	try t.expectEqual(true, try r.read(&s, 12));
@@ -418,15 +415,56 @@ test "Reader: reads fragmented message larger than static" {
 	try t.expectString("nice", r.currentMessage());
 }
 
-test "Reader: reads large fragmented message after small message" {
+test "Reader: reads fragmented message larger than static smaller than pool" {
+	var s = t.Stream.init();
+	_ = s.add("hello").add(" ").add("world!").add("nice");
+	defer s.deinit();
+
+	var pool = try buffer.Pool.init(t.allocator, 2, 50);
+	defer pool.deinit();
+	var bp = buffer.Provider.init(t.allocator, &pool, 50);
+
+	var r = try Reader.init(5, 20, &bp);
+	defer r.deinit();
+
+	try t.expectEqual(true, try r.read(&s, 12));
+	try t.expectString("hello world!", r.currentMessage());
+	try t.expectString("hello world!", r.currentMessage());
+
+	r.prepareForNewMessage();
+	try t.expectEqual(true, try r.read(&s, 4));
+	try t.expectString("nice", r.currentMessage());
+}
+
+test "Reader: reads large fragmented message after small message no pool" {
 	var s = t.Stream.init();
 	_ = s.add("nice").add("hello").add(" ").add("world!");
 	defer s.deinit();
 
-	const bp = try buffer.Provider.init(t.allocator);
-	defer bp.deinit();
+	var bp = buffer.Provider.initNoPool(t.allocator);
 
-	var r = try Reader.init(5, 20, bp);
+	var r = try Reader.init(5, 20, &bp);
+	defer r.deinit();
+
+	try t.expectEqual(true, try r.read(&s, 4));
+	try t.expectString("nice", r.currentMessage());
+
+	r.prepareForNewMessage();
+	try t.expectEqual(true, try r.read(&s, 12));
+	try t.expectString("hello world!", r.currentMessage());
+	try t.expectString("hello world!", r.currentMessage());
+}
+
+test "Reader: reads large fragmented message after small with pool" {
+	var s = t.Stream.init();
+	_ = s.add("nice").add("hello").add(" ").add("world!");
+	defer s.deinit();
+
+	var pool = try buffer.Pool.init(t.allocator, 2, 50);
+	defer pool.deinit();
+	var bp = buffer.Provider.init(t.allocator, &pool, 50);
+
+	var r = try Reader.init(5, 20, &bp);
 	defer r.deinit();
 
 	try t.expectEqual(true, try r.read(&s, 4));
@@ -443,10 +481,9 @@ test "Reader: reads large fragmented message fragmented with small message" {
 	_ = s.add("nicehel").add("lo").add(" ").add("world!");
 	defer s.deinit();
 
-	const bp = try buffer.Provider.init(t.allocator);
-	defer bp.deinit();
+	var bp = buffer.Provider.initNoPool(t.allocator);
 
-	var r = try Reader.init(7, 20, bp);
+	var r = try Reader.init(7, 20, &bp);
 	defer r.deinit();
 
 	try t.expectEqual(true, try r.read(&s, 4));
@@ -463,10 +500,9 @@ test "Reader: reads large fragmented message with a small message when static bu
 	_= s.add("nicehel").add("lo").add(" ").add("world!");
 	defer s.deinit();
 
-	const bp = try buffer.Provider.init(t.allocator);
-	defer bp.deinit();
+	var bp = buffer.Provider.initNoPool(t.allocator);
 
-	var r = try Reader.init(5, 20, bp);
+	var r = try Reader.init(5, 20, &bp);
 	defer r.deinit();
 
 	try t.expectEqual(true, try r.read(&s, 4));
@@ -483,10 +519,9 @@ test "Reader: reads large fragmented message" {
 	_ = s.add("0").add("123456").add("789ABCabc").add("defghijklmn");
 	defer s.deinit();
 
-	const bp = try buffer.Provider.init(t.allocator);
-	defer bp.deinit();
+	var bp = buffer.Provider.initNoPool(t.allocator);
 
-	var r = try Reader.init(5, 20, bp);
+	var r = try Reader.init(5, 20, &bp);
 	defer r.deinit();
 
 	try t.expectEqual(true, try r.read(&s, 1));
@@ -541,10 +576,9 @@ test "Reader: fuzz" {
 			var s = stream.clone();
 			defer s.deinit();
 
-			const bp = try buffer.Provider.init(t.allocator);
-			defer bp.deinit();
+			var bp = buffer.Provider.initNoPool(t.allocator);
 
-			var r = try Reader.init(40, 101, bp);
+			var r = try Reader.init(40, 101, &bp);
 			defer r.deinit();
 
 			for (messages) |m| {

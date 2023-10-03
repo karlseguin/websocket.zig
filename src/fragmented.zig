@@ -7,52 +7,44 @@ const Allocator = std.mem.Allocator;
 const MessageType = lib.MessageType;
 
 pub const Fragmented = struct {
-	buf: []u8,
-	len: usize,
 	type: MessageType,
-	bp: *buffer.Provider,
+	buf: std.ArrayList(u8),
 
 	pub fn init(bp: *buffer.Provider, message_type: MessageType, value: []const u8) !Fragmented {
+		var buf = std.ArrayList(u8).init(bp.allocator);
+		try buf.ensureTotalCapacity(value.len * 2);
+		buf.appendSliceAssumeCapacity(value);
+
 		return .{
-			.bp = bp,
-			.len = value.len,
+			.buf = buf,
 			.type = message_type,
-			.buf = try bp.allocator.dupe(u8, value),
 		};
 	}
 
 	pub fn deinit(self: Fragmented) void {
-		self.bp.allocator.free(self.buf);
+		self.buf.deinit();
 	}
 
 	pub fn add(self: *Fragmented, value: []const u8) !void {
-		const len = self.len;
-		const new_len = len + value.len;
-
-		const buf = try self.bp.allocator.realloc(self.buf, new_len);
-		std.mem.copy(u8, buf[len..], value);
-
-		self.buf = buf;
-		self.len = new_len;
+		try self.buf.appendSlice(value);
 	}
 };
 
 const t = lib.testing;
 test "fragmented" {
-	var bp = try buffer.Provider.init(t.allocator);
-	defer bp.deinit();
+	var bp = buffer.Provider.initNoPool(t.allocator);
 
 	{
-		var f = try Fragmented.init(bp, .text, "hello");
+		var f = try Fragmented.init(&bp, .text, "hello");
 		defer f.deinit();
 
-		try t.expectString("hello", f.buf);
+		try t.expectString("hello", f.buf.items);
 
 		try f.add(" ");
-		try t.expectString(f.buf, "hello ");
+		try t.expectString("hello ", f.buf.items);
 
 		try f.add("world");
-		try t.expectString("hello world", f.buf);
+		try t.expectString("hello world", f.buf.items);
 	}
 
 	{
@@ -66,7 +58,7 @@ test "fragmented" {
 			var payload = buf[0..random.uintAtMost(usize, 99) + 1];
 			random.bytes(payload);
 
-			var f = try Fragmented.init(bp, .binary, payload);
+			var f = try Fragmented.init(&bp, .binary, payload);
 			defer f.deinit();
 
 			var expected = std.ArrayList(u8).init(t.allocator);
@@ -81,7 +73,7 @@ test "fragmented" {
 				try f.add(payload);
 				try expected.appendSlice(payload);
 			}
-			try t.expectString(expected.items, f.buf);
+			try t.expectString(expected.items, f.buf.items);
 		}
 	}
 }
