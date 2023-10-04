@@ -265,7 +265,6 @@ The 3rd parameter to `connect` is a configuration object.
 * `handle_ping` - Whether ping messages should be sent to the handler. When true, the client will not automatically answer with a pong. Default: `false`.
 * `handle_pong` - Whether pong messages should be sent to the handler. 
 * `handle_close` - Whether close messages should be sent to the handler.  When true, the client will not automatically answer with a corresponding `close` and will not close the underlying socket. However, the readLoop will still exists. If `true`, handlers are strongly encouraged to call `client.close()` when receiving a close message.
-* `write_timeout_ms` - u32 - Timeout for writes. Default: `0` (writes won't timeout)
 
 Setting `max_size == buffer_size` is valid and will ensure that no dynamic memory allocation occurs once the connection is established.
 
