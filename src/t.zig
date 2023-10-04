@@ -35,20 +35,20 @@ pub const StreamWrap = struct {
 		return self.stream.read(buf);
 	}
 
-	pub fn readPoll(_: StreamWrap, _: i32) !usize {
-		return 1;
-	}
-
 	pub fn close(self: StreamWrap) void {
 		return self.stream.close();
 	}
 
-	pub fn writeAll(self: StreamWrap, data: []const u8, timeout: u32) !void {
-		_ = timeout;
+	pub fn writeAll(self: StreamWrap, data: []const u8) !void {
 		return self.stream.writeAll(data);
 	}
 
 	pub fn receiveTimeout(self: StreamWrap, ms: u32) !void {
+		_ = self;
+		_ = ms;
+	}
+
+	pub fn writeTimeout(self: StreamWrap, ms: u32) !void {
 		_ = self;
 		_ = ms;
 	}
