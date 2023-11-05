@@ -13,6 +13,7 @@ pub fn expectEqual(expected: anytype, actual: anytype) !void {
 
 pub const expectError = std.testing.expectError;
 pub const expectString = std.testing.expectEqualStrings;
+pub const expectSlice = std.testing.expectEqualSlices;
 
 pub fn getRandom() std.rand.DefaultPrng {
 	var seed: u64 = undefined;

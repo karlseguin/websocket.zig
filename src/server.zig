@@ -130,7 +130,7 @@ fn clientLoop(comptime H: type, context: anytype, net_conn: NetConn, config: *co
 		return;
 	};
 	defer reader.deinit();
-	conn.readLoop(H, handler, &reader) catch {};
+	conn.readLoop(*H, &handler, &reader) catch {};
 }
 
 const EMPTY_PONG = ([2]u8{ @intFromEnum(OpCode.pong), 0 })[0..];
@@ -348,6 +348,32 @@ pub fn readRequest(stream: anytype, buf: []u8, timeout: ?u32) ![]u8 {
 }
 
 const t = lib.testing;
+test "clientLoop" {
+	// we don't currently use this
+	var context = TestContext{};
+	const config = Config{
+		.handshake_timeout_ms = null,
+	};
+
+	var hp = try HandshakePool.init(t.allocator, 1, 512, 5);
+	defer hp.deinit();
+
+	var bp = buffer.Provider.initNoPool(t.allocator);
+
+	{
+		var stream = t.Stream.handshake();
+		defer stream.deinit();
+		_ = stream.textFrame(true, &.{0}).textFrame(true, &.{0});
+		clientLoop(TestHandler, context, NetConn{.stream = &stream}, &config, &hp, &bp);
+		try t.expectEqual(stream.closed, true);
+
+		const r = stream.asReceived(true);
+		defer r.deinit();
+		try t.expectSlice(u8, &.{2, 0, 0, 0}, r.messages[0].data);
+		try t.expectSlice(u8, &.{3, 0, 0, 0}, r.messages[1].data);
+	}
+}
+
 test "read messages" {
 	{
 		// simple small message
@@ -582,19 +608,38 @@ const TEST_BUFFER_SIZE = 512;
 const TestContext = struct {};
 const TestHandler = struct {
 	conn: *Conn,
+	counter: i32,
+	init_ptr: usize,
 
 	pub fn init(_: anytype, conn: *Conn, _: TestContext) !TestHandler {
-		return TestHandler{
+		return .{
 			.conn = conn,
+			.counter = 0,
+			.init_ptr = 0,
 		};
 	}
 
+	pub fn afterInit(self: *TestHandler) !void {
+		self.counter = 1;
+		self.init_ptr = @intFromPtr(self);
+	}
+
 	// echo it back, so that it gets written back into our t.Stream
-	pub fn handle(self: TestHandler, message: lib.Message) !void {
+	pub fn handle(self: *TestHandler, message: lib.Message) !void {
+		self.counter += 1;
 		const data = message.data;
 		switch (message.type) {
 			.binary => try self.conn.writeBin(data),
-			.text => try self.conn.write(data),
+			.text => {
+				if (data.len == 1 and data[0] == 0) {
+					std.debug.assert(self.init_ptr == @intFromPtr(self));
+					var buf: [4]u8 = undefined;
+					std.mem.writeIntNative(i32, &buf, self.counter);
+					try self.conn.write(&buf);
+				} else {
+					try self.conn.write(data);
+				}
+			},
 			else => unreachable,
 		}
 	}
