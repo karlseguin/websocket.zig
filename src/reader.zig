@@ -237,20 +237,26 @@ pub const Reader = struct {
 			self.message_len = to_read;
 			return true;
 		}
-		const missing = to_read - len;
 
 		var buf = self.buf.data;
-		const start = self.start;
-		const message_len = self.message_len;
-		var read_start = start + len;
 
-		if (missing > buf.len - read_start) {
+		// the position in buf up to which we have valid data, this is where
+		// we should start filling it up from.
+		var pos = self.start + len;
+
+		// how much data we're missing to satifisfy to_read
+		const missing = to_read - len;
+
+		if (missing > buf.len - pos) {
+			// the position, in buf, where the current message starts
+			const start = self.start;
+
 			if (to_read <= buf.len) {
 				// We have enough space to read this message in our
 				// current buffer, but we need to compact it.
-				std.mem.copyForwards(u8, buf[0..], buf[start..read_start]);
+				std.mem.copyForwards(u8, buf[0..], buf[start..pos]);
 				self.start = 0;
-				read_start = len;
+				pos = len;
 			} else if (to_read <= self.max_size) {
 				const new_buf = try self.bp.alloc(to_read);
 				if (len > 0) {
@@ -261,26 +267,26 @@ pub const Reader = struct {
 				// want to over-read data here, since we want to be able to cleanly
 				// revert back to our static buffer
 				buf = new_buf.data[0..to_read];
-				read_start = len;
+				pos = len;
 
 				self.start = 0;
 				self.buf = new_buf;
-				self.len = message_len;
+				self.len = self.message_len;
 			} else {
 				return error.TooLarge;
 			}
 		}
 
-		var total_read: usize = 0;
-		while (total_read < missing) {
-			const n = try stream.read(buf[(read_start + total_read)..]);
+		const read_end = pos + missing;
+		while (pos < read_end) {
+			const n = try stream.read(buf[pos..buf.len]);
 			if (n == 0) {
 				return false;
 			}
-			total_read += n;
+			pos += n;
 		}
 
-		self.len += total_read;
+		self.len = pos - self.start;
 		self.message_len = to_read;
 		return true;
 	}
