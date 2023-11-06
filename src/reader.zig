@@ -277,9 +277,15 @@ pub const Reader = struct {
 			}
 		}
 
-		const read_end = pos + missing;
-		while (pos < read_end) {
-			const n = try stream.read(buf[pos..buf.len]);
+		// Once pos reaches this position, then we have to_read bytes
+		const need_pos = pos + missing;
+
+		// A bit arbitrary
+		const buf_end = if (to_read > 20) buf.len else need_pos;
+		// const buf_end = if (buf.len - need_pos > 20) buf.len else need_pos;
+
+		while (pos < need_pos) {
+			const n = try stream.read(buf[pos..buf_end]);
 			if (n == 0) {
 				return false;
 			}
