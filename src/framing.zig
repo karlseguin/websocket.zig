@@ -11,39 +11,18 @@ pub const OpCode = enum(u8) {
 
 
 pub fn mask(m: []const u8, payload: []u8) void {
-	@setRuntimeSafety(false);
-	const word_size = @sizeOf(usize);
-
-	// not point optimizing this if it's a really short payload
-	if (payload.len < word_size) {
-		simpleMask(m, payload);
-		return;
-	}
-
-	// We're going to xor this 1 word at a time.
-	// But, our payload's length probably isn't a perfect multiple of word_size
-	// so we'll first xor the bits until we have it aligned.
 	var data = payload;
-	const over = data.len % word_size;
-
-	if (over > 0) {
-		simpleMask(m, data[0..over]);
-		data = data[over..];
+	const vector_size = std.simd.suggestVectorSize(u8) orelse @sizeOf(usize);
+	if (data.len >= vector_size) {
+		const mask_vector = std.simd.repeat(vector_size, @as(@Vector(4, u8), m[0..4].*));
+		while (data.len >= vector_size) {
+			var slice = data[0..vector_size];
+			var masked_data_slice: @Vector(vector_size, u8) = slice.*;
+			slice.* = masked_data_slice ^ mask_vector;
+			data = data[vector_size..];
+		}
 	}
-
-	// shift the mask based on the # bytes we already unmasked in the above loop
-	var mask_template: [4]u8 = undefined;
-	for (0..4) |i| {
-		mask_template[i] = m[(i + over) & 3];
-	}
-
-	var i: usize = 0;
-	const mask_vector = std.simd.repeat(word_size, @as(@Vector(4, u8), mask_template[0..4].*));
-	while (i < data.len) : (i += word_size) {
-		var slice = data[i..i+word_size][0..word_size];
-		var masked_data_slice: @Vector(word_size, u8) = slice.*;
-		slice.* = masked_data_slice ^ mask_vector;
-	}
+	simpleMask(m, data);
 }
 
 fn simpleMask(m: []const u8, payload: []u8) void {
