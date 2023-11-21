@@ -634,7 +634,7 @@ const TestHandler = struct {
 				if (data.len == 1 and data[0] == 0) {
 					std.debug.assert(self.init_ptr == @intFromPtr(self));
 					var buf: [4]u8 = undefined;
-					std.mem.writeInt(i32, &buf, self.counter, .little);
+					std.mem.writeIntLittle(i32, &buf, self.counter);
 					try self.conn.write(&buf);
 				} else {
 					try self.conn.write(data);
