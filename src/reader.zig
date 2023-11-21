@@ -111,8 +111,8 @@ pub const Reader = struct {
 				switch (phase) {
 					.pre => {
 						const msg = self.currentMessage();
-						var byte1 = msg[0];
-						var byte2 = msg[1];
+						const byte1 = msg[0];
+						const byte2 = msg[1];
 						masked = byte2 & 128 == 128;
 						length_of_length = switch (byte2 & 127) {
 							126 => 2,
@@ -148,7 +148,7 @@ pub const Reader = struct {
 					},
 					.header => {
 						const msg = self.currentMessage();
-						var payload_length = switch (length_of_length) {
+						const payload_length = switch (length_of_length) {
 							2 => @as(u16, @intCast(msg[3])) | @as(u16, @intCast(msg[2])) << 8,
 							8 => @as(u64, @intCast(msg[9])) | @as(u64, @intCast(msg[8])) << 8 | @as(u64, @intCast(msg[7])) << 16 | @as(u64, @intCast(msg[6])) << 24 | @as(u64, @intCast(msg[5])) << 32 | @as(u64, @intCast(msg[4])) << 40 | @as(u64, @intCast(msg[3])) << 48 | @as(u64, @intCast(msg[2])) << 56,
 							else => msg[1] & 127,
@@ -159,7 +159,7 @@ pub const Reader = struct {
 					.payload => {
 						const msg = self.currentMessage();
 						const fin = msg[0] & 128 == 128;
-						var payload = msg[header_length..];
+						const payload = msg[header_length..];
 
 						if (masked) {
 							const mask = msg[header_length - 4 .. header_length];
@@ -230,7 +230,7 @@ pub const Reader = struct {
 	// Reads at least to_read bytes and returns true
 	// When read fails, returns false
 	fn read(self: *Reader, stream: anytype, to_read: usize) !bool {
-		var len = self.len;
+		const len = self.len;
 
 		if (to_read < len) {
 			// we already have to_read bytes available

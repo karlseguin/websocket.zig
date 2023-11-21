@@ -3,10 +3,10 @@ const lib = @import("lib.zig");
 const t = lib.testing;
 
 pub fn init() *Testing {
-	var stream = t.allocator.create(t.Stream) catch unreachable;
+	const stream = t.allocator.create(t.Stream) catch unreachable;
 	stream.* = t.Stream.init();
 
-	var testing = t.allocator.create(Testing) catch unreachable;
+	const testing = t.allocator.create(Testing) catch unreachable;
 
 	testing.* = .{
 		.read_index = 0,

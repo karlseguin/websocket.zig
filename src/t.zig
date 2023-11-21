@@ -162,7 +162,7 @@ pub const Stream = struct {
 		var frames: []u8 = undefined;
 
 		// 2 byte header + length_of_length + mask + payload_length
-		var needed = 2 + length_of_length + 4 + l;
+		const needed = 2 + length_of_length + 4 + l;
 
 		if (self.frames) |f| {
 			start = f.len;
@@ -295,7 +295,7 @@ pub const Stream = struct {
 	pub fn clone(self: *Stream) Stream {
 		var c = Stream.init();
 		if (self.frames) |f| {
-			var copy = allocator.alloc(u8, f.len) catch unreachable;
+			const copy = allocator.alloc(u8, f.len) catch unreachable;
 			mem.copy(u8, copy, f);
 			c.frames = copy;
 		}
@@ -353,7 +353,7 @@ pub const Received = struct {
 		}
 
 		// move past the last received data, which was the end of our handshake
-		var frames = all[i..];
+		const frames = all[i..];
 
 		var frame_index: usize = 0;
 		var message_index: usize = 0;

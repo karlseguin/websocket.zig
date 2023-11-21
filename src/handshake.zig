@@ -236,7 +236,7 @@ const t = lib.testing;
 const readRequest = @import("server.zig").readRequest;
 test "handshake: parse" {
 	var buffer: [512]u8 = undefined;
-	var buf = buffer[0..];
+	const buf = buffer[0..];
 	var headers = try KeyValue.init(t.allocator, 10);
 	defer headers.deinit(t.allocator);
 

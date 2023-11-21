@@ -16,8 +16,8 @@ pub fn mask(m: []const u8, payload: []u8) void {
 	if (data.len >= vector_size) {
 		const mask_vector = std.simd.repeat(vector_size, @as(@Vector(4, u8), m[0..4].*));
 		while (data.len >= vector_size) {
-			var slice = data[0..vector_size];
-			var masked_data_slice: @Vector(vector_size, u8) = slice.*;
+			const slice = data[0..vector_size];
+			const masked_data_slice: @Vector(vector_size, u8) = slice.*;
 			slice.* = masked_data_slice ^ mask_vector;
 			data = data[vector_size..];
 		}
@@ -77,7 +77,7 @@ test "mask" {
 
 	var size: usize = 0;
 	while (size < 1000) {
-		var slice = original[0..size];
+		const slice = original[0..size];
 		random.bytes(slice);
 		std.mem.copy(u8, payload, slice);
 		mask(m[0..], payload[0..size]);

@@ -111,12 +111,12 @@ pub fn Client(comptime T: type) type {
 		}
 
 		pub fn handshake(self: *Self, path: []const u8, opts: HandshakeOpts) !void {
-			var stream = &self.stream;
+			const stream = &self.stream;
 			errdefer self.closeWithCode(1002);
 
 			// we've already setup our reader, and the reader has a static buffer
 			// we might as well use it!
-			var buf = self._reader.static.data;
+			const buf = self._reader.static.data;
 
 			const key = blk: {
 				const bin_key = generateKey();
@@ -135,7 +135,7 @@ pub fn Client(comptime T: type) type {
 
 		pub fn readLoop(self: *Self, h: anytype) !void {
 			var reader = &self._reader;
-			var stream = &self.stream;
+			const stream = &self.stream;
 			defer h.close();
 
 			const handle_ping = self._handle_ping;
@@ -405,7 +405,7 @@ fn readHandshakeReply(buf: []u8, key: []const u8, opts: *const HandshakeOpts, st
 	var line_start: usize = 0;
 	var complete_response: u8 = 0;
 	while (true) {
-		var n = try stream.read(buf[pos..]);
+		const n = try stream.read(buf[pos..]);
 		if (n == 0) {
 			return error.ConnectionClosed;
 		}
