@@ -21,6 +21,7 @@ pub const Config = struct {
 	max_size: usize = 65536,
 	max_headers: usize = 0,
 	buffer_size: usize = 4096,
+	unix_path: ?[]const u8 = null,
 	address: []const u8 = "127.0.0.1",
 	handshake_max_size: usize = 1024,
 	handshake_pool_count: usize = 50,
@@ -44,14 +45,26 @@ pub fn listen(comptime H: type, allocator: Allocator, context: anytype, config: 
 	var hp = try HandshakePool.init(allocator, config.handshake_pool_count, config.handshake_max_size, config.max_headers);
 	defer hp.deinit();
 
-	try server.listen(net.Address.parseIp(config.address, config.port) catch unreachable);
+	var no_delay = true;
+	const address = blk: {
+		if (config.unix_path) |unix_path| {
+			no_delay = false;
+			std.fs.deleteFileAbsolute(unix_path) catch {};
+			break :blk try net.Address.initUnix(unix_path);
+		} else {
+			break :blk try net.Address.parseIp(config.address, config.port);
+		}
+	};
+	try server.listen(address);
 
-	// TODO: Broken on darwin:
-	// https://github.com/ziglang/zig/issues/17260
-	// if (@hasDecl(os.TCP, "NODELAY")) {
-	// 	try os.setsockopt(socket.sockfd.?, os.IPPROTO.TCP, os.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1)));
-	// }
-	try os.setsockopt(server.sockfd.?, os.IPPROTO.TCP, 1, &std.mem.toBytes(@as(c_int, 1)));
+	if (no_delay) {
+		// TODO: Broken on darwin:
+		// https://github.com/ziglang/zig/issues/17260
+		// if (@hasDecl(os.TCP, "NODELAY")) {
+		//  try os.setsockopt(socket.sockfd.?, os.IPPROTO.TCP, os.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1)));
+		// }
+		try os.setsockopt(server.sockfd.?, os.IPPROTO.TCP, 1, &std.mem.toBytes(@as(c_int, 1)));
+	}
 
 	while (true) {
 		if (server.accept()) |conn| {

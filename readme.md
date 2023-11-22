@@ -129,6 +129,7 @@ The 4th parameter to `websocket.listen` is a configuration object.
 * `max_size` - Maximum incoming message size to allow. The server will dynamically allocate up to this much space per request. Default: `65536`.
 * `buffer_size` - Size of the static buffer that's available per connection for incoming messages. While there's other overhead, the minimal memory usage of the server will be `# of active connections * buffer_size`. Default: `4096`.
 * `address` - Address to bind to. Default: `"127.0.0.1"`.
+* `unix_path` - Unix socket path to listen on (must be an absolute path). Mutually exclusive with address+port. Defaults: null
 * `handshake_pool_count` - The number of buffers to create and keep for reading the initial handshake. Default: `50`
 * `handshake_max_size` - The maximum size of the initial handshake to allow. Default: `1024`.
 * `max_headers` - The maximum size of headers to store in `handshake.headers`. Requests with more headers will still be processed, but `handshake.headers` will only contain the first `max_headers` headers. Default: `0`.
