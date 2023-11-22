@@ -34,7 +34,10 @@ pub const Config = struct {
 };
 
 pub fn listen(comptime H: type, allocator: Allocator, context: anytype, config: Config) !void {
-	var server = net.StreamServer.init(.{ .reuse_address = true });
+	var server = net.StreamServer.init(.{
+		.reuse_address = true,
+		.kernel_backlog = 1024,
+	});
 	defer server.deinit();
 
 	var buffer_pool = try buffer.Pool.init(allocator, config.large_buffer_pool_count, config.large_buffer_size);
