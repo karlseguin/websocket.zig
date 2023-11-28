@@ -1,5 +1,6 @@
 const std = @import("std");
 const lib = @import("lib.zig");
+const builtin = @import("builtin");
 
 const HandshakePool = @import("handshake.zig").Pool;
 
@@ -50,13 +51,14 @@ pub fn listen(comptime H: type, allocator: Allocator, context: anytype, config: 
 
 	var no_delay = true;
 	const address = blk: {
-		if (config.unix_path) |unix_path| {
-			no_delay = false;
-			std.fs.deleteFileAbsolute(unix_path) catch {};
-			break :blk try net.Address.initUnix(unix_path);
-		} else {
-			break :blk try net.Address.parseIp(config.address, config.port);
+		if (comptime builtin.os.tag != .windows) {
+			if (config.unix_path) |unix_path| {
+				no_delay = false;
+				std.fs.deleteFileAbsolute(unix_path) catch {};
+				break :blk try net.Address.initUnix(unix_path);
+			}
 		}
+		break :blk try net.Address.parseIp(config.address, config.port);
 	};
 	try server.listen(address);
 
