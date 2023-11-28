@@ -137,7 +137,7 @@ fn clientLoop(comptime H: type, context: anytype, net_conn: NetConn, config: *co
 	}
 
 	defer handler.close();
-	if (comptime std.meta.trait.hasFn("afterInit")(H)) {
+	if (comptime std.meta.hasFn(H, "afterInit")) {
 		handler.afterInit() catch return;
 	}
 
