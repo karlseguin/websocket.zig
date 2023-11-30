@@ -103,6 +103,25 @@ The call to `init` includes a `*websocket.Conn`. It is expected that handlers wi
 
 `conn.close()` can also be called to close the connection. Calling `conn.close()` **will** result in the handler's `close` callback being called.
 
+### Writer
+It's possible to get a `std.io.Writer` from a `*Conn`. Because websocket messages are framed, the writter will buffer the message in memory and requires an explicit "flush". Buffering will use the global buffer pool (described in the Config section), but can still result in dynamic allocations if the pool is empty or the message being written is larger than the configured max size.
+
+```zig
+var wb = try conn.writeBuffer();
+try std.fmt.format(wb.writer(), "it's over {d}!!!", .{9000});
+try wb.flush(.{});
+```
+
+By default, `wb` is automatically freed on `flush`. Also, by default, `.text` frame is sent. This behavior can be changed:
+
+```zig
+var wb = try conn.writeBuffer();
+defer wb.deinit();
+
+try std.fmt.format(wb.writer(), "it's over {d}!!!", .{9000});
+try wb.flush(.{.op_code = .binary, .deinit = false});
+```
+
 ### Pings, Pongs and Close
 By default, the library answers incoming `ping` messages with a corresponging `pong`. Similarly, when a `close` message is received, a `close` reply is sent (as per the spec).
 

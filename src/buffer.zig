@@ -57,7 +57,7 @@ pub const Provider = struct {
 
 	pub fn alloc(self: *Provider, size: usize) !Buffer {
 		// remember: if self.pool_buffer_size == 0, then self.pool is undefined.
-		if (size < self.pool_buffer_size) {
+		if (size <= self.pool_buffer_size) {
 			if (self.pool.acquire()) |buffer| {
 				return buffer;
 			}
@@ -66,6 +66,28 @@ pub const Provider = struct {
 			.type = .dynamic,
 			.data = try self.allocator.alloc(u8, size),
 		};
+	}
+
+	pub fn allocPooledOr(self: *Provider, size: usize) !Buffer {
+		if (self.pool.acquire()) |buffer| {
+			return buffer;
+		}
+
+		return .{
+			.type = .dynamic,
+			.data = try self.allocator.alloc(u8, size),
+		};
+	}
+
+	pub fn grow(self: *Provider, buffer: *Buffer, current_size: usize, new_size: usize) !Buffer {
+		if (buffer.type == .dynamic and self.allocator.resize(buffer.data, new_size)) {
+			buffer.data = buffer.data.ptr[0..new_size];
+			return buffer.*;
+		}
+		const new_buffer = try self.alloc(new_size);
+		@memcpy(new_buffer.data[0..current_size], buffer.data[0..current_size]);
+		self.free(buffer.*);
+		return new_buffer;
 	}
 
 	pub fn free(self: *Provider, buffer: Buffer) void {
@@ -169,7 +191,7 @@ test "buffer provider: pool" {
 	}
 
 	{
-		// bigger than our buffers in pool
+		// smaller than our buffers in pool
 		const buf1 = try p.alloc(4);
 		try t.expectEqual(.pooled, buf1.type);
 		try t.expectEqual(10, buf1.data.len);
@@ -189,6 +211,61 @@ test "buffer provider: pool" {
 		p.release(buf1);
 		p.release(buf2);
 		p.release(buf3);
+	}
+}
+
+test "buffer provider: allocPooledOr" {
+	var pool = try Pool.init(t.allocator, 1, 10);
+	defer pool.deinit();
+
+	var p = Provider.init(t.allocator, &pool, 10);
+
+	const buf1 = try p.allocPooledOr(5);
+	defer p.release(buf1);
+	try t.expectEqual(.pooled, buf1.type);
+	try t.expectEqual(10, buf1.data.len);
+
+	const buf2 = try p.allocPooledOr(5);
+	defer p.release(buf2);
+	try t.expectEqual(.dynamic, buf2.type);
+	try t.expectEqual(5, buf2.data.len);
+}
+
+test "buffer provider: grow" {
+	var pool = try Pool.init(t.allocator, 1, 10);
+	defer pool.deinit();
+
+	var p = Provider.init(t.allocator, &pool, 10);
+
+	{
+		// grow a dynamic buffer
+		var buf1 = try p.alloc(15);
+		@memcpy(buf1.data[0..5], "hello");
+		const buf2 = try p.grow(&buf1, 5, 20);
+		defer p.free(buf2);
+		try t.expectEqual(20, buf2.data.len);
+		try t.expectString("hello", buf2.data[0..5]);
+	}
+
+	{
+		// grow a static buffer
+		var buf1 = try p.static(15);
+		@memcpy(buf1.data[0..6], "hello2");
+		const buf2 = try p.grow(&buf1, 6, 21);
+		defer p.free(buf2);
+		try t.expectEqual(21, buf2.data.len);
+		try t.expectString("hello2", buf2.data[0..6]);
+	}
+
+	{
+		// grow a pooled buffer
+		var buf1 = try p.alloc(8);
+		@memcpy(buf1.data[0..7], "hello2a");
+		const buf2 = try p.grow(&buf1, 7, 14);
+		defer p.free(buf2);
+		try t.expectEqual(14, buf2.data.len);
+		try t.expectString("hello2a", buf2.data[0..7]);
+		try t.expectEqual(1, pool.available);
 	}
 }
 

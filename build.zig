@@ -12,6 +12,7 @@ pub fn build(b: *std.Build) !void {
 		.root_source_file = .{ .path = "src/websocket.zig" },
 		.target = target,
 		.optimize = optimize,
+		.test_runner = "test_runner.zig",
 	});
 	const run_test = b.addRunArtifact(lib_test);
 	run_test.has_side_effects = true;

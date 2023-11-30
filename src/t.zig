@@ -304,25 +304,36 @@ pub const Stream = struct {
 	}
 
 	pub fn deinit(self: *Stream) void {
+		self.reset();
+		self.to_read.deinit();
+
+		self.received_flatten.deinit();
+		self.received.deinit();
+
+		self.* = undefined;
+	}
+
+	pub fn reset(self: *Stream) void {
 		for (self.to_read.items) |buf| {
 			allocator.free(buf);
 		}
-		self.to_read.deinit();
 
 		if (self.frames) |frames| {
 			allocator.free(frames);
 			self.frames = null;
 		}
 
-		self.received_flatten.deinit();
 		if (self.received.items.len > 0) {
 			for (self.received.items) |buf| {
 				allocator.free(buf);
 			}
 		}
-		self.received.deinit();
 
-		self.* = undefined;
+		self.closed = false;
+		self.buf_index = 0;
+		self.read_index = 0;
+		self.received.clearRetainingCapacity();
+		self.received_flatten.clearRetainingCapacity();
 	}
 };
 

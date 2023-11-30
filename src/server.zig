@@ -96,6 +96,7 @@ fn clientLoop(comptime H: type, context: anytype, net_conn: NetConn, config: *co
 	var handler: H = undefined;
 	var conn = Conn{
 		.stream = stream,
+		._bp = bp,
 		._handle_ping = config.handle_ping,
 		._handle_pong = config.handle_pong,
 		._handle_close = config.handle_close,
@@ -159,6 +160,7 @@ const CLOSE_PROTOCOL_ERROR = ([_]u8{ @intFromEnum(OpCode.close), 2, 3, 234 })[0.
 pub const Conn = struct {
 	stream: lib.Stream,
 	closed: bool = false,
+	_bp: *buffer.Provider,
 	_handle_pong: bool = false,
 	_handle_ping: bool = false,
 	_handle_close: bool = false,
@@ -228,6 +230,10 @@ pub const Conn = struct {
 
 	pub fn writeFramed(self: Conn, data: []const u8) !void {
 		try self.steam.writeAll(data);
+	}
+
+	pub fn writeBuffer(self: *Conn) !Writer {
+		return Writer.init(self);
 	}
 
 	pub fn close(self: *Conn) void {
@@ -313,6 +319,73 @@ pub const Conn = struct {
 			}
 		}
 	}
+
+	pub const Writer = struct {
+		pos: usize,
+		conn: *Conn,
+		bp: *buffer.Provider,
+		buffer: buffer.Buffer,
+
+		pub const Error = Allocator.Error;
+		pub const IOWriter = std.io.Writer(*Writer, error{OutOfMemory}, Writer.write);
+
+		fn init(conn: *Conn) !Writer {
+			return .{
+				.pos = 0,
+				.conn = conn,
+				.bp = conn._bp,
+				.buffer = try conn._bp.allocPooledOr(512),
+			};
+		}
+
+		pub fn deinit(self: *Writer) void {
+			self.bp.free(self.buffer);
+		}
+
+		pub fn writer(self: *Writer) IOWriter {
+			return .{.context = self};
+		}
+
+		pub fn write(self: *Writer, data: []const u8) Allocator.Error!usize {
+			try self.ensureSpace(data.len);
+			const pos = self.pos;
+			const end_pos = pos + data.len;
+			@memcpy(self.buffer.data[pos..end_pos], data);
+			self.pos = end_pos;
+			return data.len;
+		}
+
+		pub const FlushOpts = struct {
+			deinit: bool = true,
+			op_code: OpCode = .text,
+		};
+
+		pub fn flush(self: *Writer, opts: FlushOpts) !void {
+			defer if(opts.deinit) {
+				self.deinit();
+			};
+			try self.conn.writeFrame(opts.op_code, self.buffer.data[0..self.pos]);
+		}
+
+		fn ensureSpace(self: *Writer, n: usize) !void {
+			const pos = self.pos;
+			const buf = self.buffer;
+			const required_capacity = pos + n;
+
+			if (buf.data.len >= required_capacity) {
+				// we have enough space in our body as-is
+				return;
+			}
+
+			// taken from std.ArrayList
+			var new_capacity = buf.data.len;
+			while (true) {
+				new_capacity +|= new_capacity / 2 + 8;
+				if (new_capacity >= required_capacity) break;
+			}
+			self.buffer = try self.bp.grow(&self.buffer, pos, new_capacity);
+		}
+	};
 };
 
 const read_no_timeout = std.mem.toBytes(os.timeval{
@@ -579,6 +652,57 @@ test "readFrame errors" {
 	}
 }
 
+test "conn: writer" {
+	var tf = TestConnFactory.init();
+	defer tf.deinit();
+
+	{
+		// short message (no growth) auto deinit
+		var conn = tf.conn();
+		var wb = try conn.writeBuffer();
+		try std.fmt.format(wb.writer(), "it's over {d}!!!", .{9000});
+		try wb.flush(.{});
+		try expectFrames(&.{Expect.text("it's over 9000!!!")}, conn.stream, false);
+	}
+
+{
+		// short message (no growth) manual deinit
+		var conn = tf.conn();
+		var wb = try conn.writeBuffer();
+		defer wb.deinit();
+
+		try std.fmt.format(wb.writer(), "it's over {d}!!!", .{9000});
+		try wb.flush(.{.op_code = .binary, .deinit = false});
+		try expectFrames(&.{Expect.binary("it's over 9000!!!")}, conn.stream, false);
+	}
+
+	{
+		// message requiring growth auto deinit
+		var conn = tf.conn();
+		var wb = try conn.writeBuffer();
+		var writer = wb.writer();
+		for (0..1000) |_| {
+			try writer.writeAll(".");
+		}
+		try wb.flush(.{});
+		try expectFrames(&.{Expect.text("." ** 1000)}, conn.stream, false);
+	}
+
+	{
+		// message requiring growth manual deinit
+		var conn = tf.conn();
+		var wb = try conn.writeBuffer();
+		defer wb.deinit();
+
+		var writer = wb.writer();
+		for (0..1000) |_| {
+			try writer.writeAll(".");
+		}
+		try wb.flush(.{.op_code = .binary, .deinit = false});
+		try expectFrames(&.{Expect.binary("." ** 1000)}, conn.stream, false);
+	}
+}
+
 fn testReadFrames(s: *t.Stream, expected: []Expect) !void {
 	defer s.deinit();
 
@@ -601,24 +725,26 @@ fn testReadFrames(s: *t.Stream, expected: []Expect) !void {
 
 	for (0..100) |_| {
 		var stream = s.clone();
+		defer stream.deinit();
+
 		clientLoop(TestHandler, context, NetConn{.stream = &stream}, &config, &hp, &bp);
 		try t.expectEqual(stream.closed, true);
+		try expectFrames(expected, &stream, true);
+	}
+}
 
-		const r = stream.asReceived(true);
-		const messages = r.messages;
-		errdefer r.deinit();
-		errdefer stream.deinit();
+fn expectFrames(expected: []const Expect, stream: *t.Stream, skip_handshake: bool) !void {
+	const r = stream.asReceived(skip_handshake);
+	const messages = r.messages;
+	defer r.deinit();
 
-		try t.expectEqual(expected.len, messages.len);
-		var i: usize = 0;
-		while (i < expected.len) : (i += 1) {
-			const e = expected[i];
-			const actual = messages[i];
-			try t.expectEqual(e.type, actual.type);
-			try t.expectString(e.data, actual.data);
-		}
-		r.deinit();
-		stream.deinit();
+	try t.expectEqual(expected.len, messages.len);
+	var i: usize = 0;
+	while (i < expected.len) : (i += 1) {
+		const e = expected[i];
+		const actual = messages[i];
+		try t.expectEqual(e.type, actual.type);
+		try t.expectString(e.data, actual.data);
 	}
 }
 
@@ -676,6 +802,13 @@ const Expect = struct {
 		};
 	}
 
+	fn binary(data: []const u8) Expect {
+		return .{
+			.data = data,
+			.type = .binary,
+		};
+	}
+
 	fn pong(data: []const u8) Expect {
 		return .{
 			.data = data,
@@ -687,6 +820,35 @@ const Expect = struct {
 		return .{
 			.data = data,
 			.type = .close,
+		};
+	}
+};
+
+const TestConnFactory = struct {
+	stream: t.Stream,
+	bp: buffer.Provider,
+
+	fn init() TestConnFactory {
+		const pool = t.allocator.create(buffer.Pool) catch unreachable;
+		pool.* = buffer.Pool.init(t.allocator, 2, 100) catch unreachable;
+
+		return .{
+			.stream = t.Stream.init(),
+			.bp = buffer.Provider.init(t.allocator, pool, 10),
+		};
+	}
+
+	fn deinit(self: *TestConnFactory) void {
+		self.bp.pool.deinit();
+		t.allocator.destroy(self.bp.pool);
+		self.stream.deinit();
+	}
+
+	fn conn(self: *TestConnFactory) Conn {
+		self.stream.reset();
+		return .{
+			._bp = &self.bp,
+			.stream = &self.stream,
 		};
 	}
 };
