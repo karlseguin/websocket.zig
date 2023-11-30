@@ -355,16 +355,8 @@ pub const Conn = struct {
 			return data.len;
 		}
 
-		pub const FlushOpts = struct {
-			deinit: bool = true,
-			op_code: OpCode = .text,
-		};
-
-		pub fn flush(self: *Writer, opts: FlushOpts) !void {
-			defer if(opts.deinit) {
-				self.deinit();
-			};
-			try self.conn.writeFrame(opts.op_code, self.buffer.data[0..self.pos]);
+		pub fn flush(self: *Writer, op_code: OpCode) !void {
+			try self.conn.writeFrame(op_code, self.buffer.data[0..self.pos]);
 		}
 
 		fn ensureSpace(self: *Writer, n: usize) !void {
@@ -656,40 +648,20 @@ test "conn: writer" {
 	var tf = TestConnFactory.init();
 	defer tf.deinit();
 
+
 	{
-		// short message (no growth) auto deinit
+		// short message (no growth)
 		var conn = tf.conn();
 		var wb = try conn.writeBuffer();
+		defer wb.deinit();
+
 		try std.fmt.format(wb.writer(), "it's over {d}!!!", .{9000});
-		try wb.flush(.{});
+		try wb.flush(.text);
 		try expectFrames(&.{Expect.text("it's over 9000!!!")}, conn.stream, false);
 	}
 
-{
-		// short message (no growth) manual deinit
-		var conn = tf.conn();
-		var wb = try conn.writeBuffer();
-		defer wb.deinit();
-
-		try std.fmt.format(wb.writer(), "it's over {d}!!!", .{9000});
-		try wb.flush(.{.op_code = .binary, .deinit = false});
-		try expectFrames(&.{Expect.binary("it's over 9000!!!")}, conn.stream, false);
-	}
-
 	{
-		// message requiring growth auto deinit
-		var conn = tf.conn();
-		var wb = try conn.writeBuffer();
-		var writer = wb.writer();
-		for (0..1000) |_| {
-			try writer.writeAll(".");
-		}
-		try wb.flush(.{});
-		try expectFrames(&.{Expect.text("." ** 1000)}, conn.stream, false);
-	}
-
-	{
-		// message requiring growth manual deinit
+		// message requiring growth
 		var conn = tf.conn();
 		var wb = try conn.writeBuffer();
 		defer wb.deinit();
@@ -698,7 +670,7 @@ test "conn: writer" {
 		for (0..1000) |_| {
 			try writer.writeAll(".");
 		}
-		try wb.flush(.{.op_code = .binary, .deinit = false});
+		try wb.flush(.binary);
 		try expectFrames(&.{Expect.binary("." ** 1000)}, conn.stream, false);
 	}
 }

@@ -108,18 +108,12 @@ It's possible to get a `std.io.Writer` from a `*Conn`. Because websocket message
 
 ```zig
 var wb = try conn.writeBuffer();
-try std.fmt.format(wb.writer(), "it's over {d}!!!", .{9000});
-try wb.flush(.{});
-```
-
-By default, `wb` is automatically freed on `flush`. Also, by default, `.text` frame is sent. This behavior can be changed:
-
-```zig
-var wb = try conn.writeBuffer();
 defer wb.deinit();
 
 try std.fmt.format(wb.writer(), "it's over {d}!!!", .{9000});
-try wb.flush(.{.op_code = .binary, .deinit = false});
+
+// .text or .binary
+try wb.flush(.text);
 ```
 
 ### Pings, Pongs and Close
