@@ -232,8 +232,8 @@ pub const Conn = struct {
 		try self.stream.writeAll(data);
 	}
 
-	pub fn writeBuffer(self: *Conn) !Writer {
-		return Writer.init(self);
+	pub fn writeBuffer(self: *Conn, op_code: OpCode) !Writer {
+		return Writer.init(self, op_code);
 	}
 
 	pub fn close(self: *Conn) void {
@@ -323,17 +323,19 @@ pub const Conn = struct {
 	pub const Writer = struct {
 		pos: usize,
 		conn: *Conn,
+		op_code: OpCode,
 		bp: *buffer.Provider,
 		buffer: buffer.Buffer,
 
 		pub const Error = Allocator.Error;
 		pub const IOWriter = std.io.Writer(*Writer, error{OutOfMemory}, Writer.write);
 
-		fn init(conn: *Conn) !Writer {
+		fn init(conn: *Conn, op_code: OpCode) !Writer {
 			return .{
 				.pos = 0,
 				.conn = conn,
 				.bp = conn._bp,
+				.op_code = op_code,
 				.buffer = try conn._bp.allocPooledOr(512),
 			};
 		}
@@ -355,8 +357,8 @@ pub const Conn = struct {
 			return data.len;
 		}
 
-		pub fn flush(self: *Writer, op_code: OpCode) !void {
-			try self.conn.writeFrame(op_code, self.buffer.data[0..self.pos]);
+		pub fn flush(self: *Writer) !void {
+			try self.conn.writeFrame(self.op_code, self.buffer.data[0..self.pos]);
 		}
 
 		fn ensureSpace(self: *Writer, n: usize) !void {
@@ -651,25 +653,25 @@ test "conn: writer" {
 	{
 		// short message (no growth)
 		var conn = tf.conn();
-		var wb = try conn.writeBuffer();
+		var wb = try conn.writeBuffer(.text);
 		defer wb.deinit();
 
 		try std.fmt.format(wb.writer(), "it's over {d}!!!", .{9000});
-		try wb.flush(.text);
+		try wb.flush();
 		try expectFrames(&.{Expect.text("it's over 9000!!!")}, conn.stream, false);
 	}
 
 	{
 		// message requiring growth
 		var conn = tf.conn();
-		var wb = try conn.writeBuffer();
+		var wb = try conn.writeBuffer(.binary);
 		defer wb.deinit();
 
 		var writer = wb.writer();
 		for (0..1000) |_| {
 			try writer.writeAll(".");
 		}
-		try wb.flush(.binary);
+		try wb.flush();
 		try expectFrames(&.{Expect.binary("." ** 1000)}, conn.stream, false);
 	}
 }

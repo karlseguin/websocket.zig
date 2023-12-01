@@ -107,13 +107,13 @@ The call to `init` includes a `*websocket.Conn`. It is expected that handlers wi
 It's possible to get a `std.io.Writer` from a `*Conn`. Because websocket messages are framed, the writter will buffer the message in memory and requires an explicit "flush". Buffering will use the global buffer pool (described in the Config section), but can still result in dynamic allocations if the pool is empty or the message being written is larger than the configured max size.
 
 ```zig
-var wb = try conn.writeBuffer();
+// .text or .binary
+var wb = try conn.writeBuffer(.text);
 defer wb.deinit();
 
 try std.fmt.format(wb.writer(), "it's over {d}!!!", .{9000});
 
-// .text or .binary
-try wb.flush(.text);
+try wb.flush();
 ```
 
 ### Pings, Pongs and Close
