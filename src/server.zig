@@ -229,7 +229,7 @@ pub const Conn = struct {
 	}
 
 	pub fn writeFramed(self: Conn, data: []const u8) !void {
-		try self.steam.writeAll(data);
+		try self.stream.writeAll(data);
 	}
 
 	pub fn writeBuffer(self: *Conn) !Writer {
@@ -648,7 +648,6 @@ test "conn: writer" {
 	var tf = TestConnFactory.init();
 	defer tf.deinit();
 
-
 	{
 		// short message (no growth)
 		var conn = tf.conn();
@@ -673,6 +672,15 @@ test "conn: writer" {
 		try wb.flush(.binary);
 		try expectFrames(&.{Expect.binary("." ** 1000)}, conn.stream, false);
 	}
+}
+
+test "conn: writeFramed" {
+	var tf = TestConnFactory.init();
+	defer tf.deinit();
+
+	var conn = tf.conn();
+	try conn.writeFramed(&lib.framing.frame(.text, "must flow"));
+	try expectFrames(&.{Expect.text("must flow")}, conn.stream, false);
 }
 
 fn testReadFrames(s: *t.Stream, expected: []Expect) !void {
