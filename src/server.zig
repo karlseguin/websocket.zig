@@ -209,7 +209,7 @@ pub const Conn = struct {
 	}
 
 	pub fn writeFramed(self: Conn, data: []const u8) !void {
-		try self.steam.writeAll(data);
+		try self.stream.writeAll(data);
 	}
 
 	pub fn close(self: *Conn) void {
