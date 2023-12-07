@@ -39,12 +39,12 @@ pub fn frame(op_code: OpCode, comptime msg: []const u8) [frameLen(msg)]u8 {
 	const len = msg.len;
 	if (len <= 125) {
 		framed[1] = @intCast(len);
-		std.mem.copy(u8, framed[2..], msg);
+		@memcpy(framed[2..], msg);
 	} else if (len < 65536) {
 		framed[1] = 126;
 		framed[2] = @intCast((len >> 8) & 0xFF);
 		framed[3] = @intCast(len & 0xFF);
-		std.mem.copy(u8, framed[4..], msg);
+		@memcpy(framed[4..], msg);
 	} else {
 		framed[1] = 127;
 		framed[2] = @intCast((len >> 56) & 0xFF);
@@ -55,7 +55,7 @@ pub fn frame(op_code: OpCode, comptime msg: []const u8) [frameLen(msg)]u8 {
 		framed[7] = @intCast((len >> 16) & 0xFF);
 		framed[8] = @intCast((len >> 8) & 0xFF);
 		framed[9] = @intCast(len & 0xFF);
-		std.mem.copy(u8, framed[10..], msg);
+		@memcpy(framed[10..], msg);
 	}
 	return framed;
 }
@@ -79,7 +79,7 @@ test "mask" {
 	while (size < 1000) {
 		const slice = original[0..size];
 		random.bytes(slice);
-		std.mem.copy(u8, payload, slice);
+		@memcpy(payload[0..size], slice);
 		mask(m[0..], payload[0..size]);
 
 		for (slice, 0..) |b, i| {

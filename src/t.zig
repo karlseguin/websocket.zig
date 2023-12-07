@@ -121,7 +121,7 @@ pub const Stream = struct {
 		} else {
 			frames = allocator.alloc(u8, value.len) catch unreachable;
 		}
-		mem.copy(u8, frames[start..], value);
+		@memcpy(frames[start..start+value.len], value);
 		self.frames = frames;
 		return self;
 	}
@@ -217,8 +217,9 @@ pub const Stream = struct {
 		std.debug.assert(!self.closed);
 
 		if (self.handshake_index) |index| {
-			std.mem.copy(u8, buf, HANDSHAKE[index..]);
-			const written = @min(buf.len, HANDSHAKE.len - index);
+			const data =  HANDSHAKE[index..];
+			@memcpy(buf[0..data.len], data);
+			const written = @min(buf.len, data.len - index);
 			if (written < buf.len) {
 				self.handshake_index = null;
 			} else {
@@ -295,9 +296,7 @@ pub const Stream = struct {
 	pub fn clone(self: *Stream) Stream {
 		var c = Stream.init();
 		if (self.frames) |f| {
-			const copy = allocator.alloc(u8, f.len) catch unreachable;
-			mem.copy(u8, copy, f);
-			c.frames = copy;
+			c.frames = allocator.dupe(u8, f) catch unreachable;
 		}
 		c.handshake_index = self.handshake_index;
 		return c;
