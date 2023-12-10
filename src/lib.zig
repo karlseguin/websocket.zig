@@ -8,14 +8,14 @@ const builtin = @import("builtin");
 pub const testing = @import("t.zig");
 pub const buffer = @import("buffer.zig");
 pub const framing = @import("framing.zig");
+pub const handshake = @import("handshake.zig");
+pub const Conn = @import("server.zig").Conn;
 
 pub const is_test = builtin.is_test;
 
 pub const Stream = if (is_test) *testing.Stream else std.net.Stream;
-pub const NetConn = if (is_test) testing.NetConn else std.net.StreamServer.Connection;
 
 pub const Reader = @import("reader.zig").Reader;
-pub const Handshake = @import("handshake.zig").Handshake;
 
 pub const MessageType = enum {
 	text,

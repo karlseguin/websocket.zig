@@ -2,12 +2,11 @@ const std = @import("std");
 const lib = @import("lib.zig");
 const builtin = @import("builtin");
 
-const HandshakePool = @import("handshake.zig").Pool;
-
 const buffer = lib.buffer;
 const framing = lib.framing;
+const handshake = lib.handshake;
+
 const Reader = lib.Reader;
-const NetConn = lib.NetConn;
 const OpCode = framing.OpCode;
 
 const os = std.os;
@@ -35,19 +34,14 @@ pub const Config = struct {
 };
 
 pub fn listen(comptime H: type, allocator: Allocator, context: anytype, config: Config) !void {
-	var server = net.StreamServer.init(.{
+	var server = try Server.init(allocator, config);
+	defer server.deinit(allocator);
+
+	var listener = net.StreamServer.init(.{
 		.reuse_address = true,
 		.kernel_backlog = 1024,
 	});
-	defer server.deinit();
-
-	var buffer_pool = try buffer.Pool.init(allocator, config.large_buffer_pool_count, config.large_buffer_size);
-	defer buffer_pool.deinit();
-
-	var bp = buffer.Provider.init(allocator, &buffer_pool, config.large_buffer_size);
-
-	var hp = try HandshakePool.init(allocator, config.handshake_pool_count, config.handshake_max_size, config.max_headers);
-	defer hp.deinit();
+	defer listener.deinit();
 
 	var no_delay = true;
 	const address = blk: {
@@ -60,7 +54,7 @@ pub fn listen(comptime H: type, allocator: Allocator, context: anytype, config: 
 		}
 		break :blk try net.Address.parseIp(config.address, config.port);
 	};
-	try server.listen(address);
+	try listener.listen(address);
 
 	if (no_delay) {
 		// TODO: Broken on darwin:
@@ -68,89 +62,128 @@ pub fn listen(comptime H: type, allocator: Allocator, context: anytype, config: 
 		// if (@hasDecl(os.TCP, "NODELAY")) {
 		//  try os.setsockopt(socket.sockfd.?, os.IPPROTO.TCP, os.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1)));
 		// }
-		try os.setsockopt(server.sockfd.?, os.IPPROTO.TCP, 1, &std.mem.toBytes(@as(c_int, 1)));
+		try os.setsockopt(listener.sockfd.?, os.IPPROTO.TCP, 1, &std.mem.toBytes(@as(c_int, 1)));
 	}
 
 	while (true) {
-		if (server.accept()) |conn| {
-			const args = .{H, context, conn, &config, &hp, &bp};
-			if (comptime std.io.is_async) {
-				try Loop.instance.?.runDetached(allocator, clientLoop, args);
-			} else {
-				const thread = try std.Thread.spawn(.{}, clientLoop, args);
-				thread.detach();
-			}
+		if (listener.accept()) |conn| {
+			const args = .{&server, H, context, conn.stream};
+			const thread = try std.Thread.spawn(.{}, Server.accept, args);
+			thread.detach();
 		} else |err| {
 			log.err("failed to accept connection {}", .{err});
 		}
 	}
 }
 
-fn clientLoop(comptime H: type, context: anytype, net_conn: NetConn, config: *const Config, hp: *HandshakePool, bp: *buffer.Provider) void {
-	std.os.maybeIgnoreSigpipe();
+pub const Server = struct {
+	config: Config,
+	handshake_pool: handshake.Pool,
+	buffer_provider: buffer.Provider,
 
-	const Handshake = lib.Handshake;
-	const stream = net_conn.stream;
-	defer stream.close();
 
-	var handler: H = undefined;
-	var conn = Conn{
-		.stream = stream,
-		._bp = bp,
-		._handle_ping = config.handle_ping,
-		._handle_pong = config.handle_pong,
-		._handle_close = config.handle_close,
-	};
+	pub fn init(allocator: Allocator, config: Config) !Server {
+		const buffer_pool = try allocator.create(buffer.Pool);
+		errdefer allocator.destroy(buffer_pool);
 
-	{
-		// This block represents handshake_state's lifetime
-		var handshake_state = hp.acquire() catch |err| {
-			log.err("Failed to get a handshake state from the handshake pool, connection is being closed. The error was: {}", .{err});
-			return;
+		buffer_pool.* = try buffer.Pool.init(allocator, config.large_buffer_pool_count, config.large_buffer_size);
+		errdefer buffer_pool.deinit();
+
+		const buffer_provider = buffer.Provider.init(allocator, buffer_pool, config.large_buffer_size);
+
+		const handshake_pool = try handshake.Pool.init(allocator, config.handshake_pool_count, config.handshake_max_size, config.max_headers);
+		errdefer handshake_pool.deinit();
+
+		return .{
+			.config = config,
+			.handshake_pool = handshake_pool,
+			.buffer_provider = buffer_provider,
 		};
-		defer hp.release(handshake_state);
+	}
 
-		const request = readRequest(stream, handshake_state.buffer, config.handshake_timeout_ms) catch |err| {
-			const s = switch (err) {
-				error.Invalid => "HTTP/1.1 400 Invalid\r\nerror: invalid\r\ncontent-length: 0\r\n\r\n",
-				error.TooLarge => "HTTP/1.1 400 Invalid\r\nerror: too large\r\ncontent-length: 0\r\n\r\n",
-				error.Timeout, error.WouldBlock => "HTTP/1.1 400 Invalid\r\nerror: timeout\r\ncontent-length: 0\r\n\r\n",
-				else => "HTTP/1.1 400 Invalid\r\nerror: unknown\r\ncontent-length: 0\r\n\r\n",
+	pub fn deinit(self: *Server, allocator: Allocator) void {
+		self.handshake_pool.deinit();
+		self.buffer_provider.pool.deinit();
+		allocator.destroy(self.buffer_provider.pool);
+	}
+
+	fn accept(self: *Server, comptime H: type, context: anytype, stream: lib.Stream) void {
+		std.os.maybeIgnoreSigpipe();
+		errdefer stream.close();
+
+		const Handshake = handshake.Handshake;
+		var conn = self.newConn(stream);
+
+		var handler: H = undefined;
+
+		{
+			// This block represents handshake_state's lifetime
+			var handshake_state = self.handshake_pool.acquire() catch |err| {
+				log.err("Failed to get a handshake state from the handshake pool, connection is being closed. The error was: {}", .{err});
+				return;
 			};
-			stream.writeAll(s) catch {};
-			return;
-		};
+			defer self.handshake_pool.release(handshake_state);
 
-		const h = Handshake.parse(request, &handshake_state.headers) catch |err| {
-			Handshake.close(stream, err) catch {};
-			return;
-		};
+			const request = readRequest(stream, handshake_state.buffer, self.config.handshake_timeout_ms) catch |err| {
+				const s = switch (err) {
+					error.Invalid => "HTTP/1.1 400 Invalid\r\nerror: invalid\r\ncontent-length: 0\r\n\r\n",
+					error.TooLarge => "HTTP/1.1 400 Invalid\r\nerror: too large\r\ncontent-length: 0\r\n\r\n",
+					error.Timeout, error.WouldBlock => "HTTP/1.1 400 Invalid\r\nerror: timeout\r\ncontent-length: 0\r\n\r\n",
+					else => "HTTP/1.1 400 Invalid\r\nerror: unknown\r\ncontent-length: 0\r\n\r\n",
+				};
+				stream.writeAll(s) catch {};
+				return;
+			};
 
-		handler = H.init(h, &conn, context) catch |err| {
-			Handshake.close(stream, err) catch {};
-			return;
-		};
+			const hshake = Handshake.parse(request, &handshake_state.headers) catch |err| {
+				Handshake.close(stream, err) catch {};
+				return;
+			};
 
-		// handshake_buffer (via `h` which references it), must be valid up until
-		// this call to reply
-		h.reply(stream) catch {
-			handler.close();
-			return;
+			handler = H.init(hshake, &conn, context) catch |err| {
+				Handshake.close(stream, err) catch {};
+				return;
+			};
+
+			// handshake_state (via `hshake` which references it), must be valid up until
+			// this call to reply
+			Handshake.reply(hshake.key, stream) catch {
+				handler.close();
+				return;
+			};
+		}
+
+		self.handle(H, &handler, &conn);
+	}
+
+	pub fn newConn(self: *Server, stream: lib.Stream) Conn {
+		const config = &self.config;
+		return .{
+			.stream = stream,
+			._bp = &self.buffer_provider,
+			._handle_ping = config.handle_ping,
+			._handle_pong = config.handle_pong,
+			._handle_close = config.handle_close,
 		};
 	}
 
-	defer handler.close();
-	if (comptime std.meta.hasFn(H, "afterInit")) {
-		handler.afterInit() catch return;
-	}
+	pub fn handle(self: *Server, comptime H: type, handler: *H, conn: *Conn) void {
+		defer handler.close();
+		defer conn.stream.close();
 
-	var reader = Reader.init(config.buffer_size, config.max_size, bp) catch |err| {
-		log.err("Failed to create a Reader, connection is being closed. The error was: {}", .{err});
-		return;
-	};
-	defer reader.deinit();
-	conn.readLoop(*H, &handler, &reader) catch {};
-}
+		if (comptime std.meta.hasFn(H, "afterInit")) {
+			handler.afterInit() catch return;
+		}
+
+		const config = &self.config;
+		var reader = Reader.init(config.buffer_size, config.max_size, &self.buffer_provider) catch |err| {
+			log.err("Failed to create a Reader, connection is being closed. The error was: {}", .{err});
+			return;
+		};
+		defer reader.deinit();
+		conn.readLoop(handler, &reader) catch {};
+	}
+};
 
 const EMPTY_PONG = ([2]u8{ @intFromEnum(OpCode.pong), 0 })[0..];
 // CLOSE, 2 length, code
@@ -240,8 +273,7 @@ pub const Conn = struct {
 		self.closed = true;
 	}
 
-	fn readLoop(self: *Conn, comptime H: type, handler: H, reader: *Reader) !void {
-		var h = handler;
+	fn readLoop(self: *Conn, handler: anytype, reader: *Reader) !void {
 		const stream = self.stream;
 		const handle_ping = self._handle_ping;
 		const handle_pong = self._handle_pong;
@@ -259,7 +291,7 @@ pub const Conn = struct {
 
 			switch (message.type) {
 				.text, .binary => {
-					try h.handle(message);
+					try handler.handle(message);
 					reader.handled();
 					if (self.closed) {
 						return;
@@ -267,12 +299,12 @@ pub const Conn = struct {
 				},
 				.pong => {
 					if (handle_pong) {
-						try h.handle(message);
+						try handler.handle(message);
 					}
 				},
 				.ping => {
 					if (handle_ping) {
-						try h.handle(message);
+						try handler.handle(message);
 					} else {
 						const data = message.data;
 						if (data.len == 0) {
@@ -284,7 +316,7 @@ pub const Conn = struct {
 				},
 				.close => {
 					if (handle_close) {
-						return h.handle(message);
+						return handler.handle(message);
 					}
 
 					const data = message.data;
@@ -433,23 +465,21 @@ pub fn readRequest(stream: anytype, buf: []u8, timeout: ?u32) ![]u8 {
 }
 
 const t = lib.testing;
-test "clientLoop" {
+test "Server: accept" {
 	// we don't currently use this
 	const context = TestContext{};
 	const config = Config{
 		.handshake_timeout_ms = null,
 	};
 
-	var hp = try HandshakePool.init(t.allocator, 1, 512, 5);
-	defer hp.deinit();
-
-	var bp = buffer.Provider.initNoPool(t.allocator);
+	var server = try Server.init(t.allocator, config);
+	defer server.deinit(t.allocator);
 
 	{
 		var stream = t.Stream.handshake();
 		defer stream.deinit();
 		_ = stream.textFrame(true, &.{0}).textFrame(true, &.{0});
-		clientLoop(TestHandler, context, NetConn{.stream = &stream}, &config, &hp, &bp);
+		server.accept(TestHandler, context, &stream);
 		try t.expectEqual(stream.closed, true);
 
 		const r = stream.asReceived(true);
@@ -700,16 +730,14 @@ fn testReadFrames(s: *t.Stream, expected: []Expect) !void {
 		.handshake_timeout_ms = null,
 	};
 
-	var hp = try HandshakePool.init(t.allocator, 10, 512, 10);
-	defer hp.deinit();
-
-	var bp = buffer.Provider.initNoPool(t.allocator);
+	var server = try Server.init(t.allocator, config);
+	defer server.deinit(t.allocator);
 
 	for (0..100) |_| {
 		var stream = s.clone();
 		defer stream.deinit();
 
-		clientLoop(TestHandler, context, NetConn{.stream = &stream}, &config, &hp, &bp);
+		server.accept(TestHandler, context, &stream);
 		try t.expectEqual(stream.closed, true);
 		try expectFrames(expected, &stream, true);
 	}

@@ -104,7 +104,7 @@ pub const Handshake = struct {
 		try stream.writeAll("\r\n\r\n");
 	}
 
-	pub fn reply(self: Handshake, stream: anytype) !void {
+	pub fn reply(key: []const u8, stream: anytype) !void {
 		var h: [20]u8 = undefined;
 
 		// HTTP/1.1 101 Switching Protocols\r\n
@@ -121,7 +121,7 @@ pub const Handshake = struct {
 		const key_pos = buf.len - 32;
 
 		var hasher = std.crypto.hash.Sha1.init(.{});
-		hasher.update(self.key);
+		hasher.update(key);
 		hasher.update("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
 		hasher.final(&h);
 
@@ -296,7 +296,7 @@ test "handshake: reply" {
 		.headers = undefined,
 		.key = "this is my key",
 	};
-	try h.reply(&s);
+	try Handshake.reply(h.key, &s);
 
 	var pos: usize = 0;
 	const expected = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: upgrade\r\nSec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n\r\n";
