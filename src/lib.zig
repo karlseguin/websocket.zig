@@ -13,8 +13,6 @@ pub const Conn = @import("server.zig").Conn;
 
 pub const is_test = builtin.is_test;
 
-pub const Stream = if (is_test) *testing.Stream else std.net.Stream;
-
 pub const Reader = @import("reader.zig").Reader;
 
 pub const MessageType = enum {

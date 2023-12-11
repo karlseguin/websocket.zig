@@ -30,7 +30,7 @@ pub const HandshakeOpts = struct {
 	headers: ?[]const u8 = null,
 };
 
-pub fn connect(allocator: Allocator, host: []const u8, port: u16, config: Config) !Client(Stream) {
+pub fn connect(allocator: Allocator, host: []const u8, port: u16, config: Config) !Client {
 	var tls_client: ?tls.Client = null;
 	const net_stream = try net.tcpConnectToHost(allocator, host, port);
 
@@ -49,232 +49,226 @@ pub fn connect(allocator: Allocator, host: []const u8, port: u16, config: Config
 		}
 	}
 	const stream = Stream.init(net_stream, tls_client);
-	return Client(Stream).init(allocator, stream, config);
+	return Client.init(allocator, stream, config);
 }
 
-// var default_buffer_provider_loaded = false;
-// var default_buffer_provider_lock = std.Thread.Mutex{};
-// const default_buffer_provider: *buffer.Provider = undefined;
+pub const Client = struct {
+	stream: Stream,
+	_reader: Reader,
+	_closed: bool,
+	_handle_ping: bool,
+	_handle_pong: bool,
+	_handle_close: bool,
+	_bp: ?*buffer.Provider,
+	_mask_fn: *const fn() [4]u8,
 
-pub fn Client(comptime T: type) type {
-	return struct {
-		stream: T,
-		_reader: Reader,
-		_closed: bool,
-		_handle_ping: bool,
-		_handle_pong: bool,
-		_handle_close: bool,
-		_bp: ?*buffer.Provider,
-		_mask_fn: *const fn() [4]u8,
+	const Self = @This();
 
-		const Self = @This();
+	pub fn init(allocator: Allocator, stream: Stream, config: Config) !Self {
+		var bp: *buffer.Provider = undefined;
+		var owned_bp: ?*buffer.Provider = null;
 
-		pub fn init(allocator: Allocator, stream: T, config: Config) !Self {
-			var bp: *buffer.Provider = undefined;
-			var owned_bp: ?*buffer.Provider = null;
+		// If a buffer_provider is provided, we'll use that.
+		// If it isn't, we need to create one which also means we now "own" it
+		// and we're responsible for cleaning it up
+		if (config.buffer_provider) |shared_bp| {
+			bp = shared_bp;
+		} else {
+			bp = try allocator.create(buffer.Provider);
+			bp.* = buffer.Provider.initNoPool(allocator);
+			owned_bp = bp;
+		}
 
-			// If a buffer_provider is provided, we'll use that.
-			// If it isn't, we need to create one which also means we now "own" it
-			// and we're responsible for cleaning it up
-			if (config.buffer_provider) |shared_bp| {
-				bp = shared_bp;
-			} else {
-				bp = try allocator.create(buffer.Provider);
-				bp.* = buffer.Provider.initNoPool(allocator);
-				owned_bp = bp;
+		errdefer {
+			if (owned_bp) |obp| {
+				allocator.destroy(obp);
 			}
+		}
 
-			errdefer {
-				if (owned_bp) |obp| {
-					allocator.destroy(obp);
-				}
-			}
+		return .{
+			.stream = stream,
+			._bp = owned_bp,
+			._closed = false,
+			._mask_fn = config.mask_fn,
+			._handle_ping = config.handle_ping,
+			._handle_pong = config.handle_pong,
+			._handle_close = config.handle_close,
+			._reader = try Reader.init(config.buffer_size, config.max_size, bp),
+		};
+	}
 
-			return .{
-				.stream = stream,
-				._bp = owned_bp,
-				._closed = false,
-				._mask_fn = config.mask_fn,
-				._handle_ping = config.handle_ping,
-				._handle_pong = config.handle_pong,
-				._handle_close = config.handle_close,
-				._reader = try Reader.init(config.buffer_size, config.max_size, bp),
+	pub fn deinit(self: *Self) void {
+		self._reader.deinit();
+		if (self._bp) |bp| {
+			bp.allocator.destroy(bp);
+		}
+		self.close();
+	}
+
+	pub fn handshake(self: *Self, path: []const u8, opts: HandshakeOpts) !void {
+		const stream = &self.stream;
+		errdefer self.closeWithCode(1002);
+
+		// we've already setup our reader, and the reader has a static buffer
+		// we might as well use it!
+		const buf = self._reader.static.data;
+
+		const key = blk: {
+			const bin_key = generateKey();
+			var encoded_key: [24]u8 = undefined;
+			break :blk std.base64.standard.Encoder.encode(&encoded_key, &bin_key);
+		};
+
+		try sendHandshake(path, key, buf, &opts, stream);
+
+		const over_read = try readHandshakeReply(buf, key, &opts, stream);
+		// We might have read more than handshake response. If so, readHandshakeReply
+		// has positioned the extra data at the start of the buffer, but we need
+		// to set the length.
+		self._reader.len = over_read;
+	}
+
+	pub fn readLoop(self: *Self, h: anytype) !void {
+		var reader = &self._reader;
+		const stream = &self.stream;
+		defer h.close();
+
+		const handle_ping = self._handle_ping;
+		const handle_pong = self._handle_pong;
+		const handle_close = self._handle_close;
+
+		while (true) {
+			const message = reader.readMessage(stream) catch |err| switch (err) {
+				error.Closed, error.ConnectionResetByPeer, error.BrokenPipe => {
+					_ = @cmpxchgStrong(bool, &self._closed, false, true, .Monotonic, .Monotonic);
+					return;
+				},
+				else => {
+					self.closeWithCode(1002);
+					return;
+				},
 			};
-		}
 
-		pub fn deinit(self: *Self) void {
-			self._reader.deinit();
-			if (self._bp) |bp| {
-				bp.allocator.destroy(bp);
-			}
-			self.close();
-		}
-
-		pub fn handshake(self: *Self, path: []const u8, opts: HandshakeOpts) !void {
-			const stream = &self.stream;
-			errdefer self.closeWithCode(1002);
-
-			// we've already setup our reader, and the reader has a static buffer
-			// we might as well use it!
-			const buf = self._reader.static.data;
-
-			const key = blk: {
-				const bin_key = generateKey();
-				var encoded_key: [24]u8 = undefined;
-				break :blk std.base64.standard.Encoder.encode(&encoded_key, &bin_key);
-			};
-
-			try sendHandshake(path, key, buf, &opts, stream);
-
-			const over_read = try readHandshakeReply(buf, key, &opts, stream);
-			// We might have read more than handshake response. If so, readHandshakeReply
-			// has positioned the extra data at the start of the buffer, but we need
-			// to set the length.
-			self._reader.len = over_read;
-		}
-
-		pub fn readLoop(self: *Self, h: anytype) !void {
-			var reader = &self._reader;
-			const stream = &self.stream;
-			defer h.close();
-
-			const handle_ping = self._handle_ping;
-			const handle_pong = self._handle_pong;
-			const handle_close = self._handle_close;
-
-			while (true) {
-				const message = reader.readMessage(stream) catch |err| switch (err) {
-					error.Closed, error.ConnectionResetByPeer, error.BrokenPipe => {
-						_ = @cmpxchgStrong(bool, &self._closed, false, true, .Monotonic, .Monotonic);
-						return;
-					},
-					else => {
-						self.closeWithCode(1002);
-						return;
-					},
-				};
-
-				switch (message.type) {
-					.text, .binary => {
+			switch (message.type) {
+				.text, .binary => {
+					try h.handle(message);
+					reader.handled();
+				},
+				.ping => {
+					if (handle_ping) {
 						try h.handle(message);
-						reader.handled();
-					},
-					.ping => {
-						if (handle_ping) {
-							try h.handle(message);
-						} else {
-							// @constCast is safe because we know message.data points to
-							// reader.buffer.buf, which we own and which can be mutated
-							try self.writeFrame(.pong, @constCast(message.data));
-						}
-					},
-					.close => {
-						if (handle_close) {
-							try h.handle(message);
-						} else {
-							self.close();
-						}
-						return;
-					},
-					.pong => {
-						if (handle_pong) {
-							try h.handle(message);
-						}
-					},
-				}
+					} else {
+						// @constCast is safe because we know message.data points to
+						// reader.buffer.buf, which we own and which can be mutated
+						try self.writeFrame(.pong, @constCast(message.data));
+					}
+				},
+				.close => {
+					if (handle_close) {
+						try h.handle(message);
+					} else {
+						self.close();
+					}
+					return;
+				},
+				.pong => {
+					if (handle_pong) {
+						try h.handle(message);
+					}
+				},
 			}
 		}
+	}
 
-		pub fn readLoopInNewThread(self: *Self, h: anytype) !std.Thread {
-			return std.Thread.spawn(.{}, readLoopOwnedThread, .{self, h});
+	pub fn readLoopInNewThread(self: *Self, h: anytype) !std.Thread {
+		return std.Thread.spawn(.{}, readLoopOwnedThread, .{self, h});
+	}
+
+	fn readLoopOwnedThread(self: *Self, h: anytype) void {
+		std.os.maybeIgnoreSigpipe();
+		self.readLoop(h) catch {};
+	}
+
+	pub fn write(self: *Self, data: []u8) !void {
+		return self.writeFrame(.text, data);
+	}
+
+	pub fn writeText(self: *Self, data: []u8) !void {
+		return self.writeFrame(.text, data);
+	}
+
+	pub fn writeBin(self: *Self, data: []u8) !void {
+		return self.writeFrame(.binary, data);
+	}
+
+	pub fn writePing(self: *Self, data: []u8) !void {
+		return self.writeFrame(.ping, data);
+	}
+
+	pub fn writePong(self: *Self, data: []u8) !void {
+		return self.writeFrame(.pong, data);
+	}
+
+	pub fn writeFrame(self: *Self, op_code: OpCode, data: []u8) !void {
+		const l = data.len;
+		const mask = self._mask_fn();
+		var stream = &self.stream;
+
+		// maximum possible prefix length. op_code + length_type + 8byte length + 4 byte mask
+		var buf: [14]u8 = undefined;
+		buf[0] = @intFromEnum(op_code);
+
+		if (l <= 125) {
+			buf[1] = @as(u8, @intCast(l)) | 128;
+			@memcpy(buf[2..6], &mask);
+			try stream.writeAll(buf[0..6]);
+		} else if (l < 65536) {
+			buf[1] = 254; // 126 | 128
+			buf[2] = @intCast((l >> 8) & 0xFF);
+			buf[3] = @intCast(l & 0xFF);
+			@memcpy(buf[4..8], &mask);
+			try stream.writeAll(buf[0..8]);
+		} else {
+			buf[1] = 255; // 127 | 128
+			buf[2] = @intCast((l >> 56) & 0xFF);
+			buf[3] = @intCast((l >> 48) & 0xFF);
+			buf[4] = @intCast((l >> 40) & 0xFF);
+			buf[5] = @intCast((l >> 32) & 0xFF);
+			buf[6] = @intCast((l >> 24) & 0xFF);
+			buf[7] = @intCast((l >> 16) & 0xFF);
+			buf[8] = @intCast((l >> 8) & 0xFF);
+			buf[9] = @intCast(l & 0xFF);
+			@memcpy(buf[10..], &mask);
+			try stream.writeAll(buf[0..]);
 		}
-
-		fn readLoopOwnedThread(self: *Self, h: anytype) void {
-			std.os.maybeIgnoreSigpipe();
-			self.readLoop(h) catch {};
+		if (l > 0) {
+			framing.mask(&mask, data);
+			try stream.writeAll(data);
 		}
+	}
 
-		pub fn write(self: *Self, data: []u8) !void {
-			return self.writeFrame(.text, data);
+	pub fn close(self: *Self) void {
+		if (@cmpxchgStrong(bool, &self._closed, false, true, .Monotonic, .Monotonic) == null) {
+			self.writeFrame(.close, "") catch {};
+			self.stream.close();
 		}
+	}
 
-		pub fn writeText(self: *Self, data: []u8) !void {
-			return self.writeFrame(.text, data);
+	pub fn closeWithCode(self: *Self, code: u16) void {
+		if (@cmpxchgStrong(bool, &self._closed, false, true, .Monotonic, .Monotonic) == null) {
+			var buf: [2]u8 = undefined;
+			buf[0] = @intCast((code >> 8) & 0xFF);
+			buf[1] = @intCast(code & 0xFF);
+			self.writeFrame(.close, &buf) catch {};
+			self.stream.close();
 		}
-
-		pub fn writeBin(self: *Self, data: []u8) !void {
-			return self.writeFrame(.binary, data);
-		}
-
-		pub fn writePing(self: *Self, data: []u8) !void {
-			return self.writeFrame(.ping, data);
-		}
-
-		pub fn writePong(self: *Self, data: []u8) !void {
-			return self.writeFrame(.pong, data);
-		}
-
-		pub fn writeFrame(self: *Self, op_code: OpCode, data: []u8) !void {
-			const l = data.len;
-			const mask = self._mask_fn();
-			var stream = &self.stream;
-
-			// maximum possible prefix length. op_code + length_type + 8byte length + 4 byte mask
-			var buf: [14]u8 = undefined;
-			buf[0] = @intFromEnum(op_code);
-
-			if (l <= 125) {
-				buf[1] = @as(u8, @intCast(l)) | 128;
-				@memcpy(buf[2..6], &mask);
-				try stream.writeAll(buf[0..6]);
-			} else if (l < 65536) {
-				buf[1] = 254; // 126 | 128
-				buf[2] = @intCast((l >> 8) & 0xFF);
-				buf[3] = @intCast(l & 0xFF);
-				@memcpy(buf[4..8], &mask);
-				try stream.writeAll(buf[0..8]);
-			} else {
-				buf[1] = 255; // 127 | 128
-				buf[2] = @intCast((l >> 56) & 0xFF);
-				buf[3] = @intCast((l >> 48) & 0xFF);
-				buf[4] = @intCast((l >> 40) & 0xFF);
-				buf[5] = @intCast((l >> 32) & 0xFF);
-				buf[6] = @intCast((l >> 24) & 0xFF);
-				buf[7] = @intCast((l >> 16) & 0xFF);
-				buf[8] = @intCast((l >> 8) & 0xFF);
-				buf[9] = @intCast(l & 0xFF);
-				@memcpy(buf[10..], &mask);
-				try stream.writeAll(buf[0..]);
-			}
-			if (l > 0) {
-				framing.mask(&mask, data);
-				try stream.writeAll(data);
-			}
-		}
-
-		pub fn close(self: *Self) void {
-			if (@cmpxchgStrong(bool, &self._closed, false, true, .Monotonic, .Monotonic) == null) {
-				self.writeFrame(.close, "") catch {};
-				self.stream.close();
-			}
-		}
-
-		pub fn closeWithCode(self: *Self, code: u16) void {
-			if (@cmpxchgStrong(bool, &self._closed, false, true, .Monotonic, .Monotonic) == null) {
-				var buf: [2]u8 = undefined;
-				buf[0] = @intCast((code >> 8) & 0xFF);
-				buf[1] = @intCast(code & 0xFF);
-				self.writeFrame(.close, &buf) catch {};
-				self.stream.close();
-			}
-		}
-	};
-}
+	}
+};
 
 // wraps a net.Stream and optional a tls.Client
 pub const Stream = struct {
 	stream: net.Stream,
-	tls_client: ?tls.Client,
+	tls_client: ?tls.Client = null,
 
 	pub fn init(stream: net.Stream, tls_client: ?tls.Client) Stream {
 		return .{
@@ -411,7 +405,7 @@ fn readHandshakeReply(buf: []u8, key: []const u8, opts: *const HandshakeOpts, st
 		}
 
 		pos += n;
-		while (findCarriageReturnIndex(buf[line_start..pos])) |relative_end| {
+		while (std.mem.indexOfScalar(u8, buf[line_start..pos], '\r')) |relative_end| {
 			if (relative_end == 0) {
 				if (complete_response != 15) {
 					return error.InvalidHandshakeResponse;
@@ -490,177 +484,103 @@ fn readHandshakeReply(buf: []u8, key: []const u8, opts: *const HandshakeOpts, st
 	}
 }
 
-const CR = '\r';
-const VECTOR_8_LEN = if (std.simd.suggestVectorSize(u8) == null) 0 else 8;
-const VECTOR_8_CR: @Vector(8, u8) = @splat(@as(u8, CR));
-const VECTOR_8_IOTA = std.simd.iota(u8, VECTOR_8_LEN);
-const VECTOR_8_NULLS: @Vector(8, u8) = @splat(@as(u8, 255));
-
-const VECTOR_16_LEN = if (std.simd.suggestVectorSize(u8) == null) 0 else 16;
-const VECTOR_16_CR: @Vector(16, u8) = @splat(@as(u8, CR));
-const VECTOR_16_IOTA = std.simd.iota(u8, VECTOR_16_LEN);
-const VECTOR_16_NULLS: @Vector(16, u8) = @splat(@as(u8, 255));
-
-const VECTOR_32_LEN = if (std.simd.suggestVectorSize(u8) == null) 0 else 32;
-const VECTOR_32_CR: @Vector(32, u8) = @splat(@as(u8, CR));
-const VECTOR_32_IOTA = std.simd.iota(u8, VECTOR_32_LEN);
-const VECTOR_32_NULLS: @Vector(32, u8) = @splat(@as(u8, 255));
-
-const VECTOR_64_LEN = if (std.simd.suggestVectorSize(u8) == null) 0 else 64;
-const VECTOR_64_CR: @Vector(64, u8) = @splat(@as(u8, CR));
-const VECTOR_64_IOTA = std.simd.iota(u8, VECTOR_64_LEN);
-const VECTOR_64_NULLS: @Vector(64, u8) = @splat(@as(u8, 255));
-
-fn findCarriageReturnIndex(buf: []u8) ?usize {
-	if (VECTOR_32_LEN == 0) {
-		return std.mem.indexOfScalar(u8, buf, CR);
-	}
-
-	var pos: usize = 0;
-	var left = buf.len;
-	while (left > 0) {
-		if (left < VECTOR_8_LEN) {
-			if (std.mem.indexOfScalar(u8, buf[pos..], CR)) |n| {
-				return pos + n;
-			}
-			return null;
-		}
-		var index: u8 = undefined;
-		var vector_len: usize = undefined;
-		if (left < VECTOR_16_LEN) {
-			vector_len = VECTOR_8_LEN;
-			const vec: @Vector(VECTOR_8_LEN, u8) = buf[pos..][0..VECTOR_8_LEN].*;
-			const matches = vec == VECTOR_8_CR;
-			const indices = @select(u8, matches, VECTOR_8_IOTA, VECTOR_8_NULLS);
-			index = @reduce(.Min, indices);
-		} else if (left < VECTOR_32_LEN) {
-			vector_len = VECTOR_16_LEN;
-			const vec: @Vector(VECTOR_16_LEN, u8) = buf[pos..][0..VECTOR_16_LEN].*;
-			const matches = vec == VECTOR_16_CR;
-			const indices = @select(u8, matches, VECTOR_16_IOTA, VECTOR_16_NULLS);
-			index = @reduce(.Min, indices);
-		} else if (left < VECTOR_64_LEN) {
-			vector_len = VECTOR_32_LEN;
-			const vec: @Vector(VECTOR_32_LEN, u8) = buf[pos..][0..VECTOR_32_LEN].*;
-			const matches = vec == VECTOR_32_CR;
-			const indices = @select(u8, matches, VECTOR_32_IOTA, VECTOR_32_NULLS);
-			index = @reduce(.Min, indices);
-		} else {
-			vector_len = VECTOR_64_LEN;
-			const vec: @Vector(VECTOR_64_LEN, u8) = buf[pos..][0..VECTOR_64_LEN].*;
-			const matches = vec == VECTOR_64_CR;
-			const indices = @select(u8, matches, VECTOR_64_IOTA, VECTOR_64_NULLS);
-			index = @reduce(.Min, indices);
-		}
-
-		if (index != 255) {
-			return pos + index;
-		}
-		pos += vector_len;
-		left -= vector_len;
-	}
-	return null;
-}
-
 const t = lib.testing;
-const TestClient = Client(t.StreamWrap);
 test "client: handshake" {
 	{
-		// closed connection
-		var stream = t.Stream.init();
-		defer stream.deinit();
-		var client = try TestClient.init(t.allocator, t.wrap(&stream), .{});
-		defer client.deinit();
-		try t.expectError(error.ConnectionClosed, client.handshake("/", .{}));
-	}
-
-	{
 		// empty reponse
-		var stream = t.Stream.init();
-		defer stream.deinit();
-		_ = stream.add("\r\n\r\n");
-		var client = try TestClient.init(t.allocator, t.wrap(&stream), .{});
+		var pair = t.SocketPair.init();
+		defer pair.deinit();
+		try pair.client.writeAll("\r\n\r\n");
+
+		var client = try Client.init(t.allocator, .{.stream = pair.server}, .{});
 		defer client.deinit();
 		try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
 	}
 
 	{
 		// invalid websocket response
-		var stream = t.Stream.init();
-		defer stream.deinit();
-		_ = stream.add("HTTP/1.1 200 OK\r\n\r\n");
-		var client = try TestClient.init(t.allocator, t.wrap(&stream), .{});
+		var pair = t.SocketPair.init();
+		defer pair.deinit();
+		try pair.client.writeAll("HTTP/1.1 200 OK\r\n\r\n");
+
+		var client = try Client.init(t.allocator, .{.stream = pair.server}, .{});
 		defer client.deinit();
 		try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
 	}
 
 	{
 		// missing upgrade header
-		var stream = t.Stream.init();
-		defer stream.deinit();
-		_ = stream.add("HTTP/1.1 101 Switching Protocol\r\n\r\n");
-		var client = try TestClient.init(t.allocator, t.wrap(&stream), .{});
+		var pair = t.SocketPair.init();
+		defer pair.deinit();
+		try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\n\r\n");
+
+		var client = try Client.init(t.allocator, .{.stream = pair.server}, .{});
 		defer client.deinit();
 		try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
 	}
 
-
 	{
 		// wrong upgrade header
-		var stream = t.Stream.init();
-		defer stream.deinit();
-		_ = stream.add("HTTP/1.1 101 Switching Protocol\r\nUpgrade: nope\r\n\r\n");
-		var client = try TestClient.init(t.allocator, t.wrap(&stream), .{});
+		var pair = t.SocketPair.init();
+		defer pair.deinit();
+		try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: nope\r\n\r\n");
+
+		var client = try Client.init(t.allocator, .{.stream = pair.server}, .{});
 		defer client.deinit();
 		try t.expectError(error.InvalidUpgradeHeader, client.handshake("/", .{}));
 	}
 
 	{
 		// missing connection header
-		var stream = t.Stream.init();
-		defer stream.deinit();
-		_ = stream.add("HTTP/1.1 101 Switching Protocol\r\nUpgrade: websocket\r\n\r\n");
-		var client = try TestClient.init(t.allocator, t.wrap(&stream), .{});
+		var pair = t.SocketPair.init();
+		defer pair.deinit();
+		try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: websocket\r\n\r\n");
+
+		var client = try Client.init(t.allocator, .{.stream = pair.server}, .{});
 		defer client.deinit();
 		try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
 	}
 
 	{
 		// wrong connection header
-		var stream = t.Stream.init();
-		defer stream.deinit();
-		_ = stream.add("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: something\r\n\r\n");
-		var client = try TestClient.init(t.allocator, t.wrap(&stream), .{});
+		var pair = t.SocketPair.init();
+		defer pair.deinit();
+		try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: something\r\n\r\n");
+
+		var client = try Client.init(t.allocator, .{.stream = pair.server}, .{});
 		defer client.deinit();
 		try t.expectError(error.InvalidConnectionHeader, client.handshake("/", .{}));
 	}
 
 	{
 		// missing Sec-Websocket-Accept header
-		var stream = t.Stream.init();
-		defer stream.deinit();
-		_ = stream.add("HTTP/1.1 101 Switching Protocol\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n");
-		var client = try TestClient.init(t.allocator, t.wrap(&stream), .{});
+		var pair = t.SocketPair.init();
+		defer pair.deinit();
+		try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n");
+
+		var client = try Client.init(t.allocator, .{.stream = pair.server}, .{});
 		defer client.deinit();
 		try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
 	}
 
 	{
 		// wrong Sec-Websocket-Accept header
-		var stream = t.Stream.init();
-		defer stream.deinit();
-		_ = stream.add("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: hack\r\n\r\n");
-		var client = try TestClient.init(t.allocator, t.wrap(&stream), .{});
+		var pair = t.SocketPair.init();
+		defer pair.deinit();
+		try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: hack\r\n\r\n");
+
+		var client = try Client.init(t.allocator, .{.stream = pair.server}, .{});
 		defer client.deinit();
 		try t.expectError(error.InvalidWebsocketAcceptHeader, client.handshake("/", .{}));
 	}
 
 	{
 		// ok for successful
-		var stream = t.Stream.init();
-		defer stream.deinit();
-		_ = stream.add("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: C/0nmHhBztSRGR1CwL6Tf4ZjwpY=\r\n\r\n");
-		var client = try TestClient.init(t.allocator, t.wrap(&stream), .{});
+		var pair = t.SocketPair.init();
+		defer pair.deinit();
+		try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: C/0nmHhBztSRGR1CwL6Tf4ZjwpY=\r\n\r\n");
+
+		var client = try Client.init(t.allocator, .{.stream = pair.server}, .{});
 		defer client.deinit();
 		try client.handshake("/", .{});
 		try t.expectEqual(0, client._reader.len);
@@ -668,29 +588,13 @@ test "client: handshake" {
 
 	{
 		// ok for successful, with overread
-		var stream = t.Stream.init();
-		defer stream.deinit();
-		_ = stream.add("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: C/0nmHhBztSRGR1CwL6Tf4ZjwpY=\r\n\r\nSome Random Data Which is Part Of the Next Message");
-		var client = try TestClient.init(t.allocator, t.wrap(&stream), .{});
+		var pair = t.SocketPair.init();
+		defer pair.deinit();
+		try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: C/0nmHhBztSRGR1CwL6Tf4ZjwpY=\r\n\r\nSome Random Data Which is Part Of the Next Message");
+
+		var client = try Client.init(t.allocator, .{.stream = pair.server}, .{});
 		defer client.deinit();
 		try client.handshake("/", .{});
 		try t.expectEqual(50, client._reader.len);
-	}
-}
-
-test "client: findCarriageReturnIndex" {
-	var input = ("z" ** 128).*;
-	for (1..input.len) |i| {
-		var buf = input[0..i];
-		try t.expectEqual(null, findCarriageReturnIndex(buf));
-
-		for (0..i) |j| {
-			buf[j] = CR;
-			if (j > 0) {
-				buf[j-1] = 'z';
-			}
-			try t.expectEqual(j, findCarriageReturnIndex(buf).?);
-		}
-		buf[i-1] = 'z';
 	}
 }

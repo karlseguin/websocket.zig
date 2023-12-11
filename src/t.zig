@@ -1,10 +1,11 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const lib = @import("lib.zig");
 
+const os = std.os;
 const mem = std.mem;
 const ArrayList = std.ArrayList;
 
-pub const expect = std.testing.expect;
 pub const allocator = std.testing.allocator;
 
 pub fn expectEqual(expected: anytype, actual: anytype) !void {
@@ -17,136 +18,109 @@ pub const expectSlice = std.testing.expectEqualSlices;
 
 pub fn getRandom() std.rand.DefaultPrng {
 	var seed: u64 = undefined;
-	std.os.getrandom(std.mem.asBytes(&seed)) catch unreachable;
+	std.os.getrandom(mem.asBytes(&seed)) catch unreachable;
 	return std.rand.DefaultPrng.init(seed);
 }
 
-pub const NetConn = struct {
-	stream: *Stream,
-};
-
-// wraps a stream so that it can be used as a writer
-pub const StreamWrap = struct {
-	stream: *Stream,
-	handle: c_int = 0,
-
-	pub const Error = std.os.WriteError;
-
-	pub fn read(self: StreamWrap, buf: []u8) !usize {
-		return self.stream.read(buf);
-	}
-
-	pub fn close(self: StreamWrap) void {
-		return self.stream.close();
-	}
-
-	pub fn writeAll(self: StreamWrap, data: []const u8) !void {
-		return self.stream.writeAll(data);
-	}
-
-	pub fn receiveTimeout(self: StreamWrap, ms: u32) !void {
-		_ = self;
-		_ = ms;
-	}
-
-	pub fn writeTimeout(self: StreamWrap, ms: u32) !void {
-		_ = self;
-		_ = ms;
-	}
-};
-
-pub fn wrap(stream: *Stream) StreamWrap {
-	return .{.stream = stream};
-}
-
-pub const Stream = struct {
-	closed: bool,
-	buf_index: usize,
-	read_index: usize,
-	frames: ?[]u8,
-	handle: c_int = 0,
-	handshake_index: ?usize,
-	to_read: ArrayList([]const u8),
+pub const SocketPair = struct {
+	buf: std.ArrayList(u8),
+	client: std.net.Stream,
+	server: std.net.Stream,
 	random: std.rand.DefaultPrng,
-	received: ArrayList([]const u8),
-	received_flatten: ArrayList(u8),
 
-	pub fn init() Stream {
+	pub fn init() SocketPair {
+		var address = std.net.Address.parseIp("127.0.0.1", 0) catch unreachable;
+		var address_len = address.getOsSockLen();
+
+		const listener = os.socket(address.any.family, os.SOCK.STREAM | os.SOCK.CLOEXEC, os.IPPROTO.TCP) catch unreachable;
+		defer os.close(listener);
+
+		{
+			// setup our listener
+			os.bind(listener, &address.any, address_len) catch unreachable;
+			os.listen(listener, 1) catch unreachable;
+			os.getsockname(listener, &address.any, &address_len) catch unreachable;
+		}
+
+		const client = os.socket(address.any.family, os.SOCK.STREAM, os.IPPROTO.TCP) catch unreachable;
+		{
+			// connect the client
+			const flags =  os.fcntl(client, os.F.GETFL, 0) catch unreachable;
+			_ = os.fcntl(client, os.F.SETFL, flags | os.SOCK.NONBLOCK) catch unreachable;
+			os.connect(client, &address.any, address_len) catch |err| switch (err) {
+				error.WouldBlock => {},
+				else => unreachable,
+			};
+			_ = os.fcntl(client, os.F.SETFL, flags) catch unreachable;
+		}
+
+		const server = os.accept(listener, &address.any, &address_len, os.SOCK.CLOEXEC) catch unreachable;
+
 		return .{
-			.closed = false,
-			.buf_index = 0,
-			.read_index = 0,
-			.frames = null,
 			.random = getRandom(),
-			.handshake_index = null,
-			.to_read = ArrayList([]const u8).init(allocator),
-			.received = ArrayList([]const u8).init(allocator),
-			.received_flatten = ArrayList(u8).init(allocator),
+			.client = .{.handle = client},
+			.server = .{.handle = server},
+			.buf = std.ArrayList(u8).init(allocator),
 		};
 	}
 
-	// init's the stream + sets up a valid handshake
-	const HANDSHAKE = "GET / HTTP/1.1\r\n" ++
-		"Connection: upgrade\r\n" ++
-		"Upgrade: websocket\r\n" ++
-		"Sec-websocket-version: 13\r\n" ++
-		"Sec-websocket-key: leto\r\n\r\n";
-
-	pub fn handshake() Stream {
-		var s = init();
-		s.handshake_index = 0;
-		return s;
+	pub fn deinit(self: *SocketPair) void {
+		self.buf.deinit();
+		// assume test closes self.server
+		self.client.close();
 	}
 
-	// When bytes are added via add, the call to read will return the
-	// bytes exactly as they were added, provided the destination has
-	// enough space. This is different than adding the bytes via a frame
-	// method which will cause random fragmentation (those framing methods
-	// ultimate end up calling add).
-	pub fn add(self: *Stream, value: []const u8) *Stream {
-		// Take ownership of this data so that we can consistently free each
-		// (necessary because we need to allocate data for frames)
-		const copy = allocator.dupe(u8, value) catch unreachable;
-		self.to_read.append(copy) catch unreachable;
-		return self;
+	pub fn handshakeRequest(self: SocketPair) void {
+		self.client.writeAll("GET / HTTP/1.1\r\n" ++
+			"Connection: upgrade\r\n" ++
+			"Upgrade: websocket\r\n" ++
+			"Sec-websocket-version: 13\r\n" ++
+			"Sec-websocket-key: leto\r\n\r\n"
+		) catch unreachable;
 	}
 
-	pub fn fragmentedAdd(self: *Stream, value: []const u8) *Stream {
-		var start: usize = 0;
-		var frames: []u8 = undefined;
-
-		if (self.frames) |f| {
-			start = f.len;
-			frames = allocator.realloc(f, start + value.len) catch unreachable;
-		} else {
-			frames = allocator.alloc(u8, value.len) catch unreachable;
+	pub fn handshakeReply(self: SocketPair) !void {
+		var pos: usize = 0;
+		var buf: [1024]u8 = undefined;
+		while (true) {
+			const n = try self.client.read(buf[pos..]);
+			if (n == 0) {
+				return error.Closed;
+			}
+			pos += n;
+			if (std.mem.endsWith(u8, buf[0..pos], "\r\n\r\n")) {
+				return;
+			}
 		}
-		@memcpy(frames[start..start+value.len], value);
-		self.frames = frames;
-		return self;
 	}
 
-	pub fn ping(self: *Stream) *Stream {
+	pub fn ping(self: *SocketPair) void {
 		return self.pingPayload("");
 	}
 
-	pub fn pingPayload(self: *Stream, payload: []const u8) *Stream {
+	pub fn pingPayload(self: *SocketPair, payload: []const u8) void {
 		return self.frame(true, 9, payload, 0);
 	}
 
-	pub fn textFrame(self: *Stream, fin: bool, payload: []const u8) *Stream {
+	pub fn textFrame(self: *SocketPair, fin: bool, payload: []const u8) void {
 		return self.frame(fin, 1, payload, 0);
 	}
 
-	pub fn textFrameReserved(self: *Stream, fin: bool, payload: []const u8, reserved: u8) *Stream {
+	pub fn binaryFrame(self: *SocketPair, fin: bool, payload: []const u8) void {
+		return self.frame(fin, 2, payload, 0);
+	}
+
+	pub fn textFrameReserved(self: *SocketPair, fin: bool, payload: []const u8, reserved: u8) void {
 		return self.frame(fin, 1, payload, reserved);
 	}
 
-	pub fn cont(self: *Stream, fin: bool, payload: []const u8) *Stream {
+	pub fn cont(self: *SocketPair, fin: bool, payload: []const u8) void {
 		return self.frame(fin, 0, payload, 0);
 	}
 
-	pub fn frame(self: *Stream, fin: bool, op_code: u8, payload: []const u8, reserved: u8) *Stream {
+	pub fn frame(self: *SocketPair, fin: bool, op_code: u8, payload: []const u8, reserved: u8) void {
+		var buf = &self.buf;
+
 		const l = payload.len;
 		var length_of_length: usize = 0;
 
@@ -158,262 +132,124 @@ pub const Stream = struct {
 			}
 		}
 
-		var start: usize = 0;
-		var frames: []u8 = undefined;
-
 		// 2 byte header + length_of_length + mask + payload_length
 		const needed = 2 + length_of_length + 4 + l;
-
-		if (self.frames) |f| {
-			start = f.len;
-			frames = allocator.realloc(f, f.len + needed) catch unreachable;
-		} else {
-			frames = allocator.alloc(u8, needed) catch unreachable;
-		}
+		buf.ensureUnusedCapacity(needed) catch unreachable;
 
 		if (fin) {
-			frames[start] = 128 | op_code | reserved;
+			buf.appendAssumeCapacity(128 | op_code | reserved);
 		} else {
-			frames[start] = op_code | reserved;
+			buf.appendAssumeCapacity(op_code | reserved);
 		}
 
 		if (length_of_length == 0) {
-			frames[start + 1] = 128 | @as(u8, @intCast(l));
+			buf.appendAssumeCapacity(128 | @as(u8, @intCast(l)));
 		} else if (length_of_length == 2) {
-			frames[start + 1] = 128 | 126;
-			frames[start + 2] = @intCast((l >> 8) & 0xFF);
-			frames[start + 3] = @intCast(l & 0xFF);
+			buf.appendAssumeCapacity(128 | 126);
+			buf.appendAssumeCapacity(@intCast((l >> 8) & 0xFF));
+			buf.appendAssumeCapacity(@intCast(l & 0xFF));
 		} else {
-			frames[start + 1] = 128 | 127;
-			frames[start + 2] = @intCast((l >> 56) & 0xFF);
-			frames[start + 3] = @intCast((l >> 48) & 0xFF);
-			frames[start + 4] = @intCast((l >> 40) & 0xFF);
-			frames[start + 5] = @intCast((l >> 32) & 0xFF);
-			frames[start + 6] = @intCast((l >> 24) & 0xFF);
-			frames[start + 7] = @intCast((l >> 16) & 0xFF);
-			frames[start + 8] = @intCast((l >> 8) & 0xFF);
-			frames[start + 9] = @intCast(l & 0xFF);
+			buf.appendAssumeCapacity(128 | 127);
+			buf.appendAssumeCapacity(@intCast((l >> 56) & 0xFF));
+			buf.appendAssumeCapacity(@intCast((l >> 48) & 0xFF));
+			buf.appendAssumeCapacity(@intCast((l >> 40) & 0xFF));
+			buf.appendAssumeCapacity(@intCast((l >> 32) & 0xFF));
+			buf.appendAssumeCapacity(@intCast((l >> 24) & 0xFF));
+			buf.appendAssumeCapacity(@intCast((l >> 16) & 0xFF));
+			buf.appendAssumeCapacity(@intCast((l >> 8) & 0xFF));
+			buf.appendAssumeCapacity(@intCast(l & 0xFF));
 		}
 
 		// +2 for the 2 byte prefix
-		const mask_start = start + 2 + length_of_length;
-		const mask = frames[mask_start .. mask_start + 4];
-		self.random.random().bytes(mask);
-		// frames[mask_start] = 0;
-		// frames[mask_start + 1] = 0;
-		// frames[mask_start + 2] = 0;
-		// frames[mask_start + 3] = 0;
+		var mask: [4]u8 = undefined;
+		self.random.random().bytes(&mask);
+		buf.appendSliceAssumeCapacity(&mask);
 
-		const payload_start = mask_start + 4;
 		for (payload, 0..) |b, i| {
-			frames[payload_start + i] = b ^ mask[i & 3];
+			buf.appendAssumeCapacity(b ^ mask[i & 3]);
 		}
-
-		self.frames = frames;
-		return self;
 	}
 
-	pub fn read(self: *Stream, buf: []u8) std.os.ReadError!usize {
-		std.debug.assert(!self.closed);
+	pub fn sendBuf(self: *SocketPair) void {
+		self.client.writeAll(self.buf.items) catch unreachable;
+		self.buf.clearRetainingCapacity();
+	}
 
-		if (self.handshake_index) |index| {
-			const data =  HANDSHAKE[index..];
-			@memcpy(buf[0..data.len], data);
-			const written = @min(buf.len, data.len - index);
-			if (written < buf.len) {
-				self.handshake_index = null;
-			} else {
-				self.handshake_index.? += written;
+	pub fn asReceived(self: SocketPair) Received {
+		var buf: [1024]u8 = undefined;
+		var all = std.ArrayList(u8).init(allocator);
+		errdefer all.deinit();
+
+		while (true) {
+			const n = self.client.read(&buf) catch 0;
+			if (n == 0) {
+				return Received.init(all);
 			}
-			return written;
+			all.appendSlice(buf[0..n]) catch unreachable;
 		}
-
-		// The first time we call read with frames we will fragment the messages.
-		// The goal is to simulate TCP fragmentation. This doesn't just mean making
-		// some reads smaller than a frame, it also means making some reads overread
-		// one frame plus part (or all) of the next.
-		// This can be voided by using the add function directly.
-		if (self.frames) |frames| {
-			var data = frames;
-			var random = self.random.random();
-			while (data.len > 0) {
-				const l = random.uintAtMost(usize, data.len - 1) + 1;
-				_ = self.add(data[0..l]);
-				data = data[l..];
-			}
-			allocator.free(frames);
-			self.frames = null;
-		}
-
-		const items = self.to_read.items;
-		if (self.read_index == items.len) {
-			return 0;
-		}
-
-		var data = items[self.read_index][self.buf_index..];
-		if (data.len > buf.len) {
-			// we have more data than we have space in buf (our target)
-			// we'll fill the target buffer, and keep track of where
-			// we our in our source buffer, so that that on the next read
-			// we'll use the same source buffer, but at the offset
-			self.buf_index += buf.len;
-			data = data[0..buf.len];
-		} else {
-			// ok, fully read this one, next time we can move on
-			self.buf_index = 0;
-			self.read_index += 1;
-		}
-
-		for (data, 0..) |b, i| {
-			buf[i] = b;
-		}
-
-		return data.len;
-	}
-
-	// store messages that are written to the stream
-	pub fn writeAll(self: *Stream, data: []const u8) !void {
-		std.debug.assert(!self.closed);
-		const copy = allocator.dupe(u8, data) catch unreachable;
-		self.received.append(copy) catch unreachable;
-		self.received_flatten.appendSlice(copy) catch unreachable;
-	}
-
-	pub fn asReceived(self: Stream, skip_handshake: bool) Received {
-		return Received.init(self.received.items, skip_handshake);
-	}
-
-	pub fn allReceived(self: Stream) []u8 {
-		return self.received_flatten.items;
-	}
-
-	pub fn close(self: *Stream) void {
-		self.closed = true;
-	}
-
-	// self should continue to be valid after this call (since we can clone
-	// it multiple times)
-	pub fn clone(self: *Stream) Stream {
-		var c = Stream.init();
-		if (self.frames) |f| {
-			c.frames = allocator.dupe(u8, f) catch unreachable;
-		}
-		c.handshake_index = self.handshake_index;
-		return c;
-	}
-
-	pub fn deinit(self: *Stream) void {
-		self.reset();
-		self.to_read.deinit();
-
-		self.received_flatten.deinit();
-		self.received.deinit();
-
-		self.* = undefined;
-	}
-
-	pub fn reset(self: *Stream) void {
-		for (self.to_read.items) |buf| {
-			allocator.free(buf);
-		}
-
-		if (self.frames) |frames| {
-			allocator.free(frames);
-			self.frames = null;
-		}
-
-		if (self.received.items.len > 0) {
-			for (self.received.items) |buf| {
-				allocator.free(buf);
-			}
-		}
-
-		self.closed = false;
-		self.buf_index = 0;
-		self.read_index = 0;
-		self.received.clearRetainingCapacity();
-		self.received_flatten.clearRetainingCapacity();
 	}
 };
 
 pub const Received = struct {
-	_ptr: []lib.Message,
+	raw: std.ArrayList(u8),
 	messages: []lib.Message,
 
-	// We make some big assumptions about these messages.
-	// Namely, we know that there's no websocket fragmentation, there's no
-	// continuation and we know that there's only two ways a single message
-	// will be fragmented:
-	//  either 1 received message == 1 full frame (such as when we write a
-	//       pre-generated message, like CLOSE_NORMAL)
-	//  or when writeFrame is used, in which case we'd expect 2 messages:
-	//       the first is the op_code + length, and the 2nd is the payload.
-	//
-	// There's a cleaner world where we'd let our real readFrame parse this.
-	fn init(all: [][]const u8, skip_handshake: bool) Received {
-		var i: usize = 0;
+	fn init(raw: std.ArrayList(u8)) Received {
+		var pos: usize = 0;
+		const buf = raw.items;
 
-		if (skip_handshake) {
-			while (i < all.len) : (i += 1) {
-				if (std.ascii.endsWithIgnoreCase(all[i], "\r\n\r\n")) {
-					break;
-				}
-			}
-			i += 1;
-		}
+		var messages = std.ArrayList(lib.Message).init(allocator);
+		defer messages.deinit();
 
-		// move past the last received data, which was the end of our handshake
-		const frames = all[i..];
-
-		var frame_index: usize = 0;
-		var message_index: usize = 0;
-
-		var messages = allocator.alloc(lib.Message, frames.len) catch unreachable;
-		while (frame_index < frames.len) : (frame_index += 1) {
-			var f = frames[frame_index];
-			const message_type = switch (f[0] & 15) {
+		while (pos < buf.len) {
+			const message_type = switch (buf[pos] & 15) {
 				1 => lib.MessageType.text,
 				2 => lib.MessageType.binary,
 				8 => lib.MessageType.close,
 				10 => lib.MessageType.pong,
 				else => unreachable,
 			};
+			pos += 1;
 
 			// Let's figure out if this message is all within this single frame
 			// or if it's split between this frame and the next.
 			// If it is split, then this frame will contain OP + LENGTH_PREFIX + LENGTH
 			// and the next one will be the full payload (and nothing else)
-			const length_of_length: u8 = switch (f[1] & 127) {
+			const length_of_length: u8 = switch (buf[pos] & 127) {
 				126 => 2,
 				127 => 8,
 				else => 0,
 			};
 
 			const payload_length = switch (length_of_length) {
-				2 => @as(u16, @intCast(f[3])) | (@as(u16, @intCast(f[2])) << 8),
-				8 => @as(u64, @intCast(f[9])) | @as(u64, @intCast(f[8])) << 8 | @as(u64, @intCast(f[7])) << 16 | @as(u64,  @intCast(f[6])) << 24 | @as(u64, @intCast(f[5])) << 32 | @as(u64, @intCast(f[4])) << 40 | @as(u64, @intCast(f[3])) << 48 | @as(u64, @intCast(f[2])) << 56,
-				else => f[1],
+				2 => @as(u16, @intCast(buf[pos+2])) | (@as(u16, @intCast(buf[pos+1])) << 8),
+				8 => @as(u64, @intCast(buf[pos+8])) | @as(u64, @intCast(buf[pos+7])) << 8 | @as(u64, @intCast(buf[pos+6])) << 16 | @as(u64,  @intCast(buf[pos+5])) << 24 | @as(u64, @intCast(buf[pos+4])) << 32 | @as(u64, @intCast(buf[pos+3])) << 40 | @as(u64, @intCast(buf[pos+2])) << 48 | @as(u64, @intCast(buf[pos+1])) << 56,
+				else => buf[pos],
 			};
+			pos += 1 + length_of_length;
+			const end = pos + payload_length;
 
-			var payload: []const u8 = undefined;
-			if (f.len >= 2 + length_of_length + payload_length) {
-				payload = f[2 + length_of_length ..];
-			} else {
-				frame_index += 1;
-				f = frames[frame_index];
-				payload = f;
-			}
-
-			messages[message_index] = lib.Message{
-				.data = payload,
+			messages.append(.{
+				.data = buf[pos..end],
 				.type = message_type,
-			};
-			message_index += 1;
+			}) catch unreachable;
+
+			pos = end;
 		}
-		return Received{ ._ptr = messages, .messages = messages[0..message_index] };
+
+		const owned = allocator.alloc(lib.Message, messages.items.len) catch unreachable;
+		for (messages.items, 0..) |message, i| {
+			owned[i] = message;
+		}
+
+		return .{
+			.raw = raw,
+			.messages = owned
+		};
 	}
 
 	pub fn deinit(self: Received) void {
-		allocator.free(self._ptr);
+		self.raw.deinit();
+		allocator.free(self.messages);
 	}
 };

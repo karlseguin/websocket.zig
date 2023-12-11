@@ -13,10 +13,10 @@ pub const connect = client.connect;
 // and websocket.zig integration)
 pub const Conn = lib.Conn;
 pub const Message = lib.Message;
+pub const Client = client.Client;
 pub const Server = server.Server;
 pub const OpCode = lib.framing.OpCode;
 pub const Handshake = lib.handshake.Handshake;
-pub const Client = client.Client(client.Stream);
 
 pub const Config = struct{
 	pub const Server = server.Config;

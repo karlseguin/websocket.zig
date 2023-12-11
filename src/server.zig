@@ -107,7 +107,7 @@ pub const Server = struct {
 		allocator.destroy(self.buffer_provider.pool);
 	}
 
-	fn accept(self: *Server, comptime H: type, context: anytype, stream: lib.Stream) void {
+	fn accept(self: *Server, comptime H: type, context: anytype, stream: net.Stream) void {
 		std.os.maybeIgnoreSigpipe();
 		errdefer stream.close();
 
@@ -152,11 +152,10 @@ pub const Server = struct {
 				return;
 			};
 		}
-
 		self.handle(H, &handler, &conn);
 	}
 
-	pub fn newConn(self: *Server, stream: lib.Stream) Conn {
+	pub fn newConn(self: *Server, stream: net.Stream) Conn {
 		const config = &self.config;
 		return .{
 			.stream = stream,
@@ -191,7 +190,7 @@ const CLOSE_NORMAL = ([_]u8{ @intFromEnum(OpCode.close), 2, 3, 232 })[0..]; // c
 const CLOSE_PROTOCOL_ERROR = ([_]u8{ @intFromEnum(OpCode.close), 2, 3, 234 })[0..]; //code: 1002
 
 pub const Conn = struct {
-	stream: lib.Stream,
+	stream: net.Stream,
 	closed: bool = false,
 	_bp: *buffer.Provider,
 	_handle_pong: bool = false,
@@ -475,35 +474,40 @@ test "Server: accept" {
 	var server = try Server.init(t.allocator, config);
 	defer server.deinit(t.allocator);
 
-	{
-		var stream = t.Stream.handshake();
-		defer stream.deinit();
-		_ = stream.textFrame(true, &.{0}).textFrame(true, &.{0});
-		server.accept(TestHandler, context, &stream);
-		try t.expectEqual(stream.closed, true);
+	var pair = t.SocketPair.init();
+	defer pair.deinit();
 
-		const r = stream.asReceived(true);
-		defer r.deinit();
-		try t.expectSlice(u8, &.{2, 0, 0, 0}, r.messages[0].data);
-		try t.expectSlice(u8, &.{3, 0, 0, 0}, r.messages[1].data);
-	}
+	pair.handshakeRequest();
+	const thrd = try std.Thread.spawn(.{}, Server.accept, .{&server, TestHandler, context, pair.server});
+	try pair.handshakeReply();
+	pair.textFrame(true, &.{0});
+	pair.textFrame(true, &.{0});
+	pair.binaryFrame(true, &.{255,255}); // special close frame
+	pair.sendBuf();
+	thrd.join();
+
+
+	const r = pair.asReceived();
+	defer r.deinit();
+	try t.expectSlice(u8, &.{2, 0, 0, 0}, r.messages[0].data);
+	try t.expectSlice(u8, &.{3, 0, 0, 0}, r.messages[1].data);
 }
 
 test "read messages" {
 	{
 		// simple small message
-		var expected = [_]Expect{Expect.text("over 9000!")};
-		var stream = t.Stream.handshake();
-		try testReadFrames(stream.textFrame(true, "over 9000!"), expected[0..]);
+		var pair = t.SocketPair.init();
+		pair.textFrame(true, "over 9000!");
+		try testReadFrames(&pair, &.{Expect.text("over 9000!")});
 	}
 
 	{
 		// single message exactly TEST_BUFFER_SIZE
-		// header will be 8 bytes, so we make the messae TEST_BUFFER_SIZE - 8 bytes
+		// header will be 8 bytes, so we make the message TEST_BUFFER_SIZE - 8 bytes
 		const msg = [_]u8{'a'} ** (TEST_BUFFER_SIZE - 8);
-		var expected = [_]Expect{Expect.text(msg[0..])};
-		var stream = t.Stream.handshake();
-		try testReadFrames(stream.textFrame(true, msg[0..]), expected[0..]);
+		var pair = t.SocketPair.init();
+		pair.textFrame(true, msg[0..]);
+		try testReadFrames(&pair, &.{Expect.text(msg[0..])});
 	}
 
 	{
@@ -511,29 +515,35 @@ test "read messages" {
 		// header is 8 bytes, so if we make our message TEST_BUFFER_SIZE - 7, we'll
 		// end up with a message which is exactly 1 byte larger than TEST_BUFFER_SIZE
 		const msg = [_]u8{'a'} ** (TEST_BUFFER_SIZE - 7);
-		var expected = [_]Expect{Expect.text(msg[0..])};
-		var stream = t.Stream.handshake();
-		try testReadFrames(stream.textFrame(true, msg[0..]), expected[0..]);
+		var pair = t.SocketPair.init();
+		pair.textFrame(true, msg[0..]);
+		try testReadFrames(&pair, &.{Expect.text(msg[0..])});
 	}
 
 	{
 		// single message that is much bigger than TEST_BUFFER_SIZE
 		const msg = [_]u8{'a'} ** (TEST_BUFFER_SIZE * 2);
-		var expected = [1]Expect{Expect.text(msg[0..])};
-		var stream = t.Stream.handshake();
-		try testReadFrames(stream.textFrame(true, msg[0..]), expected[0..]);
+		var pair = t.SocketPair.init();
+		pair.textFrame(true, msg[0..]);
+		try testReadFrames(&pair, &.{Expect.text(msg[0..])});
 	}
 
 	{
 		// multiple small messages
-		var expected = [_]Expect{ Expect.text("over"), Expect.text(" "), Expect.pong(""), Expect.text("9000"), Expect.text("!") };
-		var stream = t.Stream.handshake();
-		try testReadFrames(stream
-			.textFrame(true, "over")
-			.textFrame(true, " ")
-			.ping()
-			.textFrame(true, "9000")
-			.textFrame(true, "!"), expected[0..]);
+		var pair = t.SocketPair.init();
+		pair.textFrame(true, "over");
+		pair.textFrame(true, " ");
+		pair.ping();
+		pair.textFrame(true, "9000");
+		pair.textFrame(true, "!");
+
+		try testReadFrames(&pair, &.{
+			Expect.text("over"),
+			Expect.text(" "),
+			Expect.pong(""),
+			Expect.text("9000"),
+			Expect.text("!")
+		});
 	}
 
 	{
@@ -543,144 +553,152 @@ test "read messages" {
 		// but don't fit in a single buffer)
 		const msg1 = [_]u8{'a'} ** (TEST_BUFFER_SIZE - 100);
 		const msg2 = [_]u8{'b'} ** 200;
-		var expected = [_]Expect{ Expect.text(msg1[0..]), Expect.text(msg2[0..]) };
-		var stream = t.Stream.handshake();
-		try testReadFrames(stream
-			.textFrame(true, msg1[0..])
-			.textFrame(true, msg2[0..]), expected[0..]);
+		var pair = t.SocketPair.init();
+		pair.textFrame(true, msg1[0..]);
+		pair.textFrame(true, msg2[0..]);
+
+		try testReadFrames(&pair, &.{
+			Expect.text(msg1[0..]),
+			Expect.text(msg2[0..])
+		});
 	}
 
 	{
 		// two messages, the first bigger than TEST_BUFFER_SIZE, the second smaller
 		const msg1 = [_]u8{'a'} ** (TEST_BUFFER_SIZE + 100);
 		const msg2 = [_]u8{'b'} ** 200;
-		var expected = [_]Expect{ Expect.text(msg1[0..]), Expect.text(msg2[0..]) };
-		var stream = t.Stream.handshake();
-		try testReadFrames(stream
-			.textFrame(true, msg1[0..])
-			.textFrame(true, msg2[0..]), expected[0..]);
+		var pair = t.SocketPair.init();
+		pair.textFrame(true, msg1[0..]);
+		pair.textFrame(true, msg2[0..]);
+
+		try testReadFrames(&pair, &.{
+			Expect.text(msg1[0..]),
+			Expect.text(msg2[0..])
+		});
 	}
 
 	{
 		// Simple fragmented (websocket fragmentation)
-		var expected = [_]Expect{Expect.text("over 9000!")};
-		var stream = t.Stream.handshake();
-		try testReadFrames(stream
-			.textFrame(false, "over")
-			.cont(true, " 9000!"), expected[0..]);
+		var pair = t.SocketPair.init();
+		pair.textFrame(false, "over");
+		pair.cont(true, " 9000!");
+		try testReadFrames(&pair, &.{Expect.text("over 9000!")});
 	}
 
 	{
 		// large fragmented (websocket fragmentation)
 		const msg = [_]u8{'a'} ** (TEST_BUFFER_SIZE * 2 + 600);
-		var expected  = [_]Expect{Expect.text(msg[0..])};
-		var stream = t.Stream.handshake();
-		try testReadFrames(stream
-			.textFrame(false, msg[0 .. TEST_BUFFER_SIZE + 100])
-			.cont(true, msg[TEST_BUFFER_SIZE + 100 ..]), expected[0..]);
+		var pair = t.SocketPair.init();
+		pair.textFrame(false, msg[0 .. TEST_BUFFER_SIZE + 100]);
+		pair.cont(true, msg[TEST_BUFFER_SIZE + 100 ..]);
+		try testReadFrames(&pair, &.{Expect.text(msg[0..])});
 	}
 
 	{
 		// Fragmented with control in between
-		var expected = [_]Expect{ Expect.pong(""), Expect.pong(""), Expect.text("over 9000!") };
-		var stream = t.Stream.handshake();
-		try testReadFrames(stream
-			.textFrame(false, "over")
-			.ping()
-			.cont(false, " ")
-			.ping()
-			.cont(true, "9000!"), expected[0..]);
+		var pair = t.SocketPair.init();
+		pair.textFrame(false, "over");
+		pair.ping();
+		pair.cont(false, " ");
+		pair.ping();
+		pair.cont(true, "9000!");
+		try testReadFrames(&pair, &.{
+			Expect.pong(""),
+			Expect.pong(""),
+			Expect.text("over 9000!")
+		});
 	}
 
 	{
 		// Large Fragmented with control in between
 		const msg = [_]u8{'b'} ** (TEST_BUFFER_SIZE * 2 + 600);
-		var expected = [_]Expect{ Expect.pong(""), Expect.pong(""), Expect.text(msg[0..]) };
-		var stream = t.Stream.handshake();
-		try testReadFrames(stream
-			.textFrame(false, msg[0 .. TEST_BUFFER_SIZE + 100])
-			.ping()
-			.cont(false, msg[TEST_BUFFER_SIZE + 100 .. TEST_BUFFER_SIZE + 110])
-			.ping()
-			.cont(true, msg[TEST_BUFFER_SIZE + 110 ..]), expected[0..]);
+		var pair = t.SocketPair.init();
+		pair.textFrame(false, msg[0 .. TEST_BUFFER_SIZE + 100]);
+		pair.ping();
+		pair.cont(false, msg[TEST_BUFFER_SIZE + 100 .. TEST_BUFFER_SIZE + 110]);
+		pair.ping();
+		pair.cont(true, msg[TEST_BUFFER_SIZE + 110 ..]);
+		try testReadFrames(&pair, &.{
+			Expect.pong(""),
+			Expect.pong(""),
+			Expect.text(msg[0..])
+		});
 	}
 
 	{
 		// Empty fragmented messages
-		var expected = [_]Expect{Expect.text("")};
-		var stream = t.Stream.handshake();
-		try testReadFrames(stream
-			.textFrame(false, "")
-			.cont(false, "")
-			.cont(true, ""), expected[0..]);
+		var pair = t.SocketPair.init();
+		pair.textFrame(false, "");
+		pair.cont(false, "");
+		pair.cont(true, "");
+		try testReadFrames(&pair, &.{Expect.text("")});
 	}
 
 	{
 		// max-size control
 		const msg = [_]u8{'z'} ** 125;
-		var expected = [_]Expect{Expect.pong(msg[0..])};
-		var stream = t.Stream.handshake();
-		try testReadFrames(stream.pingPayload(msg[0..]), expected[0..]);
+		var pair = t.SocketPair.init();
+		pair.pingPayload(msg[0..]);
+		try testReadFrames(&pair, &.{Expect.pong(msg[0..])});
 	}
 }
 
 test "readFrame errors" {
 	{
 		// Nested non-control fragmented (websocket fragmentation)
-		var expected = [_]Expect{};
-		var s = t.Stream.handshake();
-		try testReadFrames(s
-			.textFrame(false, "over")
-			.textFrame(false, " 9000!"), expected[0..]);
+		var pair = t.SocketPair.init();
+		pair.textFrame(false, "over");
+		pair.textFrame(false, " 9000!");
+		try testReadFrames(&pair, &.{});
 	}
 
 	{
 		// Nested non-control fragmented FIN (websocket fragmentation)
-		var expected = [_]Expect{};
-		var s = t.Stream.handshake();
-		try testReadFrames(s
-			.textFrame(false, "over")
-			.textFrame(true, " 9000!"), expected[0..]);
+		var pair = t.SocketPair.init();
+		pair.textFrame(false, "over");
+		pair.textFrame(true, " 9000!");
+		try testReadFrames(&pair, &.{});
 	}
 
 	{
 		// control too big
 		const msg = [_]u8{'z'} ** 126;
-		var expected = [_]Expect{Expect.close(&.{3, 234})};
-		var s = t.Stream.handshake();
-		try testReadFrames(s.pingPayload(msg[0..]), expected[0..]);
+		var pair = t.SocketPair.init();
+		pair.pingPayload(msg[0..]);
+		try testReadFrames(&pair, &.{Expect.close(&.{3, 234})});
 	}
 
 	{
 		// reserved bit1
-		var expected = [_]Expect{Expect.close(&.{3, 234})};
-		var s = t.Stream.handshake();
-		_ = s.textFrameReserved(true, "over9000", 64);
-		try testReadFrames(&s, expected[0..]);
+		var pair = t.SocketPair.init();
+		pair.textFrameReserved(true, "over9000", 64);
+		try testReadFrames(&pair, &.{Expect.close(&.{3, 234})});
+
 	}
 
 	{
 		// reserved bit2
-		var expected = [_]Expect{Expect.close(&.{3, 234})};
-		var s = t.Stream.handshake();
-		_ = s.textFrameReserved(true, "over9000", 32);
-		try testReadFrames(&s, expected[0..]);
+		var pair = t.SocketPair.init();
+		pair.textFrameReserved(true, "over9000", 32);
+		try testReadFrames(&pair, &.{Expect.close(&.{3, 234})});
 	}
 
 	{
 		// reserved bit3
-		var expected = [_]Expect{Expect.close(&.{3, 234})};
-		var s = t.Stream.handshake();
-		_ = s.textFrameReserved(true, "over9000", 16);
-		try testReadFrames(&s, expected[0..]);
+		var pair = t.SocketPair.init();
+		pair.textFrameReserved(true, "over9000", 16);
+		try testReadFrames(&pair, &.{Expect.close(&.{3, 234})});
 	}
 }
 
 test "conn: writer" {
-	var tf = TestConnFactory.init();
-	defer tf.deinit();
-
 	{
+		var pair = t.SocketPair.init();
+		defer pair.deinit();
+
+		var tf = TestConnFactory.init(pair.server);
+		defer tf.deinit();
+
 		// short message (no growth)
 		var conn = tf.conn();
 		var wb = try conn.writeBuffer(.text);
@@ -688,10 +706,17 @@ test "conn: writer" {
 
 		try std.fmt.format(wb.writer(), "it's over {d}!!!", .{9000});
 		try wb.flush();
-		try expectFrames(&.{Expect.text("it's over 9000!!!")}, conn.stream, false);
+		pair.server.close();
+		try expectFrames(&.{Expect.text("it's over 9000!!!")}, &pair);
 	}
 
 	{
+		var pair = t.SocketPair.init();
+		defer pair.deinit();
+
+		var tf = TestConnFactory.init(pair.server);
+		defer tf.deinit();
+
 		// message requiring growth
 		var conn = tf.conn();
 		var wb = try conn.writeBuffer(.binary);
@@ -702,21 +727,26 @@ test "conn: writer" {
 			try writer.writeAll(".");
 		}
 		try wb.flush();
-		try expectFrames(&.{Expect.binary("." ** 1000)}, conn.stream, false);
+		pair.server.close();
+		try expectFrames(&.{Expect.binary("." ** 1000)}, &pair);
 	}
 }
 
 test "conn: writeFramed" {
-	var tf = TestConnFactory.init();
+	var pair = t.SocketPair.init();
+	defer pair.deinit();
+
+	var tf = TestConnFactory.init(pair.server);
 	defer tf.deinit();
 
 	var conn = tf.conn();
 	try conn.writeFramed(&lib.framing.frame(.text, "must flow"));
-	try expectFrames(&.{Expect.text("must flow")}, conn.stream, false);
+	pair.server.close();
+	try expectFrames(&.{Expect.text("must flow")}, &pair);
 }
 
-fn testReadFrames(s: *t.Stream, expected: []Expect) !void {
-	defer s.deinit();
+fn testReadFrames(pair: *t.SocketPair, expected: []const Expect) !void {
+	defer pair.deinit();
 
 	// we don't currently use this
 	const context = TestContext{};
@@ -733,20 +763,19 @@ fn testReadFrames(s: *t.Stream, expected: []Expect) !void {
 	var server = try Server.init(t.allocator, config);
 	defer server.deinit(t.allocator);
 
-	for (0..100) |_| {
-		var stream = s.clone();
-		defer stream.deinit();
-
-		server.accept(TestHandler, context, &stream);
-		try t.expectEqual(stream.closed, true);
-		try expectFrames(expected, &stream, true);
-	}
+	pair.handshakeRequest();
+	const thrd = try std.Thread.spawn(.{}, Server.accept, .{&server, TestHandler, context, pair.server});
+	try pair.handshakeReply();
+	pair.binaryFrame(true, &.{255,255}); // special close frame
+	pair.sendBuf();
+	thrd.join();
+	try expectFrames(expected, pair);
 }
 
-fn expectFrames(expected: []const Expect, stream: *t.Stream, skip_handshake: bool) !void {
-	const r = stream.asReceived(skip_handshake);
-	const messages = r.messages;
+fn expectFrames(expected: []const Expect, pair: *t.SocketPair) !void {
+	const r = pair.asReceived();
 	defer r.deinit();
+	const messages = r.messages;
 
 	try t.expectEqual(expected.len, messages.len);
 	var i: usize = 0;
@@ -783,7 +812,13 @@ const TestHandler = struct {
 		self.counter += 1;
 		const data = message.data;
 		switch (message.type) {
-			.binary => try self.conn.writeBin(data),
+			.binary => {
+				if (data.len == 2 and data[0] == 255 and data[1] == 255) {
+					self.conn.close();
+				} else {
+					try self.conn.writeBin(data);
+				}
+			},
 			.text => {
 				if (data.len == 1 and data[0] == 0) {
 					std.debug.assert(self.init_ptr == @intFromPtr(self));
@@ -835,15 +870,15 @@ const Expect = struct {
 };
 
 const TestConnFactory = struct {
-	stream: t.Stream,
+	stream: net.Stream,
 	bp: buffer.Provider,
 
-	fn init() TestConnFactory {
+	fn init(stream: net.Stream) TestConnFactory {
 		const pool = t.allocator.create(buffer.Pool) catch unreachable;
 		pool.* = buffer.Pool.init(t.allocator, 2, 100) catch unreachable;
 
 		return .{
-			.stream = t.Stream.init(),
+			.stream = stream,
 			.bp = buffer.Provider.init(t.allocator, pool, 10),
 		};
 	}
@@ -851,14 +886,12 @@ const TestConnFactory = struct {
 	fn deinit(self: *TestConnFactory) void {
 		self.bp.pool.deinit();
 		t.allocator.destroy(self.bp.pool);
-		self.stream.deinit();
 	}
 
 	fn conn(self: *TestConnFactory) Conn {
-		self.stream.reset();
 		return .{
 			._bp = &self.bp,
-			.stream = &self.stream,
+			.stream = self.stream,
 		};
 	}
 };
