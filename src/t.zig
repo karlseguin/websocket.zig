@@ -1,4 +1,6 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
 const lib = @import("lib.zig");
 
 const mem = std.mem;
@@ -28,7 +30,7 @@ pub const NetConn = struct {
 // wraps a stream so that it can be used as a writer
 pub const StreamWrap = struct {
 	stream: *Stream,
-	handle: c_int = 0,
+	handle: std.os.socket_t = if (builtin.os.tag == .windows) std.os.windows.ws2_32.INVALID_SOCKET else 0,
 
 	pub const Error = std.os.WriteError;
 
@@ -64,7 +66,7 @@ pub const Stream = struct {
 	buf_index: usize,
 	read_index: usize,
 	frames: ?[]u8,
-	handle: c_int = 0,
+	handle: std.os.socket_t = if (builtin.os.tag == .windows) std.os.windows.ws2_32.INVALID_SOCKET else 0,
 	handshake_index: ?usize,
 	to_read: ArrayList([]const u8),
 	random: std.rand.DefaultPrng,
