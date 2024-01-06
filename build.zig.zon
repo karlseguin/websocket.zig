@@ -2,7 +2,7 @@
 	.name = "websocket",
 	.version = "0.1.0",
 	.dependencies = .{},
-	.path = .{
+	.paths = .{
 		"readme.md",
 		"build.zig",
 		"build.zig.zon",
