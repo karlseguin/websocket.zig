@@ -12,7 +12,7 @@ pub const OpCode = enum(u8) {
 
 pub fn mask(m: []const u8, payload: []u8) void {
 	var data = payload;
-	const vector_size = std.simd.suggestVectorSize(u8) orelse @sizeOf(usize);
+	const vector_size = std.simd.suggestVectorLength(u8) orelse @sizeOf(usize);
 	if (data.len >= vector_size) {
 		const mask_vector = std.simd.repeat(vector_size, @as(@Vector(4, u8), m[0..4].*));
 		while (data.len >= vector_size) {
