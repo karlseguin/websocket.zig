@@ -36,10 +36,11 @@ pub const Fragmented = struct {
 
 	// Optimization so that we don't over-allocate on our last frame.
 	pub fn last(self: *Fragmented, value: []const u8) ![]u8 {
-		if (self.buf.items.len + value.len > self.max_size) {
+		const total_len = self.buf.items.len + value.len;
+		if (total_len > self.max_size) {
 			return error.TooLarge;
 		}
-		try self.buf.ensureUnusedCapacity(value.len);
+		try self.buf.ensureTotalCapacityPrecise(total_len);
 		self.buf.appendSliceAssumeCapacity(value);
 		return self.buf.items;
 	}

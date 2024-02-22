@@ -9,7 +9,6 @@ pub const OpCode = enum(u8) {
 	pong = 128 | 10,
 };
 
-
 pub fn mask(m: []const u8, payload: []u8) void {
 	var data = payload;
 	const vector_size = std.simd.suggestVectorLength(u8) orelse @sizeOf(usize);

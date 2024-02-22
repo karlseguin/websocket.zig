@@ -240,17 +240,17 @@ pub const Reader = struct {
 
 		var buf = self.buf.data;
 
+		// the position, in buf, where the current message starts
+		const start = self.start;
+
 		// the position in buf up to which we have valid data, this is where
 		// we should start filling it up from.
-		var pos = self.start + len;
+		var pos = start + len;
 
 		// how much data we're missing to satifisfy to_read
 		const missing = to_read - len;
 
 		if (missing > buf.len - pos) {
-			// the position, in buf, where the current message starts
-			const start = self.start;
-
 			if (to_read <= buf.len) {
 				// We have enough space to read this message in our
 				// current buffer, but we need to compact it.
@@ -260,7 +260,7 @@ pub const Reader = struct {
 			} else if (to_read <= self.max_size) {
 				const new_buf = try self.bp.alloc(to_read);
 				if (len > 0) {
-					@memcpy(new_buf.data[0 .. len], buf[start .. start + len]);
+					@memcpy(new_buf.data[0..len], buf[start..pos]);
 				}
 
 				// bp.alloc can return a larger buffer (e.g. from a pool). But we don't
@@ -280,9 +280,8 @@ pub const Reader = struct {
 		// Once pos reaches this position, then we have to_read bytes
 		const need_pos = pos + missing;
 
-		// A bit arbitrary
-		const buf_end = if (to_read > 20) buf.len else need_pos;
-		// const buf_end = if (buf.len - need_pos > 20) buf.len else need_pos;
+		// We can overread if this is our static buffer
+		const buf_end = if (buf.ptr == self.static.data.ptr) buf.len else need_pos;
 
 		while (pos < need_pos) {
 			const n = try stream.read(buf[pos..buf_end]);
@@ -637,5 +636,88 @@ test "Reader: fuzz" {
 			try t.expectString(m, r.currentMessage());
 			r.prepareForNewMessage();
 		}
+	}
+}
+
+test "Reader: readMessage full" {
+	var pair = t.SocketPair.init();
+	defer pair.deinit();
+
+	var thread = try std.Thread.spawn(.{}, testMessageReader, .{pair.server});
+
+	try pair.client.writeAll(&.{129, 5, 's', 'h', 'o', 'r', 't'});
+	std.time.sleep(std.time.ns_per_ms * 5);
+
+	try pair.client.writeAll(&.{129, 5, 'a', 'b', 'c', 'd', 'e', 129});
+	std.time.sleep(std.time.ns_per_ms * 5);
+
+	try pair.client.writeAll(&.{4, '1', '2', '3', '4', 130, 15});
+	std.time.sleep(std.time.ns_per_ms * 5);
+
+	try pair.client.writeAll("-tKAjdmaij4j");
+	std.time.sleep(std.time.ns_per_ms * 5);
+
+	try pair.client.writeAll(&.{'9', '8', '7', 130, 4, 'A', 'B'});
+	std.time.sleep(std.time.ns_per_ms * 5);
+	try pair.client.writeAll(&.{'C', 'D'});
+
+	try pair.client.writeAll(&.{129, 20});
+	try pair.client.writeAll(&.{'1', '2', '3', '4', '5', '6', '7', '8', '9', '0', 'A', 'B', 'C', 'D', 'E', 'F', 'G'});
+	std.time.sleep(std.time.ns_per_ms * 5);
+	try pair.client.writeAll(&.{'H', 'I', 'J', 129, 3, 'j', 'k', 'l'});
+	thread.join();
+}
+
+fn testMessageReader(stream: std.net.Stream) void {
+	// done this way so we can try in our real function
+	// probably a better way to do this
+	tryTestMessageReader(stream) catch unreachable;
+}
+
+fn tryTestMessageReader(stream: std.net.Stream) !void {
+	var bp = buffer.Provider.initNoPool(t.allocator);
+	var r = try Reader.init(10, 100, &bp);
+	defer r.deinit();
+
+	{
+		const msg = try r.readMessage(stream) ;
+		try t.expectEqual(.text, msg.type);
+		try t.expectString("short", msg.data);
+	}
+
+	{
+		const msg = try r.readMessage(stream) ;
+		try t.expectEqual(.text, msg.type);
+		try t.expectString("abcde", msg.data);
+	}
+
+	{
+		const msg = try r.readMessage(stream) ;
+		try t.expectEqual(.text, msg.type);
+		try t.expectString("1234", msg.data);
+	}
+
+	{
+		const msg = try r.readMessage(stream) ;
+		try t.expectEqual(.binary, msg.type);
+		try t.expectString("-tKAjdmaij4j987", msg.data);
+	}
+
+	{
+		const msg = try r.readMessage(stream) ;
+		try t.expectEqual(.binary, msg.type);
+		try t.expectString("ABCD", msg.data);
+	}
+
+	{
+		const msg = try r.readMessage(stream) ;
+		try t.expectEqual(.text, msg.type);
+		try t.expectString("1234567890ABCDEFGHIJ", msg.data);
+	}
+
+	{
+		const msg = try r.readMessage(stream) ;
+		try t.expectEqual(.text, msg.type);
+		try t.expectString("jkl", msg.data);
 	}
 }
