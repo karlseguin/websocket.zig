@@ -231,7 +231,10 @@ const Handler = struct {
     }
 
     pub fn connect(self: *Handler, path: []const u8) !void {
-        try self.client.handshake(path, .{.timeout_ms = 5000});
+        try self.client.handshake(path, .{
+            .timeout_ms = 5000
+            .headers = "Host: 127.0.0.1:9223",
+        });
         const thread = try self.client.readLoopInNewThread(self);
         thread.detach();
     }
@@ -276,7 +279,10 @@ var client = try websocket.connect(allocator, "localhost", 9001, .{});
 defer client.deinit();
 
 const path = "/";
-try client.handshake(path, .{.timeout_ms = 5000});
+try client.handshake(path, .{
+    .timeout_ms = 5000
+    .headers = "Host: localhost:9001",
+});
 
 const handler = Handler{.client = &client};
 const thread = try client.readLoopInNewThread(handler);
