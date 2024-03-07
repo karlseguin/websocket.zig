@@ -270,7 +270,7 @@ pub fn main() !void {
 }
 ```
 
-The above is an example of how you might want to use `websocket.Client`. The link between the library's `websocket.Client` and your application's` `Handler` is very thin. Your handler will hold the client in order to write to the server and close the connection. But it is only the call to `client.readLoopInNewThread(HANDLER)` or `client.readLoop(HANDLER)` which connects the client to your handler.
+The above is an example of how you might want to use `websocket.Client`. The link between the library's `websocket.Client` and your application's `Handler` is very thin. Your handler will hold the client in order to write to the server and close the connection. But it is only the call to `client.readLoopInNewThread(HANDLER)` or `client.readLoop(HANDLER)` which connects the client to your handler.
 
 The above example could be rewritten to more cleanly separate the application's Handler and the library's Client:
 
