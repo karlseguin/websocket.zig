@@ -140,7 +140,7 @@ pub const Client = struct {
 		while (true) {
 			const message = reader.readMessage(stream) catch |err| switch (err) {
 				error.Closed, error.ConnectionResetByPeer, error.BrokenPipe => {
-					_ = @cmpxchgStrong(bool, &self._closed, false, true, .Monotonic, .Monotonic);
+					_ = @cmpxchgStrong(bool, &self._closed, false, true, .monotonic, .monotonic);
 					return;
 				},
 				else => {
@@ -248,14 +248,14 @@ pub const Client = struct {
 	}
 
 	pub fn close(self: *Self) void {
-		if (@cmpxchgStrong(bool, &self._closed, false, true, .Monotonic, .Monotonic) == null) {
+		if (@cmpxchgStrong(bool, &self._closed, false, true, .monotonic, .monotonic) == null) {
 			self.writeFrame(.close, "") catch {};
 			self.stream.close();
 		}
 	}
 
 	pub fn closeWithCode(self: *Self, code: u16) void {
-		if (@cmpxchgStrong(bool, &self._closed, false, true, .Monotonic, .Monotonic) == null) {
+		if (@cmpxchgStrong(bool, &self._closed, false, true, .monotonic, .monotonic) == null) {
 			var buf: [2]u8 = undefined;
 			buf[0] = @intCast((code >> 8) & 0xFF);
 			buf[1] = @intCast(code & 0xFF);
