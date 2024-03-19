@@ -37,11 +37,6 @@ pub fn listen(comptime H: type, allocator: Allocator, context: anytype, config: 
 	var server = try Server.init(allocator, config);
 	defer server.deinit(allocator);
 
-	var listener = net.StreamServer.init(.{
-		.reuse_address = true,
-		.kernel_backlog = 1024,
-	});
-	defer listener.deinit();
 
 	var no_delay = true;
 	const address = blk: {
@@ -54,7 +49,11 @@ pub fn listen(comptime H: type, allocator: Allocator, context: anytype, config: 
 		}
 		break :blk try net.Address.parseIp(config.address, config.port);
 	};
-	try listener.listen(address);
+	var listener = try address.listen(.{
+		.reuse_address = true,
+		.kernel_backlog = 1024,
+	});
+	defer listener.deinit();
 
 	if (no_delay) {
 		// TODO: Broken on darwin:
@@ -62,7 +61,7 @@ pub fn listen(comptime H: type, allocator: Allocator, context: anytype, config: 
 		// if (@hasDecl(os.TCP, "NODELAY")) {
 		//  try os.setsockopt(socket.sockfd.?, os.IPPROTO.TCP, os.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1)));
 		// }
-		try os.setsockopt(listener.sockfd.?, os.IPPROTO.TCP, 1, &std.mem.toBytes(@as(c_int, 1)));
+		try os.setsockopt(listener.stream.handle, os.IPPROTO.TCP, 1, &std.mem.toBytes(@as(c_int, 1)));
 	}
 
 	while (true) {
