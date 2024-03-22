@@ -1,6 +1,7 @@
 const std = @import("std");
 const lib = @import("lib.zig");
 const builtin = @import("builtin");
+const pipe = @import("pipe.zig");
 
 const buffer = lib.buffer;
 const framing = lib.framing;
@@ -9,7 +10,7 @@ const handshake = lib.handshake;
 const Reader = lib.Reader;
 const OpCode = framing.OpCode;
 
-const os = std.os;
+const os = std.posix;
 const net = std.net;
 const Loop = std.event.Loop;
 const log = std.log.scoped(.websocket);
@@ -107,7 +108,7 @@ pub const Server = struct {
 	}
 
 	fn accept(self: *Server, comptime H: type, context: anytype, stream: net.Stream) void {
-		std.os.maybeIgnoreSigpipe();
+		pipe.maybeIgnoreSigpipe();
 		errdefer stream.close();
 
 		const Handshake = handshake.Handshake;
