@@ -1,5 +1,6 @@
 const std = @import("std");
 const lib = @import("lib.zig");
+const pipe = @import("pipe.zig");
 
 const buffer = lib.buffer;
 const framing = lib.framing;
@@ -7,7 +8,7 @@ const Reader = lib.Reader;
 const Message = lib.Message;
 const OpCode = framing.OpCode;
 
-const os = std.os;
+const os = std.posix;
 const net = std.net;
 const tls = std.crypto.tls;
 const Allocator = std.mem.Allocator;
@@ -185,7 +186,7 @@ pub const Client = struct {
 	}
 
 	fn readLoopOwnedThread(self: *Self, h: anytype) void {
-		std.os.maybeIgnoreSigpipe();
+		pipe.maybeIgnoreSigpipe();
 		self.readLoop(h) catch {};
 	}
 

@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const lib = @import("lib.zig");
 
-const os = std.os;
+const os = std.posix;
 const mem = std.mem;
 const ArrayList = std.ArrayList;
 
@@ -18,7 +18,7 @@ pub const expectSlice = std.testing.expectEqualSlices;
 
 pub fn getRandom() std.rand.DefaultPrng {
 	var seed: u64 = undefined;
-	std.os.getrandom(mem.asBytes(&seed)) catch unreachable;
+	std.posix.getrandom(mem.asBytes(&seed)) catch unreachable;
 	return std.rand.DefaultPrng.init(seed);
 }
 

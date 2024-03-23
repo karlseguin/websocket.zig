@@ -5,12 +5,12 @@ const BORDER = "=" ** 80;
 
 pub fn main() !void {
 	const verbose = blk: {
-		if (std.os.getenv("TEST_VERBOSE")) |e| {
+		if (std.posix.getenv("TEST_VERBOSE")) |e| {
 			break :blk std.mem.eql(u8, e, "true");
 		}
 		break :blk false;
 	};
-	const filter = std.os.getenv("TEST_FILTER");
+	const filter = std.posix.getenv("TEST_FILTER");
 
 	const printer = Printer.init();
 	var slowest = SlowTracker.init(5);
@@ -84,7 +84,7 @@ pub fn main() !void {
 	try printer.fmt("\n", .{});
 	try slowest.display(printer);
 	try printer.fmt("\n", .{});
-	std.os.exit(if (fail == 0) 0 else 1);
+	std.posix.exit(if (fail == 0) 0 else 1);
 }
 
 const Printer = struct {
