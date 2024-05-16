@@ -149,7 +149,7 @@ The 4th parameter to `websocket.listen` is a configuration object.
 * `handshake_timeout_ms` - The time, in milliseconds, to wait for the handshake to complete. This essentially prevents a client from opening a connection and "hanging" the thread while it waits for data. If a client slowly sends a few bytes at a time, the actual timeout might happen up to 2x longer than specified. Generally speaking, it might be better to let a proxy (e.g. nginx) handle this. Default 10_000;
  `handle_ping` - Whether ping messages should be sent to the handler. When true, the libray will not automatically answer with a pong. Default: `false`.
 * `handle_pong` - Whether pong messages should be sent to the handler. 
-* `handle_close` - Whether close messages should be sent to the handler.  When true, the library will not automatically answer with a corresponding `close` However, the readLoop will exists and the connection will be closed.
+* `handle_close` - Whether close messages should be sent to the handler.  When true, the library will not automatically answer with a corresponding `close` However, the readLoop will exit and the connection will be closed.
 * `large_buffer_pool_count` - The number of "large" buffers to keep pooled. Default: `32`.
 * `large_buffer_size` - The size of each large buffer. Default: `32768`
 
