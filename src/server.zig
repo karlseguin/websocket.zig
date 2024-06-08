@@ -107,7 +107,7 @@ pub const Server = struct {
 		allocator.destroy(self.buffer_provider.pool);
 	}
 
-	fn accept(self: *Server, comptime H: type, context: anytype, stream: net.Stream) void {
+	pub fn accept(self: *Server, comptime H: type, context: anytype, stream: net.Stream) void {
 		pipe.maybeIgnoreSigpipe();
 		errdefer stream.close();
 
