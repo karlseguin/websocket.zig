@@ -12,7 +12,6 @@ const OpCode = framing.OpCode;
 
 const os = std.posix;
 const net = std.net;
-const Loop = std.event.Loop;
 const log = std.log.scoped(.websocket);
 
 const Allocator = std.mem.Allocator;

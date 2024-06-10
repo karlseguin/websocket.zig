@@ -232,7 +232,7 @@ const Handler = struct {
 
     pub fn connect(self: *Handler, path: []const u8) !void {
         try self.client.handshake(path, .{
-            .timeout_ms = 5000
+            .timeout_ms = 5000,
             .headers = "Host: 127.0.0.1:9223",
         });
         const thread = try self.client.readLoopInNewThread(self);

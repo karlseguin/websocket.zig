@@ -1,4 +1,4 @@
 zig-out/
-zig-cache/
+.zig-cache/
 support/autobahn/client/reports/
 support/autobahn/server/reports/
