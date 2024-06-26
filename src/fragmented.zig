@@ -71,7 +71,7 @@ test "fragmented" {
 	}
 
 	{
-		var r = std.rand.DefaultPrng.init(0);
+		var r = std.Random.DefaultPrng.init(0);
 		var random = r.random();
 
 		var count: usize = 0;

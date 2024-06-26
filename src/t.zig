@@ -16,17 +16,17 @@ pub const expectError = std.testing.expectError;
 pub const expectString = std.testing.expectEqualStrings;
 pub const expectSlice = std.testing.expectEqualSlices;
 
-pub fn getRandom() std.rand.DefaultPrng {
+pub fn getRandom() std.Random.DefaultPrng {
 	var seed: u64 = undefined;
 	std.posix.getrandom(mem.asBytes(&seed)) catch unreachable;
-	return std.rand.DefaultPrng.init(seed);
+	return std.Random.DefaultPrng.init(seed);
 }
 
 pub const SocketPair = struct {
 	buf: std.ArrayList(u8),
 	client: std.net.Stream,
 	server: std.net.Stream,
-	random: std.rand.DefaultPrng,
+	random: std.Random.DefaultPrng,
 
 	pub fn init() SocketPair {
 		var address = std.net.Address.parseIp("127.0.0.1", 0) catch unreachable;
