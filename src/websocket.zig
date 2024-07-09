@@ -6,7 +6,6 @@ const buffer = lib.buffer;
 const client = @import("client.zig");
 const server = @import("server.zig");
 
-pub const listen = server.listen;
 pub const connect = client.connect;
 
 // Many of these are only exposed for advanced integration (e.g. the http.zig
@@ -16,7 +15,11 @@ pub const Message = lib.Message;
 pub const Client = client.Client;
 pub const Server = server.Server;
 pub const OpCode = lib.framing.OpCode;
-pub const Handshake = lib.handshake.Handshake;
+pub const Handshake = lib.Handshake;
+pub const TextType = enum{
+	text,
+	binary,
+};
 
 pub const Config = struct{
 	pub const Server = server.Config;

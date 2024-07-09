@@ -1,6 +1,5 @@
 const std = @import("std");
 const lib = @import("lib.zig");
-const pipe = @import("pipe.zig");
 
 const buffer = lib.buffer;
 const framing = lib.framing;
@@ -186,7 +185,6 @@ pub const Client = struct {
 	}
 
 	fn readLoopOwnedThread(self: *Self, h: anytype) void {
-		pipe.maybeIgnoreSigpipe();
 		self.readLoop(h) catch {};
 	}
 

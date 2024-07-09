@@ -16,23 +16,10 @@ pub fn main() !void {
 
 	const allocator = general_purpose_allocator.allocator();
 
-	// abitrary context object that will get passed to your handler
-	var context = Context{};
-
-	const config = websocket.Config.Server{
+	var server = try websocket.Server(Handler).init(allocator, .{
 		.port = 9223,
 
 		.address = "127.0.0.1",
-		.handshake_timeout_ms = 3000,
-
-		// We initialize and keep in memory `handshake_pool_size` buffers, each of
-		// `handshake_max_size` at all time. This is used to parse the initial
-		// handshake request. If the pool is empty and new connections come in,
-		// then buffers of `handshake_max_size` are dynamically allocated as needed.
-		.handshake_pool_count = 10,
-
-		// See handshake_pool_size
-		.handshake_max_size = 1024,
 
 		// On connection, each client will get buffer_size bytes allocated
 		// to process messages. This will be a single allocation and will only
@@ -50,11 +37,21 @@ pub fn main() !void {
 		// IMPORTANT NOTE: autobahn tests with large messages (16MB).
 		// You almost certainly want to use a small value here.
 		.max_size = 20_000_000,
-	};
+
+		.handshake = .{
+			.timeout = 3,
+			.max_size = 1024,
+			.max_headers = 10,
+		},
+	});
+	defer server.deinit();
+
+	// abitrary context object that will get passed to your handler
+	var context = Context{};
 
 	// Start websocket listening on the given port,
 	// speficying the handler struct that will servi
-	try websocket.listen(Handler, allocator, &context, config);
+	try server.listen(&context);
 }
 
 const Context = struct {};
@@ -70,9 +67,8 @@ const Handler = struct {
 		};
 	}
 
-	pub fn handle(self: *Handler, message: Message) !void {
-		const data = message.data;
-		switch (message.type) {
+	pub fn handleMessage(self: *Handler, data: []const u8, tpe: websocket.TextType) !void {
+		switch (tpe) {
 			.binary => try self.conn.writeBin(data),
 			.text => {
 				if (std.unicode.utf8ValidateSlice(data)) {
@@ -81,7 +77,6 @@ const Handler = struct {
 					self.conn.close();
 				}
 			},
-			else => unreachable,
 		}
 	}
 

@@ -8,12 +8,11 @@ const builtin = @import("builtin");
 pub const testing = @import("t.zig");
 pub const buffer = @import("buffer.zig");
 pub const framing = @import("framing.zig");
-pub const handshake = @import("handshake.zig");
-pub const Conn = @import("server.zig").Conn;
+pub const Conn = @import("conn.zig").Conn;
+pub const Reader = @import("reader.zig").Reader;
+pub const Handshake = @import("handshake.zig").Handshake;
 
 pub const is_test = builtin.is_test;
-
-pub const Reader = @import("reader.zig").Reader;
 
 pub const MessageType = enum {
 	text,
@@ -27,3 +26,22 @@ pub const Message = struct {
 	type: MessageType,
 	data: []const u8,
 };
+
+const force_blocking: bool = blk: {
+	const build = @import("build");
+	if (@hasDecl(build, "force_blocking")) {
+		break :blk  build.force_blocking;
+	}
+	break :blk false;
+};
+
+pub fn blockingMode() bool {
+	return true;
+	// if (force_blocking) {
+	// 	return true;
+	// }
+	// return switch (builtin.os.tag) {
+	// 	.linux, .macos, .ios, .tvos, .watchos, .freebsd, .netbsd, .dragonfly, .openbsd => false,
+	// 	else => true,
+	// };
+}
