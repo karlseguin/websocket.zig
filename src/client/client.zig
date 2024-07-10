@@ -320,7 +320,6 @@ pub const Stream = struct {
 		self.stream.close();
 	}
 
-
 	pub fn read(self: *Stream, buf: []u8) !usize {
 		if (self.tls_client) |*tls_client| {
 			return tls_client.read(self.stream, buf);
@@ -534,117 +533,130 @@ fn eql(a: []const u8, b: []const u8) bool {
 	return true;
 }
 
-// const t = @import("../t.zig");
-// test "client: handshake" {
-// 	{
-// 		// empty reponse
-// 		var pair = t.SocketPair.init();
-// 		defer pair.deinit();
-// 		try pair.client.writeAll("\r\n\r\n");
+const t = @import("../t.zig");
+test "Client: handshake" {
+	{
+		// empty response
+		var pair = t.SocketPair.init();
+		defer pair.deinit();
+		try pair.client.writeAll("\r\n\r\n");
 
-// 		var client = try Client.init(t.allocator, .{.stream = pair.server}, .{});
-// 		defer client.deinit();
-// 		try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
-// 	}
+		var client = testClient(pair.server);
+		defer client.deinit();
+		try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
+	}
 
-// 	{
-// 		// invalid websocket response
-// 		var pair = t.SocketPair.init();
-// 		defer pair.deinit();
-// 		try pair.client.writeAll("HTTP/1.1 200 OK\r\n\r\n");
+	{
+		// invalid websocket response
+		var pair = t.SocketPair.init();
+		defer pair.deinit();
+		try pair.client.writeAll("HTTP/1.1 200 OK\r\n\r\n");
 
-// 		var client = try Client.init(t.allocator, .{.stream = pair.server}, .{});
-// 		defer client.deinit();
-// 		try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
-// 	}
+		var client = testClient(pair.server);
+		defer client.deinit();
+		try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
+	}
 
-// 	{
-// 		// missing upgrade header
-// 		var pair = t.SocketPair.init();
-// 		defer pair.deinit();
-// 		try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\n\r\n");
+	{
+		// missing upgrade header
+		var pair = t.SocketPair.init();
+		defer pair.deinit();
+		try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\n\r\n");
 
-// 		var client = try Client.init(t.allocator, .{.stream = pair.server}, .{});
-// 		defer client.deinit();
-// 		try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
-// 	}
+		var client = testClient(pair.server);
+		defer client.deinit();
+		try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
+	}
 
-// 	{
-// 		// wrong upgrade header
-// 		var pair = t.SocketPair.init();
-// 		defer pair.deinit();
-// 		try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: nope\r\n\r\n");
+	{
+		// wrong upgrade header
+		var pair = t.SocketPair.init();
+		defer pair.deinit();
+		try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: nope\r\n\r\n");
 
-// 		var client = try Client.init(t.allocator, .{.stream = pair.server}, .{});
-// 		defer client.deinit();
-// 		try t.expectError(error.InvalidUpgradeHeader, client.handshake("/", .{}));
-// 	}
+		var client = testClient(pair.server);
+		defer client.deinit();
+		try t.expectError(error.InvalidUpgradeHeader, client.handshake("/", .{}));
+	}
 
-// 	{
-// 		// missing connection header
-// 		var pair = t.SocketPair.init();
-// 		defer pair.deinit();
-// 		try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: websocket\r\n\r\n");
+	{
+		// missing connection header
+		var pair = t.SocketPair.init();
+		defer pair.deinit();
+		try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: websocket\r\n\r\n");
 
-// 		var client = try Client.init(t.allocator, .{.stream = pair.server}, .{});
-// 		defer client.deinit();
-// 		try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
-// 	}
+		var client = testClient(pair.server);
+		defer client.deinit();
+		try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
+	}
 
-// 	{
-// 		// wrong connection header
-// 		var pair = t.SocketPair.init();
-// 		defer pair.deinit();
-// 		try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: something\r\n\r\n");
+	{
+		// wrong connection header
+		var pair = t.SocketPair.init();
+		defer pair.deinit();
+		try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: something\r\n\r\n");
 
-// 		var client = try Client.init(t.allocator, .{.stream = pair.server}, .{});
-// 		defer client.deinit();
-// 		try t.expectError(error.InvalidConnectionHeader, client.handshake("/", .{}));
-// 	}
+		var client = testClient(pair.server);
+		defer client.deinit();
+		try t.expectError(error.InvalidConnectionHeader, client.handshake("/", .{}));
+	}
 
-// 	{
-// 		// missing Sec-Websocket-Accept header
-// 		var pair = t.SocketPair.init();
-// 		defer pair.deinit();
-// 		try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n");
+	{
+		// missing Sec-Websocket-Accept header
+		var pair = t.SocketPair.init();
+		defer pair.deinit();
+		try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n");
 
-// 		var client = try Client.init(t.allocator, .{.stream = pair.server}, .{});
-// 		defer client.deinit();
-// 		try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
-// 	}
+		var client = testClient(pair.server);
+		defer client.deinit();
+		try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
+	}
 
-// 	{
-// 		// wrong Sec-Websocket-Accept header
-// 		var pair = t.SocketPair.init();
-// 		defer pair.deinit();
-// 		try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: hack\r\n\r\n");
+	{
+		// wrong Sec-Websocket-Accept header
+		var pair = t.SocketPair.init();
+		defer pair.deinit();
+		try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: hack\r\n\r\n");
 
-// 		var client = try Client.init(t.allocator, .{.stream = pair.server}, .{});
-// 		defer client.deinit();
-// 		try t.expectError(error.InvalidWebsocketAcceptHeader, client.handshake("/", .{}));
-// 	}
+		var client = testClient(pair.server);
+		defer client.deinit();
+		try t.expectError(error.InvalidWebsocketAcceptHeader, client.handshake("/", .{}));
+	}
 
-// 	{
-// 		// ok for successful
-// 		var pair = t.SocketPair.init();
-// 		defer pair.deinit();
-// 		try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: C/0nmHhBztSRGR1CwL6Tf4ZjwpY=\r\n\r\n");
+	{
+		// ok for successful
+		var pair = t.SocketPair.init();
+		defer pair.deinit();
+		try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: C/0nmHhBztSRGR1CwL6Tf4ZjwpY=\r\n\r\n");
 
-// 		var client = try Client.init(t.allocator, .{.stream = pair.server}, .{});
-// 		defer client.deinit();
-// 		try client.handshake("/", .{});
-// 		try t.expectEqual(0, client._reader.len);
-// 	}
+		var client = testClient(pair.server);
+		defer client.deinit();
+		try client.handshake("/", .{});
+		try t.expectEqual(0, client._reader.pos);
+	}
 
-// 	{
-// 		// ok for successful, with overread
-// 		var pair = t.SocketPair.init();
-// 		defer pair.deinit();
-// 		try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: C/0nmHhBztSRGR1CwL6Tf4ZjwpY=\r\n\r\nSome Random Data Which is Part Of the Next Message");
+	{
+		// ok for successful, with overread
+		var pair = t.SocketPair.init();
+		defer pair.deinit();
+		try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: C/0nmHhBztSRGR1CwL6Tf4ZjwpY=\r\n\r\nSome Random Data Which is Part Of the Next Message");
 
-// 		var client = try Client.init(t.allocator, .{.stream = pair.server}, .{});
-// 		defer client.deinit();
-// 		try client.handshake("/", .{});
-// 		try t.expectEqual(50, client._reader.len);
-// 	}
-// }
+		var client = testClient(pair.server);
+		defer client.deinit();
+		try client.handshake("/", .{});
+		try t.expectEqual(50, client._reader.pos);
+	}
+}
+
+fn testClient(stream: net.Stream) Client {
+	const bp = t.allocator.create(buffer.Provider) catch unreachable;
+	bp.* = buffer.Provider.init(t.allocator, .{.count = 0, .size = 0, .max = 4096}) catch unreachable;
+
+	return .{
+		._closed = false,
+		._own_bp = true,
+		._mask_fn = generateMask,
+		.stream = .{.stream = stream},
+		._reader = Reader.init(1024, bp) catch undefined,
+	};
+}

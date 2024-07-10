@@ -58,7 +58,10 @@ pub const Provider = struct {
 	}
 
 	pub fn deinit(self: *Provider) void {
-		self.pool.deinit();
+		if (self.pool_buffer_size > 0) {
+			// else, pool is undefined
+			self.pool.deinit();
+		}
 	}
 
 	pub fn static(self: *const Provider, size: usize) !Buffer {
