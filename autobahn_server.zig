@@ -51,7 +51,11 @@ pub fn main() !void {
 
 	// Start websocket listening on the given port,
 	// speficying the handler struct that will servi
-	try server.listen(&context);
+	var thrd = try server.listenInNewThread(&context);
+	std.time.sleep(std.time.ns_per_s * 2);
+	server.stop();
+	thrd.join();
+
 }
 
 const Context = struct {};

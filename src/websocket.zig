@@ -1,54 +1,29 @@
 const std = @import("std");
-const lib = @import("lib.zig");
-pub const testing = @import("testing.zig");
 
-const buffer = lib.buffer;
-const client = @import("client.zig");
-const server = @import("server.zig");
+pub const proto = @import("proto.zig");
+pub const OpCode = proto.OpCode;
+pub const Message = proto.Message;
 
-pub const connect = client.connect;
+pub const buffer = @import("buffer.zig");
+pub const Client = @import("client/client.zig").Client;
 
-// Many of these are only exposed for advanced integration (e.g. the http.zig
-// and websocket.zig integration)
-pub const Conn = lib.Conn;
-pub const Message = lib.Message;
-pub const Client = client.Client;
-pub const Server = server.Server;
-pub const OpCode = lib.framing.OpCode;
-pub const Handshake = lib.Handshake;
-pub const TextType = enum{
-	text,
-	binary,
-};
-
-pub const Config = struct{
-	pub const Server = server.Config;
-	pub const Client = client.Config;
-};
-
-const Allocator = std.mem.Allocator;
-pub fn bufferProvider(allocator: Allocator, pool_buffer_count: u16, pool_buffer_size: usize) !*buffer.Provider {
-	const pool = try allocator.create(buffer.Pool);
-	pool.* = try buffer.Pool.init(allocator, pool_buffer_count, pool_buffer_size);
-
-	const provider = try allocator.create(buffer.Provider);
-	provider.* = buffer.Provider.init(allocator, pool, pool_buffer_size);
-	return provider;
+pub fn bufferProvider(allocator: std.mem.Allocator, config: buffer.Config) !buffer.Provider {
+	return buffer.Provider.init(allocator, config);
 }
 
-pub fn frameText(comptime msg: []const u8) [lib.framing.frameLen(msg)]u8 {
-	return lib.framing.frame(.text, msg);
+pub fn frameText(comptime msg: []const u8) [proto.calculateFrameLen(msg)]u8 {
+	return proto.frame(.text, msg);
 }
 
-pub fn frameBin(comptime msg: []const u8) [lib.framing.frameLen(msg)]u8 {
-	return lib.framing.frame(.binary, msg);
+pub fn frameBin(comptime msg: []const u8) [proto.calculateFrameLen(msg)]u8 {
+	return proto.frame(.binary, msg);
 }
 
 comptime {
 	std.testing.refAllDecls(@This());
 }
 
-const t = lib.testing;
+const t = @import("t.zig");
 test "frameText" {
 	{
 		// short

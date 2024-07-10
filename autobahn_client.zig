@@ -6,9 +6,9 @@ const Allocator = std.mem.Allocator;
 pub const io_mode = .evented;
 
 pub fn main() !void {
-	var general_purpose_allocator = std.heap.GeneralPurposeAllocator(.{}){};
-	const allocator = general_purpose_allocator.allocator();
-	defer _ = general_purpose_allocator.detectLeaks();
+	var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+	const allocator = gpa.allocator();
+	defer _ = gpa.detectLeaks();
 
 	const cases = [_][]const u8{
 		"1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6", "1.1.7", "1.1.8", "1.2.1", "1.2.2", "1.2.3", "1.2.4", "1.2.5", "1.2.6", "1.2.7", "1.2.8",
@@ -60,21 +60,22 @@ pub fn main() !void {
 	};
 
 	// wait 5 seconds for autobanh server to be up
-	std.time.sleep(5000000000);
+	// std.time.sleep(5000000000);
 
-	const buffer_provider = try websocket.bufferProvider(allocator, 10, 32768);
+	var buffer_provider = try websocket.bufferProvider(allocator, .{.count = 10, .size = 32768, .max = 20_000_000});
 	defer buffer_provider.deinit();
 
 	for (cases, 0..) |case, i| {
-		std.debug.print("running case: {s}\n", .{case});
 		// if (!std.mem.eql(u8, case, "6.3.1")) continue;
+		std.debug.print("running case: {s}\n", .{case});
 
 		const path = try std.fmt.allocPrint(allocator, "/runCase?casetuple={s}&agent=websocket.zig", .{case});
 		defer allocator.free(path);
 
-		var client = try websocket.connect(allocator, "localhost", 9001, .{
-			.max_size = 20_000_000,
-			.buffer_provider = buffer_provider,
+		var client = try websocket.Client.init(allocator, .{
+			.port = 9001,
+			.host = "localhost",
+			.buffer_provider = &buffer_provider,
 		});
 		defer client.deinit();
 		const handler = Handler{.client = &client};
@@ -86,7 +87,18 @@ pub fn main() !void {
 
 		// optional, if you want to set a SO_SNDTIMEO on the socket
 		try client.stream.writeTimeout(5000);
-		try client.readLoop(handler);
+		client.readLoop(handler) catch |err| switch (err) {
+			// Each of these error cases reqiuer that we close the connection, as per
+			// the spec. You probably just want to re-connect. But, for the autobahn tests
+			// we don't want to shutdown, since autobahn is testing these invalid cases.
+			error.LargeControl => {},
+			error.ReservedFlags => {},
+			error.NestedFragment => {},
+			error.FragmentedControl => {},
+			error.InvalidMessageType => {},
+			error.UnfragmentedContinuation => {},
+			else => return err,
+		};
 		if (@rem(i, 10) == 0) {
 			try updateReport(allocator);
 		}
@@ -95,7 +107,11 @@ pub fn main() !void {
 }
 
 fn updateReport(allocator: Allocator) !void {
-	var client = try websocket.connect(allocator, "localhost", 9001, .{});
+	var client = try websocket.Client.init(allocator, .{
+		.port = 9001,
+		.host = "localhost",
+	});
+
 	defer client.deinit();
 	try client.handshake("/updateReports?agent=websocket.zig", .{
 		.headers = "host: localhost:9001\r\n",
@@ -105,9 +121,8 @@ fn updateReport(allocator: Allocator) !void {
 const Handler = struct {
 	client: *websocket.Client,
 
-	pub fn handle(self: Handler, message: websocket.Message) !void {
-		const data = message.data;
-		switch (message.type) {
+	pub fn handleMessage(self: Handler, data: []const u8, tpe: websocket.Message.TextType) !void {
+		switch (tpe) {
 			.binary => try self.client.writeBin(@constCast(data)),
 			.text => {
 				if (std.unicode.utf8ValidateSlice(data)) {
@@ -116,11 +131,6 @@ const Handler = struct {
 					self.client.closeWithCode(1007);
 				}
 			},
-			else => unreachable,
 		}
-	}
-
-	pub fn close(_: Handler) void {
-
 	}
 };

@@ -1,10 +1,10 @@
 const std = @import("std");
-const builtin = @import("builtin");
-const lib = @import("lib.zig");
+const proto = @import("proto.zig");
 
-const os = std.posix;
-const mem = std.mem;
+const posix = std.posix;
 const ArrayList = std.ArrayList;
+
+const Message = proto.Message;
 
 pub const allocator = std.testing.allocator;
 
@@ -18,8 +18,13 @@ pub const expectSlice = std.testing.expectEqualSlices;
 
 pub fn getRandom() std.Random.DefaultPrng {
 	var seed: u64 = undefined;
-	std.posix.getrandom(mem.asBytes(&seed)) catch unreachable;
+	std.posix.getrandom(std.mem.asBytes(&seed)) catch unreachable;
 	return std.Random.DefaultPrng.init(seed);
+}
+
+pub var arena = std.heap.ArenaAllocator.init(allocator);
+pub fn reset() void {
+	_ = arena.reset(.free_all);
 }
 
 pub const SocketPair = struct {
@@ -32,29 +37,29 @@ pub const SocketPair = struct {
 		var address = std.net.Address.parseIp("127.0.0.1", 0) catch unreachable;
 		var address_len = address.getOsSockLen();
 
-		const listener = os.socket(address.any.family, os.SOCK.STREAM | os.SOCK.CLOEXEC, os.IPPROTO.TCP) catch unreachable;
-		defer os.close(listener);
+		const listener = posix.socket(address.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch unreachable;
+		defer posix.close(listener);
 
 		{
 			// setup our listener
-			os.bind(listener, &address.any, address_len) catch unreachable;
-			os.listen(listener, 1) catch unreachable;
-			os.getsockname(listener, &address.any, &address_len) catch unreachable;
+			posix.bind(listener, &address.any, address_len) catch unreachable;
+			posix.listen(listener, 1) catch unreachable;
+			posix.getsockname(listener, &address.any, &address_len) catch unreachable;
 		}
 
-		const client = os.socket(address.any.family, os.SOCK.STREAM, os.IPPROTO.TCP) catch unreachable;
+		const client = posix.socket(address.any.family, posix.SOCK.STREAM, posix.IPPROTO.TCP) catch unreachable;
 		{
 			// connect the client
-			const flags =  os.fcntl(client, os.F.GETFL, 0) catch unreachable;
-			_ = os.fcntl(client, os.F.SETFL, flags | os.SOCK.NONBLOCK) catch unreachable;
-			os.connect(client, &address.any, address_len) catch |err| switch (err) {
+			const flags =  posix.fcntl(client, posix.F.GETFL, 0) catch unreachable;
+			_ = posix.fcntl(client, posix.F.SETFL, flags | posix.SOCK.NONBLOCK) catch unreachable;
+			posix.connect(client, &address.any, address_len) catch |err| switch (err) {
 				error.WouldBlock => {},
 				else => unreachable,
 			};
-			_ = os.fcntl(client, os.F.SETFL, flags) catch unreachable;
+			_ = posix.fcntl(client, posix.F.SETFL, flags) catch unreachable;
 		}
 
-		const server = os.accept(listener, &address.any, &address_len, os.SOCK.CLOEXEC) catch unreachable;
+		const server = posix.accept(listener, &address.any, &address_len, posix.SOCK.CLOEXEC) catch unreachable;
 
 		return .{
 			.random = getRandom(),
@@ -160,14 +165,16 @@ pub const SocketPair = struct {
 			buf.appendAssumeCapacity(@intCast(l & 0xFF));
 		}
 
-		// +2 for the 2 byte prefix
 		var mask: [4]u8 = undefined;
 		self.random.random().bytes(&mask);
-		buf.appendSliceAssumeCapacity(&mask);
+		// var mask = [_]u8{1, 1, 1, 1};
 
+		buf.appendSliceAssumeCapacity(&mask);
 		for (payload, 0..) |b, i| {
 			buf.appendAssumeCapacity(b ^ mask[i & 3]);
 		}
+
+
 	}
 
 	pub fn sendBuf(self: *SocketPair) void {
@@ -192,21 +199,21 @@ pub const SocketPair = struct {
 
 pub const Received = struct {
 	raw: std.ArrayList(u8),
-	messages: []lib.Message,
+	messages: []proto.Message,
 
 	fn init(raw: std.ArrayList(u8)) Received {
 		var pos: usize = 0;
 		const buf = raw.items;
 
-		var messages = std.ArrayList(lib.Message).init(allocator);
+		var messages = std.ArrayList(Message).init(allocator);
 		defer messages.deinit();
 
 		while (pos < buf.len) {
 			const message_type = switch (buf[pos] & 15) {
-				1 => lib.MessageType.text,
-				2 => lib.MessageType.binary,
-				8 => lib.MessageType.close,
-				10 => lib.MessageType.pong,
+				1 => Message.Type.text,
+				2 => Message.Type.binary,
+				8 => Message.Type.close,
+				10 => Message.Type.pong,
 				else => unreachable,
 			};
 			pos += 1;
@@ -237,7 +244,7 @@ pub const Received = struct {
 			pos = end;
 		}
 
-		const owned = allocator.alloc(lib.Message, messages.items.len) catch unreachable;
+		const owned = allocator.alloc(Message, messages.items.len) catch unreachable;
 		for (messages.items, 0..) |message, i| {
 			owned[i] = message;
 		}
