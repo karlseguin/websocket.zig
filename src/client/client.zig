@@ -472,40 +472,43 @@ fn readHandshakeReply(buf: []u8, key: []const u8, opts: *const Client.HandshakeO
 					line[i] = b + 32;
 					continue;
 				}
+
 				if (b != ':') {
 					continue;
 				}
 
-				const name = line[0..i];
-				const value = line[i+1..];
-				if (std.mem.eql(u8, name, "upgrade")) {
-					if (!ascii.eqlIgnoreCase(std.mem.trim(u8, value, &ascii.whitespace), "websocket")) {
-						return error.InvalidUpgradeHeader;
-					}
-					complete_response |= 2;
-				} else if (std.mem.eql(u8, name, "connection")) {
-					if (!ascii.eqlIgnoreCase(std.mem.trim(u8, value, &ascii.whitespace), "upgrade")) {
-						return error.InvalidConnectionHeader;
-					}
-					complete_response |= 4;
-				} else if (std.mem.eql(u8, name, "sec-websocket-accept")) {
+				switch (i) {
+					7 => if (eql(line[0..i], "upgrade")) {
+						if (!ascii.eqlIgnoreCase(std.mem.trim(u8, line[i+1..], &ascii.whitespace), "websocket")) {
+							return error.InvalidUpgradeHeader;
+						}
+						complete_response |= 2;
+					},
+					10 => if (eql(line[0..i], "connection")) {
+						if (!ascii.eqlIgnoreCase(std.mem.trim(u8, line[i+1..], &ascii.whitespace), "upgrade")) {
+							return error.InvalidConnectionHeader;
+						}
+						complete_response |= 4;
+					},
+					20 => if (eql(line[0..i], "sec-websocket-accept")) {
+						var h: [20]u8 = undefined;
+						{
+							var hasher = std.crypto.hash.Sha1.init(.{});
+							hasher.update(key);
+							hasher.update("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+							hasher.final(&h);
+						}
 
-					var h: [20]u8 = undefined;
-					{
-						var hasher = std.crypto.hash.Sha1.init(.{});
-						hasher.update(key);
-						hasher.update("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-						hasher.final(&h);
-					}
+						var encoded_buf: [28]u8 = undefined;
+						const sec_hash = std.base64.standard.Encoder.encode(&encoded_buf, &h);
+						const header_value = std.mem.trim(u8, line[i+1..], &ascii.whitespace);
 
-					var encoded_buf: [28]u8 = undefined;
-					const sec_hash = std.base64.standard.Encoder.encode(&encoded_buf, &h);
-					const header_value = std.mem.trim(u8, value, &ascii.whitespace);
-
-					if (!std.mem.eql(u8, header_value, sec_hash)) {
-						return error.InvalidWebsocketAcceptHeader;
-					}
-					complete_response |= 8;
+						if (!std.mem.eql(u8, header_value, sec_hash)) {
+							return error.InvalidWebsocketAcceptHeader;
+						}
+						complete_response |= 8;
+					},
+					else => {}, // some other header we don't care about
 				}
 			}
 		}
@@ -518,6 +521,17 @@ fn readHandshakeReply(buf: []u8, key: []const u8, opts: *const Client.HandshakeO
 			return error.ResponseTooLarge;
 		}
 	}
+}
+
+// avoids the len check and pointer check of std.mem.eql
+// we can skip the length check because this is only called when a.len == b.len
+fn eql(a: []const u8, b: []const u8) bool {
+	for (a, b) |aa, bb| {
+		if (aa != bb) {
+			return false;
+		}
+	}
+	return true;
 }
 
 // const t = @import("../t.zig");
