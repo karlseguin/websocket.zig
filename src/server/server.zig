@@ -1,5 +1,6 @@
 const std = @import("std");
-const lib = @import("lib.zig");
+const proto = @import("../proto.zig");
+const buffer = @import("../buffer.zig");
 
 const net = std.net;
 const posix = std.posix;
@@ -8,11 +9,10 @@ const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.websocket);
 
-const Reader = lib.Reader;
-const buffer = lib.buffer;
-const Message = lib.Message;
-const Handshake = lib.Handshake;
-const OpCode = lib.framing.OpCode;
+const OpCode = proto.OpCode;
+const Reader = proto.Reader;
+const Message = proto.Message;
+const Handshake = @import("handshake.zig").Handshake;
 
 const MAX_TIMEOUT = 2_147_483_647;
 const DEFAULT_WORKER_COUNT = 1;
@@ -32,7 +32,7 @@ const force_blocking: bool = blk: {
 };
 
 pub fn blockingMode() bool {
-	return false;
+	return true;
 	// if (force_blocking) {
 	// 	return true;
 	// }
@@ -45,9 +45,10 @@ pub fn blockingMode() bool {
 pub const Config = struct {
 	port: ?u16 = null,
 	address: []const u8 = "127.0.0.1",
+	unix_path: ?[]const u8 = null,
+
 	max_size: usize = 65536,
 	buffer_size: usize = 4096,
-	unix_path: ?[]const u8 = null,
 
 	workers: Workers = .{},
 	shutdown: Shutdown = .{},
@@ -80,9 +81,9 @@ pub const Config = struct {
 pub fn Server(comptime H: type) type {
 	return struct {
 		config: Config,
+		bp: buffer.Provider,
 		allocator: Allocator,
 		cond: Thread.Condition,
-		buffer_provider: buffer.Provider,
 		signals: [][2]posix.fd_t,
 
 		const Self = @This();
@@ -91,27 +92,24 @@ pub fn Server(comptime H: type) type {
 			const signals = try allocator.alloc([2]posix.fd_t, config.workers.count orelse DEFAULT_WORKER_COUNT);
 			errdefer allocator.free(signals);
 
-			const buffer_pool = try allocator.create(buffer.Pool);
-			errdefer allocator.destroy(buffer_pool);
-
-			const large_buffer_count = config.large_buffers.count orelse 32;
-			buffer_pool.* = try buffer.Pool.init(allocator, large_buffer_count, config.large_buffers.size orelse 32768);
-			errdefer buffer_pool.deinit();
-
-			const buffer_provider = buffer.Provider.init(allocator, buffer_pool, large_buffer_count);
+			const bp = try buffer.Provider.init(allocator, .{
+				.max = config.max_size,
+				.count = config.large_buffers.count orelse 8,
+				.size = config.large_buffers.size orelse @min(config.buffer_size * 2, config.max_size),
+			});
+			errdefer bp.deinit();
 
 			return .{
+				.bp = bp,
 				.cond = .{},
 				.config = config,
 				.signals = signals,
 				.allocator = allocator,
-				.buffer_provider = buffer_provider,
 			};
 		}
 
 		pub fn deinit(self: *Self) void {
-			self.buffer_provider.pool.deinit();
-			self.allocator.destroy(self.buffer_provider.pool);
+			self.bp.deinit();
 			self.allocator.free(self.signals);
 		}
 
@@ -140,10 +138,10 @@ pub fn Server(comptime H: type) type {
 
 			const socket = blk: {
 				var sock_flags: u32 = posix.SOCK.STREAM | posix.SOCK.CLOEXEC;
-				if (lib.blockingMode() == false) sock_flags |= posix.SOCK.NONBLOCK;
+				if (blockingMode() == false) sock_flags |= posix.SOCK.NONBLOCK;
 
-				const proto = if (address.any.family == posix.AF.UNIX) @as(u32, 0) else posix.IPPROTO.TCP;
-				break :blk try posix.socket(address.any.family, sock_flags, proto);
+				const socket_proto = if (address.any.family == posix.AF.UNIX) @as(u32, 0) else posix.IPPROTO.TCP;
+				break :blk try posix.socket(address.any.family, sock_flags, socket_proto);
 			};
 
 			if (no_delay) {
@@ -166,10 +164,10 @@ pub fn Server(comptime H: type) type {
 			{
 				const socklen = address.getOsSockLen();
 				try posix.bind(socket, &address.any, socklen);
-				try posix.listen(socket, 1204); // kernel backlog
+				try posix.listen(socket, 1024); // kernel backlog
 			}
 
-			if (comptime lib.blockingMode()) {
+			if (comptime blockingMode()) {
 				errdefer posix.close(socket);
 				var w = try Blocking(H).init(self);
 				defer w.deinit();
@@ -232,12 +230,12 @@ pub fn Server(comptime H: type) type {
 fn Blocking(comptime H: type) type {
 	return struct {
 		running: bool,
+		bp: *buffer.Provider,
 		allocator: Allocator,
 		config: *const Config,
 		handshake_timeout: Timeout,
 		handshake_max_size: u16,
 		handshake_max_headers: u16,
-		buffer_provider: *buffer.Provider,
 
 		// protects access to the conn_list and conn_pool
 		conn_lock: Thread.Mutex,
@@ -267,13 +265,13 @@ fn Blocking(comptime H: type) type {
 			errdefer conn_pool.deinit();
 
 			return .{
+				.bp = &server.bp,
 				.running = true,
 				.config = config,
 				.conn_list = .{},
 				.conn_lock = .{},
 				.conn_pool = conn_pool,
 				.allocator = allocator,
-				.buffer_provider = &server.buffer_provider,
 				.handshake_timeout = Timeout.init(config.handshake.timeout orelse MAX_TIMEOUT),
 				.handshake_max_size = config.handshake.max_size orelse DEFAULT_MAX_HANDSHAKE_SIZE,
 				.handshake_max_headers = config.handshake.max_headers orelse 0,
@@ -315,7 +313,9 @@ fn Blocking(comptime H: type) type {
 		// Wrapper around _handleConnection so that we can handle erros
 		fn handleConnection(self: *Self, socket: posix.socket_t, context: anytype) void {
 			defer posix.close(socket);
-			self._handleConnection(socket, context) catch |err| log.err("Connection thread initialization error: {}", .{err});
+			self._handleConnection(socket, context) catch |err| {
+				log.err("Connection thread initialization error: {}", .{err});
+			};
 		}
 
 		fn _handleConnection(self: *Self, socket: posix.socket_t, context: anytype) !void {
@@ -325,6 +325,7 @@ fn Blocking(comptime H: type) type {
 
 				const hc = try self.conn_pool.create();
 				hc.* = .{
+					.reader = undefined,
 					.handler = undefined,
 					.conn = .{
 						._closed = false,
@@ -339,49 +340,71 @@ fn Blocking(comptime H: type) type {
 				break :blk hc;
 			};
 
-			var conn = &hc.conn;
-
 			defer {
 				self.conn_lock.lock();
 				self.conn_list.remove(hc);
 				self.conn_pool.destroy(hc);
 				self.conn_lock.unlock();
 			}
+			var conn = &hc.conn;
 
 			hc.handler = (try self.doHandshake(conn, context)) orelse return;
 
-			var handler = &hc.handler;
 			defer if (comptime std.meta.hasFn(H, "close")) {
-				handler.close();
+				hc.handler.close();
 			};
 
 			if (comptime std.meta.hasFn(H, "afterInit")) {
-				handler.afterInit() catch return;
+				hc.handler.afterInit() catch return;
 			}
 
-			const config = self.config;
-			var reader = Reader.init(config.buffer_size, config.max_size, self.buffer_provider) catch |err| {
+			// we delay initializing the reader until AFTER the handshake to avoid
+			// unecessarily acllocate config.buffer_size
+			hc.reader = Reader.init(self.config.buffer_size, self.bp) catch |err| {
 				log.err("Failed to create a Reader, connection is being closed. The error was: {}", .{err});
 				return;
 			};
+
+			var reader = &hc.reader;
 			defer reader.deinit();
 
 			while (true) {
-				const message = reader.readMessage(conn.stream) catch |err| {
-					switch (err) {
-						error.LargeControl => conn.writeFramed(CLOSE_PROTOCOL_ERROR) catch {},
-						error.ReservedFlags => conn.writeFramed(CLOSE_PROTOCOL_ERROR) catch {},
-						else => {},
-					}
-					return;
+
+				// fill our reader buffer with more data
+				reader.fill(hc.conn.stream) catch |err| switch (err) {
+					error.BrokenPipe, error.Closed, error.ConnectionResetByPeer => return,
+					else => return err,
 				};
 
-				handleMessage(H, handler, conn, message) catch return;
-				// TODO: thread safety
-				if (conn._closed) {
-					return;
-				}
+				while (true) {
+					const has_more, const message = reader.read() catch |err| {
+						switch (err) {
+							error.LargeControl => conn.writeFramed(CLOSE_PROTOCOL_ERROR) catch {},
+							error.ReservedFlags => conn.writeFramed(CLOSE_PROTOCOL_ERROR) catch {},
+							else => {},
+						}
+						return;
+					} orelse break; // orelse, we need more data, go back to fill the buffer from the stream
 
+					// Is it ok to swallow these errors?
+					// It should be. handleMesage doesn't do any allocations.
+					// The error is either a result of a failed socket write, or an
+					// error returned by the handler, which, if the app cares about, they
+					// can handle within the handler itself.
+					handleMessage(H, hc, message) catch return;
+
+					// TODO: thread safety
+					if (conn._closed) {
+						return;
+					}
+
+					if (has_more == false) {
+						// we don't have more data ready to be processed in our buffer
+						// break out of the inner loop, back to the outer loop, where
+						// we'll read more from the stream into our buffer
+						break;
+					}
+				}
 			}
 		}
 
@@ -452,9 +475,9 @@ fn NonBlocking(comptime H: type) type {
 		// KQueue or Epoll, depending on the platform
 		loop: Loop,
 
+		bp: *buffer.Provider,
 		allocator: Allocator,
 		config: *const Config,
-		buffer_provider: *buffer.Provider,
 
 		max_conn: usize,
 		conn_list: List(HandlerConn(H)),
@@ -481,10 +504,10 @@ fn NonBlocking(comptime H: type) type {
 			return .{
 				.loop = loop,
 				.config = config,
+				.bp = &server.bp,
 				.conn_list = .{},
 				.conn_pool = conn_pool,
 				.allocator = allocator,
-				.buffer_provider = &server.buffer_provider,
 				.max_conn = config.workers.max_conn orelse 8192,
 			};
 		}
@@ -784,6 +807,7 @@ fn HandlerConn(comptime H: type) type {
 	return struct {
 		conn: Conn,
 		handler: H,
+		reader: Reader,
 		next: ?*HandlerConn(H) = null,
 		prev: ?*HandlerConn(H) = null,
 	};
@@ -809,7 +833,7 @@ pub const Conn = struct {
 
 	pub fn blocking(self: *Conn) !void {
 		// in blockingMode, io_mode is ALWAYS blocking, so we can skip this
-		if (comptime lib.blockingMode() == false) {
+		if (comptime blockingMode() == false) {
 			if (@atomicRmw(IOMode, &self._io_mode, .Xchg, .blocking, .monotonic) == .nonblock) {
 				// we don't care if the above check + this call isn't atomic.
 				// at worse, we're doing an unecessary syscall
@@ -893,8 +917,12 @@ pub const Conn = struct {
 	}
 };
 
-fn handleMessage(comptime H: type, handler: *H, conn: *Conn, message: Message) !void {
+fn handleMessage(comptime H: type, hc: *HandlerConn(H), message: Message) !void {
 	const message_type = message.type;
+	defer hc.reader.done(message_type);
+
+	const handler = &hc.handler;
+
 	switch (message_type) {
 		.text, .binary => {
 			switch (comptime @typeInfo(@TypeOf(H.handleMessage)).Fn.params.len) {
@@ -902,8 +930,6 @@ fn handleMessage(comptime H: type, handler: *H, conn: *Conn, message: Message) !
 				3 => try handler.handleMessage(message.data, if (message_type == .text) .text else .binary),
 				else => @compileError(@typeName(H) ++ ".handleMessage must accept 2 or 3 parameters"),
 			}
-			// TODO
-			// reader.handled();
 		},
 		.pong => if (comptime std.meta.hasFn(H, "handlePong")) {
 			try handler.handlePong();
@@ -913,12 +939,13 @@ fn handleMessage(comptime H: type, handler: *H, conn: *Conn, message: Message) !
 			if (comptime std.meta.hasFn(H, "handlePing")) {
 				try handler.handlePing(data);
 			} else if (data.len == 0) {
-				try conn.writeFramed(EMPTY_PONG);
+				try hc.conn.writeFramed(EMPTY_PONG);
 			} else {
-				try conn.writeFrame(.pong, data);
+				try hc.conn.writeFrame(.pong, data);
 			}
 		},
 		.close => {
+			const conn = &hc.conn;
 			defer conn.close();
 			const data = message.data;
 			if (comptime std.meta.hasFn(H, "handleClose")) {
@@ -1081,7 +1108,7 @@ fn List(comptime T: type) type {
 	};
 }
 
-const t = lib.testing;
+const t = @import("../t.zig");
 test "List: insert & remove" {
 	var list = List(TestNode){};
 	try expectList(&.{}, list);

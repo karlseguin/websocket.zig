@@ -1,11 +1,18 @@
 const std = @import("std");
 
+pub const buffer = @import("buffer.zig");
+
 pub const proto = @import("proto.zig");
 pub const OpCode = proto.OpCode;
 pub const Message = proto.Message;
 
-pub const buffer = @import("buffer.zig");
 pub const Client = @import("client/client.zig").Client;
+
+const server = @import("server/server.zig");
+
+pub const Conn = server.Conn;
+pub const Server = server.Server;
+pub const Handshake = @import("server/handshake.zig").Handshake;
 
 pub fn bufferProvider(allocator: std.mem.Allocator, config: buffer.Config) !buffer.Provider {
 	return buffer.Provider.init(allocator, config);

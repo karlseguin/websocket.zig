@@ -11,10 +11,10 @@ const Handshake = websocket.Handshake;
 pub const io_mode = .evented;
 
 pub fn main() !void {
-	var general_purpose_allocator = std.heap.GeneralPurposeAllocator(.{}){};
-	defer _ = general_purpose_allocator.detectLeaks();
+	var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+	defer _ = gpa.detectLeaks();
 
-	const allocator = general_purpose_allocator.allocator();
+	const allocator = gpa.allocator();
 
 	var server = try websocket.Server(Handler).init(allocator, .{
 		.port = 9223,
@@ -51,11 +51,7 @@ pub fn main() !void {
 
 	// Start websocket listening on the given port,
 	// speficying the handler struct that will servi
-	var thrd = try server.listenInNewThread(&context);
-	std.time.sleep(std.time.ns_per_s * 2);
-	server.stop();
-	thrd.join();
-
+	try server.listen(&context);
 }
 
 const Context = struct {};
@@ -71,7 +67,7 @@ const Handler = struct {
 		};
 	}
 
-	pub fn handleMessage(self: *Handler, data: []const u8, tpe: websocket.TextType) !void {
+	pub fn handleMessage(self: *Handler, data: []const u8, tpe: websocket.Message.TextType) !void {
 		switch (tpe) {
 			.binary => try self.conn.writeBin(data),
 			.text => {

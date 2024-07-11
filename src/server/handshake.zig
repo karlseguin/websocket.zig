@@ -1,5 +1,4 @@
 const std = @import("std");
-const lib = @import("lib.zig");
 
 const posix = std.posix;
 const ascii = std.ascii;
@@ -194,7 +193,7 @@ fn eql(a: []const u8, b: []const u8) bool {
 	return true;
 }
 
-const t = lib.testing;
+const t = @import("../t.zig");
 // const readRequest = @import("server.zig").readRequest;
 // test "handshake: parse" {
 // 	var buffer: [512]u8 = undefined;

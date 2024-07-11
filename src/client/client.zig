@@ -71,26 +71,14 @@ pub const Client = struct {
 		if (config.buffer_provider) |shared_bp| {
 			bp = shared_bp;
 		} else {
-
+			own_bp = true;
 			bp = try allocator.create(buffer.Provider);
 			errdefer allocator.destroy(bp);
-
-			if (config.max_size == config.buffer_size) {
-				// no point allocating a large buffer, since we can't accept messages
-				// larger than our static buffer
-				bp.* = try buffer.Provider.init(allocator, .{
-					.size = 0,
-					.count = 0,
-					.max = config.max_size,
-				});
-			} else {
-				bp.* = try buffer.Provider.init(allocator, .{
-					.count = 1,
-					.size = config.max_size,
-					.max = @min(65536, config.max_size),
-				});
-			}
-			own_bp = true;
+			bp.* = try buffer.Provider.init(allocator, .{
+				.size = 0,
+				.count = 0,
+				.max = config.max_size,
+			});
 		}
 
 		errdefer if (own_bp) {
