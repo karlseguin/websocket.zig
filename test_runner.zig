@@ -89,7 +89,7 @@ pub fn main() !void {
 		}
 
 		if (env.verbose) {
-			const ms = @as(f64, @floatFromInt(ns_taken)) / 100_000.0;
+			const ms = @as(f64, @floatFromInt(ns_taken)) / 1_000_000.0;
 			printer.status(status, "{s} ({d:.2}ms)\n", .{friendly_name, ms});
 		} else {
 			printer.status(status, ".", .{});
@@ -209,7 +209,7 @@ const SlowTracker = struct {
 				const count = slowest.count();
 				printer.fmt("Slowest {d} test{s}: \n", .{count, if (count != 1) "s" else ""});
 				while (slowest.removeMinOrNull()) |info| {
-						const ms = @as(f64, @floatFromInt(info.ns)) / 100_000.0;
+						const ms = @as(f64, @floatFromInt(info.ns)) / 1_000_000.0;
 						printer.fmt("  {d:.2}ms\t{s}\n", .{ms, info.name});
 				}
 		}

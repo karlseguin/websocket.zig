@@ -160,7 +160,10 @@ pub const Client = struct {
 					return err;
 				} orelse break; // orelse, we don't have enough data, so break out of the inner loop, and go get more data from the socket in the outer loop
 
+
 				const message_type = message.type;
+				defer reader.done(message_type);
+
 				switch (message_type) {
 					.text, .binary => {
 						switch (comptime @typeInfo(@TypeOf(H.handleMessage)).Fn.params.len) {
@@ -168,7 +171,6 @@ pub const Client = struct {
 							3 => try handler.handleMessage(message.data, if (message_type == .text) .text else .binary),
 							else => @compileError(@typeName(H) ++ ".handleMessage must accept 2 or 3 parameters"),
 						}
-						reader.done();
 					},
 					.ping => if (comptime std.meta.hasFn(H, "handlePing")) {
 						try handler.handlePing(message.data);

@@ -27,103 +27,52 @@ pub fn reset() void {
 	_ = arena.reset(.free_all);
 }
 
-pub const SocketPair = struct {
+pub const Writer = struct {
+	pos: usize,
 	buf: std.ArrayList(u8),
-	client: std.net.Stream,
-	server: std.net.Stream,
 	random: std.Random.DefaultPrng,
 
-	pub fn init() SocketPair {
-		var address = std.net.Address.parseIp("127.0.0.1", 0) catch unreachable;
-		var address_len = address.getOsSockLen();
-
-		const listener = posix.socket(address.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch unreachable;
-		defer posix.close(listener);
-
-		{
-			// setup our listener
-			posix.bind(listener, &address.any, address_len) catch unreachable;
-			posix.listen(listener, 1) catch unreachable;
-			posix.getsockname(listener, &address.any, &address_len) catch unreachable;
-		}
-
-		const client = posix.socket(address.any.family, posix.SOCK.STREAM, posix.IPPROTO.TCP) catch unreachable;
-		{
-			// connect the client
-			const flags =  posix.fcntl(client, posix.F.GETFL, 0) catch unreachable;
-			_ = posix.fcntl(client, posix.F.SETFL, flags | posix.SOCK.NONBLOCK) catch unreachable;
-			posix.connect(client, &address.any, address_len) catch |err| switch (err) {
-				error.WouldBlock => {},
-				else => unreachable,
-			};
-			_ = posix.fcntl(client, posix.F.SETFL, flags) catch unreachable;
-		}
-
-		const server = posix.accept(listener, &address.any, &address_len, posix.SOCK.CLOEXEC) catch unreachable;
-
+	pub fn init() Writer {
 		return .{
+			.pos = 0,
 			.random = getRandom(),
-			.client = .{.handle = client},
-			.server = .{.handle = server},
 			.buf = std.ArrayList(u8).init(allocator),
 		};
 	}
 
-	pub fn deinit(self: *SocketPair) void {
+	pub fn deinit(self: *const Writer) void {
 		self.buf.deinit();
-		// assume test closes self.server
-		self.client.close();
 	}
 
-	pub fn handshakeRequest(self: SocketPair) void {
-		self.client.writeAll("GET / HTTP/1.1\r\n" ++
-			"Connection: upgrade\r\n" ++
-			"Upgrade: websocket\r\n" ++
-			"Sec-websocket-version: 13\r\n" ++
-			"Sec-websocket-key: leto\r\n\r\n"
-		) catch unreachable;
-	}
-
-	pub fn handshakeReply(self: SocketPair) !void {
-		var pos: usize = 0;
-		var buf: [1024]u8 = undefined;
-		while (true) {
-			const n = try self.client.read(buf[pos..]);
-			if (n == 0) {
-				return error.Closed;
-			}
-			pos += n;
-			if (std.mem.endsWith(u8, buf[0..pos], "\r\n\r\n")) {
-				return;
-			}
-		}
-	}
-
-	pub fn ping(self: *SocketPair) void {
+	pub fn ping(self: *Writer) void {
 		return self.pingPayload("");
 	}
 
-	pub fn pingPayload(self: *SocketPair, payload: []const u8) void {
+	pub fn pong(self: *Writer) void {
+		return self.frame(true, 10, "", 0);
+	}
+
+	pub fn pingPayload(self: *Writer, payload: []const u8) void {
 		return self.frame(true, 9, payload, 0);
 	}
 
-	pub fn textFrame(self: *SocketPair, fin: bool, payload: []const u8) void {
+	pub fn textFrame(self: *Writer, fin: bool, payload: []const u8) void {
 		return self.frame(fin, 1, payload, 0);
 	}
 
-	pub fn binaryFrame(self: *SocketPair, fin: bool, payload: []const u8) void {
+	pub fn binaryFrame(self: *Writer, fin: bool, payload: []const u8) void {
 		return self.frame(fin, 2, payload, 0);
 	}
 
-	pub fn textFrameReserved(self: *SocketPair, fin: bool, payload: []const u8, reserved: u8) void {
+	pub fn textFrameReserved(self: *Writer, fin: bool, payload: []const u8, reserved: u8) void {
 		return self.frame(fin, 1, payload, reserved);
 	}
 
-	pub fn cont(self: *SocketPair, fin: bool, payload: []const u8) void {
+	pub fn cont(self: *Writer, fin: bool, payload: []const u8) void {
 		return self.frame(fin, 0, payload, 0);
 	}
 
-	pub fn frame(self: *SocketPair, fin: bool, op_code: u8, payload: []const u8, reserved: u8) void {
+	pub fn frame(self: *Writer, fin: bool, op_code: u8, payload: []const u8, reserved: u8) void {
 		var buf = &self.buf;
 
 		const l = payload.len;
@@ -173,13 +122,133 @@ pub const SocketPair = struct {
 		for (payload, 0..) |b, i| {
 			buf.appendAssumeCapacity(b ^ mask[i & 3]);
 		}
+	}
 
+	pub fn bytes(self: *const Writer) []const u8 {
+		return self.buf.items;
+	}
 
+	pub fn clear(self: *Writer) void {
+		self.pos = 0;
+		self.buf.clearRetainingCapacity();
+	}
+
+	pub fn read(self: *Writer, buf: []u8,) !usize {
+		const data = self.buf.items[self.pos..];
+
+		if (data.len == 0 or buf.len == 0) {
+			return 0;
+		}
+
+		// randomly fragment the data
+		const to_read = self.random.random().intRangeAtMost(usize, 1, @min(data.len, buf.len));
+		@memcpy(buf[0..to_read], data[0..to_read]);
+		self.pos += to_read;
+		return to_read;
+	}
+};
+
+pub const SocketPair = struct {
+	writer: Writer,
+	client: std.net.Stream,
+	server: std.net.Stream,
+
+	pub fn init() SocketPair {
+		var address = std.net.Address.parseIp("127.0.0.1", 0) catch unreachable;
+		var address_len = address.getOsSockLen();
+
+		const listener = posix.socket(address.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch unreachable;
+		defer posix.close(listener);
+
+		{
+			// setup our listener
+			posix.bind(listener, &address.any, address_len) catch unreachable;
+			posix.listen(listener, 1) catch unreachable;
+			posix.getsockname(listener, &address.any, &address_len) catch unreachable;
+		}
+
+		const client = posix.socket(address.any.family, posix.SOCK.STREAM, posix.IPPROTO.TCP) catch unreachable;
+		{
+			// connect the client
+			const flags =  posix.fcntl(client, posix.F.GETFL, 0) catch unreachable;
+			_ = posix.fcntl(client, posix.F.SETFL, flags | posix.SOCK.NONBLOCK) catch unreachable;
+			posix.connect(client, &address.any, address_len) catch |err| switch (err) {
+				error.WouldBlock => {},
+				else => unreachable,
+			};
+			_ = posix.fcntl(client, posix.F.SETFL, flags) catch unreachable;
+		}
+
+		const server = posix.accept(listener, &address.any, &address_len, posix.SOCK.CLOEXEC) catch unreachable;
+
+		return .{
+			.client = .{.handle = client},
+			.server = .{.handle = server},
+			.writer = Writer.init(),
+		};
+	}
+
+	pub fn deinit(self: *SocketPair) void {
+		self.writer.deinit();
+		// assume test closes self.server
+		self.client.close();
+	}
+
+	pub fn handshakeRequest(self: SocketPair) void {
+		self.client.writeAll("GET / HTTP/1.1\r\n" ++
+			"Connection: upgrade\r\n" ++
+			"Upgrade: websocket\r\n" ++
+			"Sec-websocket-version: 13\r\n" ++
+			"Sec-websocket-key: leto\r\n\r\n"
+		) catch unreachable;
+	}
+
+	pub fn handshakeReply(self: SocketPair) !void {
+		var pos: usize = 0;
+		var buf: [1024]u8 = undefined;
+		while (true) {
+			const n = try self.client.read(buf[pos..]);
+			if (n == 0) {
+				return error.Closed;
+			}
+			pos += n;
+			if (std.mem.endsWith(u8, buf[0..pos], "\r\n\r\n")) {
+				return;
+			}
+		}
+	}
+
+	pub fn ping(self: *SocketPair) void {
+		self.writer.pint();
+	}
+
+	pub fn pingPayload(self: *SocketPair, payload: []const u8) void {
+		self.writer.pingPayload(payload);
+	}
+
+	pub fn textFrame(self: *SocketPair, fin: bool, payload: []const u8) void {
+		self.writer.textFrame(fin, payload);
+	}
+
+	pub fn binaryFrame(self: *SocketPair, fin: bool, payload: []const u8) void {
+		self.writer.binaryFrame(fin, payload);
+	}
+
+	pub fn textFrameReserved(self: *SocketPair, fin: bool, payload: []const u8, reserved: u8) void {
+		self.writer.textFrameReserved(fin, payload, reserved);
+	}
+
+	pub fn cont(self: *SocketPair, fin: bool, payload: []const u8) void {
+		self.writer.cont(fin, payload);
+	}
+
+	pub fn frame(self: *SocketPair, fin: bool, op_code: u8, payload: []const u8, reserved: u8) void {
+		self.writer.frame(fin, op_code, payload, reserved);
 	}
 
 	pub fn sendBuf(self: *SocketPair) void {
-		self.client.writeAll(self.buf.items) catch unreachable;
-		self.buf.clearRetainingCapacity();
+		self.client.writeAll(self.writer.bytes()) catch unreachable;
+		self.writer.clear();
 	}
 
 	pub fn asReceived(self: SocketPair) Received {

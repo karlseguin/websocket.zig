@@ -124,8 +124,9 @@ pub const Reader = struct {
 		// But if there IS more data, we need to process it then and there.
 
 		loop: while (true) {
+			const pos = self.pos;
 			const start = self.start;
-			var buf = self.buf.data[start..self.pos];
+			var buf = self.buf.data[start..pos];
 
 			if (buf.len < 2) {
 				// not enough data yet
@@ -134,16 +135,17 @@ pub const Reader = struct {
 
 			const byte1 = buf[0];
 			const byte2 = buf[1];
+			const data_len = pos - start;
 
 			var masked = false;
-			var length_of_length: usize = 0;
+			var length_of_len: usize = 0;
 			var message_len = self.message_len;
 
 			if (message_len == 0) {
-				masked, length_of_length = payloadMeta(byte2);
+				masked, length_of_len = payloadMeta(byte2);
 
 				// + 1 for the first byte
-				if (buf.len < length_of_length + 1) {
+				if (buf.len < length_of_len + 2) {
 					// at this point, we don't have enough bytes to know the length of
 					// the message. We need more data
 					return null;
@@ -151,11 +153,11 @@ pub const Reader = struct {
 
 				// At this point, we're sure that we have at least enough bytes to know
 				// the total length of the message.
-				message_len = switch (length_of_length) {
+				message_len = switch (length_of_len) {
 					2 => @as(u16, @intCast(buf[3])) | @as(u16, @intCast(buf[2])) << 8,
 					8 => @as(u64, @intCast(buf[9])) | @as(u64, @intCast(buf[8])) << 8 | @as(u64, @intCast(buf[7])) << 16 | @as(u64, @intCast(buf[6])) << 24 | @as(u64, @intCast(buf[5])) << 32 | @as(u64, @intCast(buf[4])) << 40 | @as(u64, @intCast(buf[3])) << 48 | @as(u64, @intCast(buf[2])) << 56,
 					else => buf[1] & 127,
-				} + length_of_length + 2; // + 2 for the 2 byte prefix
+				} + length_of_len + 2; // + 2 for the 2 byte prefix
 
 				masked = byte2 & 128 == 128;
 				if (masked) {
@@ -167,9 +169,6 @@ pub const Reader = struct {
 
 				if (self.buf.data.len < message_len) {
 					// We don't have enough space in our buffer.
-
-					const pos = self.pos;
-					const data_len = pos - start;
 
 					const current_buf = self.buf;
 					defer self.bp.release(current_buf);
@@ -188,8 +187,6 @@ pub const Reader = struct {
 
 					const available_space = self.buf.data.len - start;
 					if (available_space < message_len) {
-						const pos = self.pos;
-						const data_len = pos - start;
 						std.mem.copyForwards(u8, self.buf.data[0..data_len], self.buf.data[start..pos]);
 						self.start = 0;
 						self.pos = data_len;
@@ -198,7 +195,7 @@ pub const Reader = struct {
 				}
 			}
 
-			if (buf.len < message_len) {
+			if (data_len < message_len) {
 				// we don't have enough data for the full message
 				return null;
 			}
@@ -211,8 +208,8 @@ pub const Reader = struct {
 			// to loop because of fragmentation), we'll start a new message from scratch.
 			self.message_len = 0;
 
-			if (length_of_length == 0) {
-				masked, length_of_length = payloadMeta(byte2);
+			if (length_of_len == 0) {
+				masked, length_of_len = payloadMeta(byte2);
 			}
 
 			var is_continuation = false;
@@ -233,11 +230,11 @@ pub const Reader = struct {
 				return error.ReservedFlags;
 			}
 
-			if (!is_continuation and length_of_length != 0 and (message_type == .ping or message_type == .close or message_type == .pong)) {
+			if (!is_continuation and length_of_len != 0 and (message_type == .ping or message_type == .close or message_type == .pong)) {
 				return error.LargeControl;
 			}
 
-			const header_length = 2 + length_of_length + @as(usize, if (masked) 4 else 0);
+			const header_length = 2 + length_of_len + @as(usize, if (masked) 4 else 0);
 
 			const fin = byte1 & 128 == 128;
 			const payload = buf[header_length..message_len];
@@ -316,10 +313,12 @@ pub const Reader = struct {
 	// There's some cleanup in read that we can't do until after the client has
 	// had the chance to read the message. We don't want to wait for the next
 	// call to "read" to do this, because we don't know when that'll be.
-	pub fn done(self: *Reader) void {
-		if (self.fragment) |f| {
-			f.deinit();
-			self.fragment = null;
+	pub fn done(self: *Reader, message_type: Message.Type) void {
+		if (message_type == .text or message_type == .binary) {
+			if (self.fragment) |f| {
+				f.deinit();
+				self.fragment = null;
+			}
 		}
 		self.restoreStatic();
 	}
@@ -485,7 +484,7 @@ test "mask" {
 	t.allocator.free(payload);
 }
 
-test "Reader: read too larrge" {
+test "Reader: read too large" {
 	defer t.reset();
 
 	var pair = t.SocketPair.init();
@@ -524,6 +523,128 @@ test "Reader: exact read into static with no overflow" {
 	var reader = testReader(.{.max = 12, .static = 12});
 	defer reader.deinit();
 	try t.expectString("hello!", (try testRead(&reader, pair)).data);
+}
+
+test "Reader: fuzz" {
+	defer t.reset();
+	var r = t.getRandom();
+	const random = r.random();
+
+	for (0..1000) |_| {
+		defer _ =  t.arena.reset(.{.retain_capacity = {}});
+		const arena = t.arena.allocator();
+
+		const MAX_FRAGMENTS = random.intRangeAtMost(u32, 1, 4);
+		const MESSAGE_TO_SEND = random.intRangeAtMost(u32, 1, 500);
+		const MAX_PAYLOAD_SIZE = random.intRangeAtMost(u32, 200, 1000);
+		const MAX_MESSAGE_SIZE = MAX_PAYLOAD_SIZE + 14;
+		var scrap = try arena.alloc(u8, MAX_PAYLOAD_SIZE);
+
+		var writer = t.Writer.init();
+		defer writer.deinit();
+
+		var expected = try arena.alloc(Message, MESSAGE_TO_SEND);
+
+		var is_fragmented = false;
+		var fragment_count: usize = 0;
+		var fragment = std.ArrayList(u8).init(arena);
+
+		var i: usize = 0;
+		while (i < MESSAGE_TO_SEND) {
+			if (is_fragmented == false) {
+				// this is rare
+				is_fragmented = random.intRangeAtMost(u8, 0, 8) == 0;
+				fragment_count = 0;
+			}
+
+			// a non-fragmented message is always "fin"
+			// and we'll force a "fin" after ~ 4 messages.
+			const is_fin = is_fragmented == false or random.intRangeAtMost(u8, 0, 3) == 0 or fragment_count == MAX_FRAGMENTS;
+			switch (random.intRangeAtMost(u16, 0, 11)) {
+				0...8 => { // we mostly expect text or binary messages
+					const buf = scrap[0..random.intRangeAtMost(u32, 0, MAX_PAYLOAD_SIZE)];
+					random.bytes(buf);
+					if (is_fragmented == false) {
+						writer.textFrame(true, buf);
+						expected[i] = .{.type = .text, .data = try arena.dupe(u8, buf)};
+						i += 1;
+					} else {
+						if (fragment_count == 0) {
+							// the first part of our fragmented message
+							writer.textFrame(is_fin, buf);
+						} else {
+							writer.cont(is_fin, buf);
+						}
+						fragment_count += 1;
+
+						try fragment.appendSlice(try arena.dupe(u8, buf));
+
+						if (is_fin) {
+							// this was the last message in our fragment
+							expected[i] = .{.type = .text, .data = try arena.dupe(u8, fragment.items)};
+
+							i += 1;
+							is_fragmented = false;
+							fragment.clearRetainingCapacity();
+						}
+					}
+				},
+				9 => {
+					// empty ping
+					writer.ping();
+					expected[i] = .{.type = .ping, .data = ""};
+					i += 1;
+				},
+				10 => {
+					// ping with data
+					const buf = scrap[0..random.intRangeAtMost(u32, 1, 125)];
+					random.bytes(buf);
+					writer.pingPayload(buf);
+					expected[i] = .{.type = .ping, .data = try arena.dupe(u8, buf)};
+					i += 1;
+				},
+				11 => {
+					writer.pong();
+					expected[i] = .{.type = .pong, .data = ""};
+					i += 1;
+				},
+				else => unreachable,
+			}
+		}
+
+		// test with various buffer sizes, and large buffer pools enabled/disabled
+		const static_size = random.intRangeAtMost(u32, 20, MAX_MESSAGE_SIZE + 200);
+		const large_buffer_count = random.intRangeAtMost(u16, 0, 1);
+		const large_buffer_size = random.intRangeAtMost(u32, static_size, MAX_MESSAGE_SIZE * 2);
+
+		// fragmentation could make messages very large
+		var reader = testReader(.{.max = MAX_MESSAGE_SIZE * (MAX_FRAGMENTS+1), .static = static_size, .count = large_buffer_count, .size = large_buffer_size});
+		defer reader.bp.deinit();
+		defer reader.deinit();
+
+		i = 0;
+		while (true) {
+			reader.fill(&writer) catch |err| switch (err) {
+				error.Closed => {
+					try t.expectEqual(@as(u32, @intCast(i)), MESSAGE_TO_SEND);
+					break;
+				},
+				else => return err,
+			};
+
+			while (true) {
+				const has_more, const message = (try reader.read()) orelse break;
+				try t.expectEqual(expected[i].type, message.type);
+				try t.expectString(expected[i].data, message.data);
+				reader.done(message.type);
+
+				i += 1;
+				if (has_more == false) {
+					break;
+				}
+			}
+		}
+	}
 }
 
 test "Fragmented" {
@@ -597,7 +718,6 @@ fn testReader(opts: anytype) Reader {
 	const static_size = if (@hasField(T, "static")) opts.static else 16;
 	return Reader.init(static_size, bp) catch unreachable;
 }
-
 
 fn testRead(reader: *Reader, pair: t.SocketPair) !Message {
 	var i: usize = 0;
