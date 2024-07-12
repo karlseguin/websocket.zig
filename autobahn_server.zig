@@ -26,7 +26,7 @@ pub fn main() !void {
 		// to process messages. This will be a single allocation and will only
 		// be allocated after the request has been successfully parsed and
 		// identified as a websocket request.
-		.buffer_size = 8192,
+		.connection_buffer_size = 8192,
 
 		// Maximum allowed message size. If max_size == buffer_size, then the
 		// system will never allocate more than the initial buffer_size.
@@ -37,7 +37,7 @@ pub fn main() !void {
 
 		// IMPORTANT NOTE: autobahn tests with large messages (16MB).
 		// You almost certainly want to use a small value here.
-		.max_size = 20_000_000,
+		.max_message_size = 20_000_000,
 
 		.handshake = .{
 			.timeout = 3,

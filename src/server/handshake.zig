@@ -4,6 +4,8 @@ const posix = std.posix;
 const ascii = std.ascii;
 const Allocator = std.mem.Allocator;
 
+const M = @This();
+
 pub const Handshake = struct {
 	url: []const u8,
 	key: []const u8,
@@ -11,32 +13,39 @@ pub const Handshake = struct {
 	headers: KeyValue,
 	raw_header: []const u8,
 
-	// we expect allocator to be an Arena
-	pub fn parse(buf: []u8, allocator: Allocator, max_headers: usize) !Handshake {
-		var data = buf;
-		const request_line_end = std.mem.indexOfScalar(u8, data, '\r') orelse unreachable;
-		var request_line = data[0..request_line_end];
+	pub const Pool = M.Pool;
+
+	// returns null if the request isn't full
+	pub fn parse(state: *State) !?Handshake {
+		const request = state.buf[0..state.len];
+
+		var buf = request;
+		if (std.mem.endsWith(u8, buf, "\r\n\r\n") == false) {
+			return null;
+		}
+
+		const request_line_end = std.mem.indexOfScalar(u8, buf, '\r') orelse unreachable;
+		var request_line = buf[0..request_line_end];
 
 		if (!ascii.endsWithIgnoreCase(request_line, "http/1.1")) {
 			return error.InvalidProtocol;
 		}
 
-		var headers = try KeyValue.init(allocator, max_headers);
-		errdefer headers.deinit(allocator); // allocator is an arena, but just to be safe
+		var headers = state.headers;
 
 		var key: []const u8 = "";
 		var required_headers: u8 = 0;
 
 		var request_length = request_line_end;
 
-		data = data[request_line_end+2..];
+		buf = buf[request_line_end+2..];
 
-		while (data.len > 4) {
-			const index = std.mem.indexOfScalar(u8, data, '\r') orelse unreachable;
-			const separator = std.mem.indexOfScalar(u8, data[0..index], ':') orelse return error.InvalidHeader;
+		while (buf.len > 4) {
+			const index = std.mem.indexOfScalar(u8, buf, '\r') orelse unreachable;
+			const separator = std.mem.indexOfScalar(u8, buf[0..index], ':') orelse return error.InvalidHeader;
 
-			const name = std.mem.trim(u8, toLower(data[0..separator]), &ascii.whitespace);
-			const value = std.mem.trim(u8, data[(separator + 1)..index], &ascii.whitespace);
+			const name = std.mem.trim(u8, toLower(buf[0..separator]), &ascii.whitespace);
+			const value = std.mem.trim(u8, buf[(separator + 1)..index], &ascii.whitespace);
 
 			switch (name.len) {
 				7 => if (eql("upgrade", name)) {
@@ -67,7 +76,7 @@ pub const Handshake = struct {
 			}
 			const next = index + 2;
 			request_length += next;
-			data = data[next..];
+			buf = buf[next..];
 		}
 
 		if (required_headers != 15) {
@@ -85,7 +94,7 @@ pub const Handshake = struct {
 			.url = url,
 			.method = method,
 			.headers = headers,
-			.raw_header = buf[request_line_end+2..request_length+2],
+			.raw_header = request[request_line_end+2..request_length+2],
 		};
 	}
 
@@ -112,6 +121,41 @@ pub const Handshake = struct {
 		_ = std.base64.standard.Encoder.encode(buf[key_pos..key_pos+28], h[0..]);
 		return buf;
 	}
+
+	// This is what we're pooling
+	pub const State = struct {
+		// length of data we have in buf
+		len: usize = 0,
+
+		// a buffer to read data into
+		buf: []u8,
+
+		// Headers
+		headers: KeyValue,
+
+		fn init(allocator: Allocator, buffer_size: usize, max_headers: usize) !State {
+			const buf = try allocator.alloc(u8, buffer_size);
+			errdefer allocator.free(buf);
+
+			const headers = try KeyValue.init(allocator, max_headers);
+			errdefer headers.deinit(allocator);
+
+			return .{
+				.buf = buf,
+				.headers = headers,
+			};
+		}
+
+		fn deinit(self: *State, allocator: Allocator) void {
+			allocator.free(self.buf);
+			self.headers.deinit(allocator);
+		}
+
+		fn reset(self: *State) void {
+			self.len = 0;
+			self.headers.len = 0;
+		}
+	};
 };
 
 pub const KeyValue = struct {
@@ -119,9 +163,13 @@ pub const KeyValue = struct {
 	keys: [][]const u8,
 	values: [][]const u8,
 
-	pub fn init(allocator: Allocator, max: usize) !KeyValue {
+	fn init(allocator: Allocator, max: usize) !KeyValue {
 		const keys = try allocator.alloc([]const u8, max);
+		errdefer allocator.free(keys);
+
 		const values = try allocator.alloc([]const u8, max);
+		errdefer allocator.free(values);
+
 		return .{
 			.len = 0,
 			.keys = keys,
@@ -129,12 +177,12 @@ pub const KeyValue = struct {
 		};
 	}
 
-	pub fn deinit(self: KeyValue, allocator: Allocator) void {
+	fn deinit(self: KeyValue, allocator: Allocator) void {
 		allocator.free(self.keys);
 		allocator.free(self.values);
 	}
 
-	pub fn add(self: *KeyValue, key: []const u8, value: []const u8) void {
+	fn add(self: *KeyValue, key: []const u8, value: []const u8) void {
 		const len = self.len;
 		var keys = self.keys;
 		if (len == keys.len) {
@@ -166,13 +214,85 @@ pub const KeyValue = struct {
 
 		return null;
 	}
-
-	pub fn reset(self: *KeyValue) void {
-		self.len = 0;
-	}
 };
 
+pub const Pool = struct {
+	mutex: std.Thread.Mutex,
+	available: usize,
+	allocator: Allocator,
+	buffer_size: usize,
+	max_headers: usize,
+	states: []*Handshake.State,
 
+	pub fn init(allocator: Allocator, count: usize, buffer_size: usize, max_headers: usize) !Pool {
+		const states = try allocator.alloc(*Handshake.State, count);
+
+		for (0..count) |i| {
+			const state = try allocator.create(Handshake.State);
+			errdefer allocator.destroy(state);
+
+			state.* = try Handshake.State.init(allocator, buffer_size, max_headers);
+			states[i] = state;
+		}
+
+		return .{
+			.mutex = .{},
+			.states = states,
+			.allocator = allocator,
+			.available = count,
+			.max_headers = max_headers,
+			.buffer_size = buffer_size,
+		};
+	}
+
+	pub fn deinit(self: *Pool) void {
+		const allocator = self.allocator;
+		for (self.states) |s| {
+			s.deinit(allocator);
+			allocator.destroy(s);
+		}
+		allocator.free(self.states);
+	}
+
+	pub fn acquire(self: *Pool) !*Handshake.State {
+		const states = self.states;
+
+		self.mutex.lock();
+		const available = self.available;
+		if (available == 0) {
+			// dont hold the lock over factory
+			self.mutex.unlock();
+
+			const allocator = self.allocator;
+			const state = try allocator.create(Handshake.State);
+			errdefer allocator.destroy(state);
+			state.* = try Handshake.State.init(self.allocator, self.buffer_size, self.max_headers);
+			return state;
+		}
+		const index = available - 1;
+		const state = states[index];
+		self.available = index;
+		self.mutex.unlock();
+		return state;
+	}
+
+	pub fn release(self: *Pool, state: *Handshake.State) void {
+		state.reset();
+		var states = self.states;
+
+		self.mutex.lock();
+		const available = self.available;
+		if (available == states.len) {
+			self.mutex.unlock();
+			state.deinit(self.allocator);
+			self.allocator.destroy(state);
+			return;
+		}
+		states[available] = state;
+		self.available = available + 1;
+		self.mutex.unlock();
+	}
+};
 
 fn toLower(str: []u8) []u8 {
 	for (str, 0..) |c, i| {
@@ -194,7 +314,6 @@ fn eql(a: []const u8, b: []const u8) bool {
 }
 
 const t = @import("../t.zig");
-// const readRequest = @import("server.zig").readRequest;
 // test "handshake: parse" {
 // 	var buffer: [512]u8 = undefined;
 // 	const buf = buffer[0..];
@@ -286,7 +405,7 @@ test "KeyValue: get" {
 
 	try t.expectString("application/json", kv.get("content-type").?);
 
-	kv.reset();
+	kv.len = 0;
 	try t.expectEqual(null, kv.get("content-type"));
 	kv.add(&key, "application/json2");
 	try t.expectString("application/json2", kv.get("content-type").?);
@@ -309,3 +428,74 @@ test "KeyValue: ignores beyond max" {
 	try t.expectString("www", kv.get("host").?);
 	try t.expectEqual(null, kv.get("authorization"));
 }
+
+
+test "pool: acquire and release" {
+	// not 100% sure this is testing exactly what I want, but it's ....something ?
+	var p = try Pool.init(t.allocator, 2, 10, 3);
+	defer p.deinit();
+
+	var hs1a = p.acquire() catch unreachable;
+	var hs2a = p.acquire() catch unreachable;
+	var hs3a = p.acquire() catch unreachable; // this should be dynamically generated
+
+	try t.expectEqual(false, &hs1a.buf[0] == &hs2a.buf[0]);
+	try t.expectEqual(false, &hs2a.buf[0] == &hs3a.buf[0]);
+	try t.expectEqual(10, hs1a.buf.len);
+	try t.expectEqual(10, hs2a.buf.len);
+	try t.expectEqual(10, hs3a.buf.len);
+	try t.expectEqual(0, hs1a.headers.len);
+	try t.expectEqual(0, hs2a.headers.len);
+	try t.expectEqual(0, hs3a.headers.len);
+	try t.expectEqual(3, hs1a.headers.keys.len);
+	try t.expectEqual(3, hs2a.headers.keys.len);
+	try t.expectEqual(3, hs3a.headers.keys.len);
+
+	p.release(hs1a);
+
+	var hs1b = p.acquire() catch unreachable;
+	try t.expectEqual(true, &hs1a.buf[0] == &hs1b.buf[0]);
+
+	p.release(hs3a);
+	p.release(hs2a);
+	p.release(hs1b);
+}
+
+test "Handshake.Pool: threadsafety" {
+	var p = try Pool.init(t.allocator, 4, 10, 2);
+	defer p.deinit();
+
+	for (p.states) |hs| {
+		hs.buf[0] = 0;
+	}
+
+	const t1 = try std.Thread.spawn(.{}, testPool, .{&p});
+	const t2 = try std.Thread.spawn(.{}, testPool, .{&p});
+	const t3 = try std.Thread.spawn(.{}, testPool, .{&p});
+	const t4 = try std.Thread.spawn(.{}, testPool, .{&p});
+
+	t1.join(); t2.join(); t3.join(); t4.join();
+}
+
+fn testPool(p: *Pool) void {
+	var r = t.getRandom();
+	const random = r.random();
+
+	for (0..5000) |_| {
+		var hs = p.acquire() catch unreachable;
+		std.debug.assert(hs.buf[0] == 0);
+		hs.buf[0] = 255;
+		std.time.sleep(random.uintAtMost(u32, 100000));
+		hs.buf[0] = 0;
+		p.release(hs);
+	}
+}
+
+// fn testHandshake(input: []const u8, buf: []u8, headers: *KeyValue) !Handshake {
+// 	var pair = t.SocketPair.init();
+// 	defer pair.deinit();
+// 	try pair.client.writeAll(input);
+
+// 	const request_buf = try readRequest(pair.server, buf, null);
+// 	return Handshake.parse(request_buf, headers);
+// }
