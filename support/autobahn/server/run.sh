@@ -3,10 +3,10 @@ set -o errexit
 set -o nounset
 
 root=$(dirname $(realpath $BASH_SOURCE))
+
 zig run autobahn_server.zig &
 pid=$!
 sleep 2 # give chance for socket to listen
-
 trap "kill ${pid} || true;" EXIT
 
 docker run --rm \

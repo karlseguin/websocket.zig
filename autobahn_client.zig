@@ -1,14 +1,11 @@
 const std = @import("std");
 const websocket = @import("./src/websocket.zig");
 
-const Allocator = std.mem.Allocator;
-
-pub const io_mode = .evented;
-
 pub fn main() !void {
 	var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-	const allocator = gpa.allocator();
 	defer _ = gpa.detectLeaks();
+
+	const allocator = gpa.allocator();
 
 	const cases = [_][]const u8{
 		"1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6", "1.1.7", "1.1.8", "1.2.1", "1.2.2", "1.2.3", "1.2.4", "1.2.5", "1.2.6", "1.2.7", "1.2.8",
@@ -106,7 +103,7 @@ pub fn main() !void {
 	try updateReport(allocator);
 }
 
-fn updateReport(allocator: Allocator) !void {
+fn updateReport(allocator: std.mem.Allocator) !void {
 	var client = try websocket.Client.init(allocator, .{
 		.port = 9001,
 		.host = "localhost",

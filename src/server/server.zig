@@ -173,6 +173,7 @@ pub fn Server(comptime H: type) type {
 				defer w.deinit();
 
 				const thrd = try std.Thread.spawn(.{}, Blocking(H).listen, .{&w, socket, context});
+				log.info("starting blocking worker to listen on {}", .{address});
 
 				// is this really the best way?
 				var mutex = Thread.Mutex{};
@@ -182,6 +183,7 @@ pub fn Server(comptime H: type) type {
 				w.stop();
 				posix.close(socket);
 				thrd.join();
+
 			} else {
 				defer posix.close(socket);
 				var signals = self.signals;
@@ -293,16 +295,17 @@ fn Blocking(comptime H: type) type {
 					return;
 				}
 
-				var address: std.net.Address = undefined;
-				var address_len: posix.socklen_t = @sizeOf(std.net.Address);
+				var address: net.Address = undefined;
+				var address_len: posix.socklen_t = @sizeOf(net.Address);
 				const socket = posix.accept(listener, &address.any, &address_len, posix.SOCK.CLOEXEC) catch |err| {
-					log.err("Failed to accept socket: {}", .{err});
+					log.err("failed to accept socket: {}", .{err});
 					continue;
 				};
+				log.debug("({}) connected", .{address});
 
-				const thread = std.Thread.spawn(.{}, Self.handleConnection, .{self, socket, context}) catch |err| {
+				const thread = std.Thread.spawn(.{}, Self.handleConnection, .{self, socket, address, context}) catch |err| {
 					posix.close(socket);
-					log.err("Failed to spawn connection thread: {}", .{err});
+					log.err("({}) failed to spawn connection thread: {}", .{address, err});
 					continue;
 				};
 				thread.detach();
@@ -311,14 +314,14 @@ fn Blocking(comptime H: type) type {
 
 		// Called in a thread started above in listen.
 		// Wrapper around _handleConnection so that we can handle erros
-		fn handleConnection(self: *Self, socket: posix.socket_t, context: anytype) void {
+		fn handleConnection(self: *Self, socket: posix.socket_t, address: net.Address, context: anytype) void {
 			defer posix.close(socket);
-			self._handleConnection(socket, context) catch |err| {
-				log.err("Connection thread initialization error: {}", .{err});
+			self._handleConnection(socket, address, context) catch |err| {
+				log.err("({}) uncaught error in connection handler: {}", .{address, err});
 			};
 		}
 
-		fn _handleConnection(self: *Self, socket: posix.socket_t, context: anytype) !void {
+		fn _handleConnection(self: *Self, socket: posix.socket_t, address: net.Address, context: anytype) !void {
 			const hc = blk: {
 				self.conn_lock.lock();
 				defer self.conn_lock.unlock();
@@ -332,6 +335,7 @@ fn Blocking(comptime H: type) type {
 						._rw_mode = .none,
 						._io_mode = .blocking,
 						._socket_flags = 0, // not needed in the blocking worker
+						.address = address,
 						.stream = .{.handle = socket},
 					},
 				};
@@ -355,25 +359,34 @@ fn Blocking(comptime H: type) type {
 			};
 
 			if (comptime std.meta.hasFn(H, "afterInit")) {
-				hc.handler.afterInit() catch return;
+				hc.handler.afterInit() catch |err| {
+					log.debug("({}) " ++ @typeName(H) ++ ".afterInit error: {}", .{address, err});
+					return;
+				};
 			}
+
 
 			// we delay initializing the reader until AFTER the handshake to avoid
 			// unecessarily acllocate config.buffer_size
 			hc.reader = Reader.init(self.config.buffer_size, self.bp) catch |err| {
-				log.err("Failed to create a Reader, connection is being closed. The error was: {}", .{err});
+				log.err("({}) error creating reader: {}", .{address, err});
 				return;
 			};
 
 			var reader = &hc.reader;
 			defer reader.deinit();
 
+			log.debug("({}) connection successfully upgraded", .{address});
+
 			while (true) {
 
 				// fill our reader buffer with more data
-				reader.fill(hc.conn.stream) catch |err| switch (err) {
-					error.BrokenPipe, error.Closed, error.ConnectionResetByPeer => return,
-					else => return err,
+				reader.fill(hc.conn.stream) catch |err| {
+					switch (err) {
+						error.BrokenPipe, error.Closed, error.ConnectionResetByPeer => log.debug("({}) connection closed: {}", .{address, err}),
+						else => log.warn("({}) error reading from connection: {}", .{address, err}),
+					}
+					return;
 				};
 
 				while (true) {
@@ -383,6 +396,7 @@ fn Blocking(comptime H: type) type {
 							error.ReservedFlags => conn.writeFramed(CLOSE_PROTOCOL_ERROR) catch {},
 							else => {},
 						}
+						log.debug("({}) invalid websocket packet: {}", .{address, err});
 						return;
 					} orelse break; // orelse, we need more data, go back to fill the buffer from the stream
 
@@ -391,7 +405,10 @@ fn Blocking(comptime H: type) type {
 					// The error is either a result of a failed socket write, or an
 					// error returned by the handler, which, if the app cares about, they
 					// can handle within the handler itself.
-					handleMessage(H, hc, message) catch return;
+					handleMessage(H, hc, message) catch |err| {
+						log.warn("({}) handle message error: {}", .{address, err});
+						return;
+					};
 
 					// TODO: thread safety
 					if (conn._closed) {
@@ -416,11 +433,13 @@ fn Blocking(comptime H: type) type {
 
 			const buf = try allocator.alloc(u8, self.handshake_max_size);
 			const request = self.readRequest(conn, buf) catch |err| {
+				log.debug("({}) error reading handshake: {}", .{conn.address, err});
 				respondToHandshakeError(conn, err);
 				return null;
 			};
 
 			const handshake = Handshake.parse(request, allocator, self.handshake_max_headers) catch |err| {
+				log.debug("({}) error parsing handshake: {}", .{conn.address, err});
 				respondToHandshakeError(conn, err);
 				return null;
 			};
@@ -431,6 +450,7 @@ fn Blocking(comptime H: type) type {
 				} else {
 					respondToHandshakeError(conn, err);
 				}
+				log.debug("({}) " ++ @typeName(H) ++ ".init rejected request {}", .{conn.address, err});
 				return null;
 			};
 
@@ -438,7 +458,8 @@ fn Blocking(comptime H: type) type {
 				if (comptime std.meta.hasFn(H, "close")) {
 					handler.close();
 				}
-				return err;
+				log.warn("({}) error writing handshake response: {}", .{conn.address, err});
+				return null;
 			};
 			return handler;
 		}
@@ -819,6 +840,7 @@ pub const Conn = struct {
 	_rw_mode: RWMode,
 	_socket_flags: usize,
 	stream: net.Stream,
+	address: net.Address,
 
 	const IOMode = enum {
 		blocking,
@@ -920,6 +942,8 @@ pub const Conn = struct {
 fn handleMessage(comptime H: type, hc: *HandlerConn(H), message: Message) !void {
 	const message_type = message.type;
 	defer hc.reader.done(message_type);
+
+	log.debug("({}) received {s} message", .{hc.conn.address, @tagName(message_type)});
 
 	const handler = &hc.handler;
 

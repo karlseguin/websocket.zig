@@ -1,14 +1,15 @@
 const std = @import("std");
 const websocket = @import("./src/websocket.zig");
 
-const Allocator = std.mem.Allocator;
-
 const Conn = websocket.Conn;
 const Message = websocket.Message;
 const Handshake = websocket.Handshake;
 
-// THIS MUST BE PRESENT
-pub const io_mode = .evented;
+pub const std_options = .{
+	.log_scope_levels = &[_]std.log.ScopeLevel{
+		.{.scope = .websocket, .level = .warn},
+	}
+};
 
 pub fn main() !void {
 	var gpa = std.heap.GeneralPurposeAllocator(.{}){};
