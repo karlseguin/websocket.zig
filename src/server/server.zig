@@ -167,6 +167,10 @@ pub fn Server(comptime H: type) type {
 				try posix.listen(socket, 1024); // kernel backlog
 			}
 
+			// used to block our thread until stop() is called
+			var mutex = Thread.Mutex{};
+			mutex.lock();
+
 			if (comptime blockingMode()) {
 				errdefer posix.close(socket);
 				var w = try Blocking(H).init(self);
@@ -176,8 +180,7 @@ pub fn Server(comptime H: type) type {
 				log.info("starting blocking worker to listen on {}", .{address});
 
 				// is this really the best way?
-				var mutex = Thread.Mutex{};
-				mutex.lock();
+
 				self.cond.wait(&mutex);
 				mutex.unlock();
 				w.stop();
@@ -215,8 +218,6 @@ pub fn Server(comptime H: type) type {
 				}
 
 				// is this really the best way?
-				var mutex = Thread.Mutex{};
-				mutex.lock();
 				self.cond.wait(&mutex);
 				mutex.unlock();
 			}
@@ -315,7 +316,6 @@ fn Blocking(comptime H: type) type {
 		// Called in a thread started above in listen.
 		// Wrapper around _handleConnection so that we can handle erros
 		fn handleConnection(self: *Self, socket: posix.socket_t, address: net.Address, context: anytype) void {
-			defer posix.close(socket);
 			self._handleConnection(socket, address, context) catch |err| {
 				log.err("({}) uncaught error in connection handler: {}", .{address, err});
 			};
@@ -323,6 +323,8 @@ fn Blocking(comptime H: type) type {
 
 		fn _handleConnection(self: *Self, socket: posix.socket_t, address: net.Address, context: anytype) !void {
 			const hc = blk: {
+				errdefer posix.close(socket);
+
 				self.conn_lock.lock();
 				defer self.conn_lock.unlock();
 
@@ -344,13 +346,15 @@ fn Blocking(comptime H: type) type {
 				break :blk hc;
 			};
 
+			var conn = &hc.conn;
+
 			defer {
+				conn.close();
 				self.conn_lock.lock();
 				self.conn_list.remove(hc);
 				self.conn_pool.destroy(hc);
 				self.conn_lock.unlock();
 			}
-			var conn = &hc.conn;
 
 			hc.handler = (try self.doHandshake(conn, context)) orelse return;
 
@@ -410,8 +414,7 @@ fn Blocking(comptime H: type) type {
 						return;
 					};
 
-					// TODO: thread safety
-					if (conn._closed) {
+					if (conn.isClosed()) {
 						return;
 					}
 
@@ -823,7 +826,6 @@ const EPoll = struct {
 // NonBlockign workers. The code from this point on is meant to be used with
 // both workers, independently from the blocking/nonblocking nonsense.
 
-
 fn HandlerConn(comptime H: type) type {
 	return struct {
 		conn: Conn,
@@ -864,9 +866,15 @@ pub const Conn = struct {
 		}
 	}
 
-	// TODO: thread safety
+	pub fn isClosed(self: *Conn) bool {
+		return @atomicLoad(bool, &self._closed, .monotonic);
+	}
+
 	pub fn close(self: *Conn) void {
-		self._closed = true;
+		if (self.isClosed() == false) {
+			posix.close(self.stream.handle);
+			@atomicStore(bool, &self._closed, true, .monotonic);
+		}
 	}
 
 	pub fn writeBin(self: *Conn, data: []const u8) !void {
@@ -889,14 +897,14 @@ pub const Conn = struct {
 		return self.writeFrame(.pong, data);
 	}
 
-	pub fn writeClose(self: *Conn) !void {
-		return self.writeFramed(CLOSE_NORMAL);
+	pub fn writeClose(self: *Conn) void {
+		self.writeFramed(CLOSE_NORMAL) catch {};
 	}
 
-	pub fn writeCloseWithCode(self: *Conn, code: u16) !void {
+	pub fn writeCloseWithCode(self: *Conn, code: u16) void {
 		var buf: [2]u8 = undefined;
 		std.mem.writeInt(u16, &buf, code, .Big);
-		return self.writeFrame(.close, &buf);
+		self.writeFrame(.close, &buf) catch {};
 	}
 
 	pub fn writeFrame(self: *Conn, op_code: OpCode, data: []const u8) !void {
@@ -1015,7 +1023,7 @@ fn closeAll(comptime H: type, conn_list: List(HandlerConn(H)), conn_pool: *std.h
 
 		const conn = &hc.conn;
 		if (shutdown.notify_client) {
-			conn.writeClose() catch {};
+			conn.writeClose();
 		}
 
 		if (shutdown.close_socket) {
