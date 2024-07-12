@@ -10,7 +10,7 @@ pub const Handshake = struct {
 	url: []const u8,
 	key: []const u8,
 	method: []const u8,
-	headers: KeyValue,
+	headers: *KeyValue,
 	raw_header: []const u8,
 
 	pub const Pool = M.Pool;
@@ -31,7 +31,7 @@ pub const Handshake = struct {
 			return error.InvalidProtocol;
 		}
 
-		var headers = state.headers;
+		var headers = &state.headers;
 
 		var key: []const u8 = "";
 		var required_headers: u8 = 0;
@@ -314,86 +314,44 @@ fn eql(a: []const u8, b: []const u8) bool {
 }
 
 const t = @import("../t.zig");
-// test "handshake: parse" {
-// 	var buffer: [512]u8 = undefined;
-// 	const buf = buffer[0..];
-// 	var headers = try KeyValue.init(t.allocator, 10);
-// 	defer headers.deinit(t.allocator);
+test "handshake: parse" {
+	var state = try Handshake.State.init(t.allocator, 512, 10);
+	defer state.deinit(t.allocator);
 
-// 	try t.expectError(error.InvalidProtocol, testHandshake("GET / HTTP/1.0\r\n\r\n", buf, &headers));
-// 	try t.expectError(error.MissingHeaders, testHandshake("GET / HTTP/1.1\r\n\r\n", buf, &headers));
-// 	try t.expectError(error.MissingHeaders, testHandshake("GET / HTTP/1.1\r\nConnection:  upgrade\r\n\r\n", buf, &headers));
-// 	try t.expectError(error.MissingHeaders, testHandshake("GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n", buf, &headers));
-// 	try t.expectError(error.MissingHeaders, testHandshake("GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nsec-websocket-version:13\r\n\r\n", buf, &headers));
+	try t.expectEqual(null, try testHandshake("", &state));
+	try t.expectEqual(null, try testHandshake("GET", &state));
+	try t.expectEqual(null, try testHandshake("GET 1 HTTP/1.0\r", &state));
+	try t.expectEqual(null, try testHandshake("GET 1 HTTP/1.0\r\n", &state));
 
-// 	{
-// 		headers.reset();
-// 		const h = try testHandshake("GET /test?a=1   HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nsec-websocket-version:13\r\nsec-websocket-key: 9000!\r\nCustom:  Header-Value\r\n\r\n", buf, &headers);
-// 		try t.expectString("9000!", h.key);
-// 		try t.expectString("GET", h.method);
-// 		try t.expectString("/test?a=1", h.url);
-// 		try t.expectString("connection: upgrade\r\nupgrade: websocket\r\nsec-websocket-version:13\r\nsec-websocket-key: 9000!\r\ncustom:  Header-Value\r\n", h.raw_header);
-// 		try t.expectString("upgrade", headers.get("connection").?);
-// 		try t.expectString("websocket", headers.get("upgrade").?);
-// 		try t.expectString("13", headers.get("sec-websocket-version").?);
-// 		try t.expectString("9000!", headers.get("sec-websocket-key").?);
-// 		try t.expectString("Header-Value", headers.get("custom").?);
-// 	}
+	try t.expectError(error.InvalidProtocol, testHandshake("GET / HTTP/1.0\r\n\r\n", &state));
+	try t.expectError(error.MissingHeaders, testHandshake("GET / HTTP/1.1\r\n\r\n", &state));
+	try t.expectError(error.MissingHeaders, testHandshake("GET / HTTP/1.1\r\nConnection:  upgrade\r\n\r\n", &state));
+	try t.expectError(error.MissingHeaders, testHandshake("GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n", &state));
+	try t.expectError(error.MissingHeaders, testHandshake("GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nsec-websocket-version:13\r\n\r\n", &state));
 
-// 	// fuzz tests
-// 	{
-// 		headers.reset();
-// 		var r = t.getRandom();
-// 		var random = r.random();
-// 		var count: usize = 0;
-// 		const valid = "GET / HTTP/1.1\r\nsec-websocket-key: 1139329\r\nConnection: upgrade\r\nUpgrade:WebSocket\r\nSEC-WEBSOCKET-VERSION:   13  \r\n\r\n";
-// 		while (count < 1000) : (count += 1) {
-// 			var pair = t.SocketPair.init();
-// 			defer pair.deinit();
+	{
+		state.reset();
+		const h = (try testHandshake("GET /test?a=1   HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nsec-websocket-version:13\r\nsec-websocket-key: 9000!\r\nCustom:  Header-Value\r\n\r\n", &state)).?;
+		try t.expectString("9000!", h.key);
+		try t.expectString("GET", h.method);
+		try t.expectString("/test?a=1", h.url);
+		try t.expectString("connection: upgrade\r\nupgrade: websocket\r\nsec-websocket-version:13\r\nsec-websocket-key: 9000!\r\ncustom:  Header-Value\r\n", h.raw_header);
+		try t.expectString("Header-Value", h.headers.get("custom").?);
+	}
+}
 
-// 			var data: []const u8 = valid[0..];
-// 			while (data.len > 0) {
-// 				const l = random.uintAtMost(usize, data.len - 1) + 1;
-// 				_ = try pair.client.writeAll(data[0..l]);
-// 				data = data[l..];
-// 			}
-// 			const request_buf = readRequest(pair.server, buf, null) catch unreachable;
-// 			const h = Handshake.parse(request_buf, &headers) catch unreachable;
-// 			try t.expectString("1139329", h.key);
-// 			try t.expectString("/", h.url);
-// 			try t.expectString("GET", h.method);
-// 		}
-// 	}
-// }
+test "handshake: reply" {
+	const h = Handshake{
+		.url = "",
+		.method = "",
+		.raw_header = "",
+		.headers = undefined,
+		.key = "this is my key",
+	};
 
-// test "handshake: reply" {
-// 	var pair = t.SocketPair.init();
-// 	defer pair.deinit();
-
-// 	const h = Handshake{
-// 		.url = "",
-// 		.method = "",
-// 		.raw_header = "",
-// 		.headers = undefined,
-// 		.key = "this is my key",
-// 	};
-// 	try Handshake.reply(h.key, pair.server);
-
-// 	const expected = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: upgrade\r\nSec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n\r\n";
-// 	var buf: [expected.len]u8 = undefined;
-// 	_ = try pair.client.readAll(&buf);
-// 	try t.expectString(&buf, expected);
-// }
-
-// fn testHandshake(input: []const u8, buf: []u8, headers: *KeyValue) !Handshake {
-// 	var pair = t.SocketPair.init();
-// 	defer pair.deinit();
-// 	try pair.client.writeAll(input);
-
-// 	const request_buf = try readRequest(pair.server, buf, null);
-// 	return Handshake.parse(request_buf, headers);
-// }
-
+	const expected = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: upgrade\r\nSec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n\r\n";
+	try t.expectString(expected , &h.reply());
+}
 
 test "KeyValue: get" {
 	const allocator = t.allocator;
@@ -428,7 +386,6 @@ test "KeyValue: ignores beyond max" {
 	try t.expectString("www", kv.get("host").?);
 	try t.expectEqual(null, kv.get("authorization"));
 }
-
 
 test "pool: acquire and release" {
 	// not 100% sure this is testing exactly what I want, but it's ....something ?
@@ -491,11 +448,8 @@ fn testPool(p: *Pool) void {
 	}
 }
 
-// fn testHandshake(input: []const u8, buf: []u8, headers: *KeyValue) !Handshake {
-// 	var pair = t.SocketPair.init();
-// 	defer pair.deinit();
-// 	try pair.client.writeAll(input);
-
-// 	const request_buf = try readRequest(pair.server, buf, null);
-// 	return Handshake.parse(request_buf, headers);
-// }
+fn testHandshake(request: []const u8, state: *Handshake.State) !?Handshake {
+	@memcpy(state.buf[0..request.len], request);
+	state.len = request.len;
+	return Handshake.parse(state);
+}

@@ -319,10 +319,10 @@ fn Blocking(comptime H: type) type {
 
 				const hc = try self.conn_pool.create();
 				hc.* = .{
-					.handshake = null,
 					.socket = socket,
+					.handler = null,
+					.handshake = null,
 					.reader = undefined,
-					.handler = undefined,
 					.conn = .{
 						._closed = false,
 						._rw_mode = .none,
@@ -350,11 +350,11 @@ fn Blocking(comptime H: type) type {
 			hc.handler = (try self.doHandshake(conn, context)) orelse return;
 
 			defer if (comptime std.meta.hasFn(H, "close")) {
-				hc.handler.close();
+				hc.handler.?.close();
 			};
 
 			if (comptime std.meta.hasFn(H, "afterInit")) {
-				hc.handler.afterInit() catch |err| {
+				hc.handler.?.afterInit() catch |err| {
 					log.debug("({}) " ++ @typeName(H) ++ ".afterInit error: {}", .{address, err});
 					return;
 				};
@@ -608,8 +608,9 @@ fn NonBlocking(comptime H: type) type {
 
 				hc.* = .{
 					.socket = socket,
+					.handler = null,
+					.handshake = null,
 					.reader = undefined,
-					.handler = undefined, // DANGEROUS
 					.conn = .{
 						._closed = false,
 						._rw_mode = .none,
@@ -837,10 +838,25 @@ fn EPoll(comptime H: type) type {
 // NonBlockign workers. The code from this point on is meant to be used with
 // both workers, independently from the blocking/nonblocking nonsense.
 
+
+
+// In the Blocking worker, all the state could be stored on the spawn'd thread's
+// stack. The only reason we use a HandlerConn(H) in there is to be able to re-use
+// code with the NonBlocking worker.
+//
+// For the NonBlocking worker, HandlerConn(H) is critical as it contains all the
+// state for a connection. It lives on the heap, a pointer is registered into
+// the event loop, and passed back when data is ready to read.
+// * If handler is null, it means we haven't done our handshake yet.
+// * If handler is null, reader is always invalid.
+// * If handler is not null, then reader is always valid and handshake is always null
+// * If handler is null AND handshake is null, it means we havent' received
+//   any data yet (we delay creating the handshake state until we at least have
+//   some data ready).
 fn HandlerConn(comptime H: type) type {
 	return struct {
 		conn: Conn,
-		handler: H,
+		handler: ?H,
 		reader: Reader,
 		socket: posix.socket_t, // denormalization from conn.stream.handle
 		handshake: ?Handshake.State,
@@ -966,7 +982,7 @@ fn handleMessage(comptime H: type, hc: *HandlerConn(H), message: Message) !void 
 
 	log.debug("({}) received {s} message", .{hc.conn.address, @tagName(message_type)});
 
-	const handler = &hc.handler;
+	const handler = &hc.handler.?;
 
 	switch (message_type) {
 		.text, .binary => {
@@ -1031,7 +1047,9 @@ fn closeAll(comptime H: type, conn_list: List(HandlerConn(H)), conn_pool: *std.h
 	var next_node = conn_list.head;
 	while (next_node) |hc| {
 		if (shutdown.notify_handler) {
-			hc.handler.close();
+			if (hc.handler) |*h| {
+				h.close();
+			}
 		}
 
 		const conn = &hc.conn;
