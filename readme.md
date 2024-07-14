@@ -394,7 +394,7 @@ It is safe to call `client.write`, `client.writeBin` and `client.close` from a t
 # Autobahn
 Every mandatory [Autobahn Testsuite](https://github.com/crossbario/autobahn-testsuite) case is passing. (Three fragmented UTF-8 are flagged as non-strict and as compression is not implemented, these are all flagged as "Unimplemented").
 
-You can see `autobahn_server.zig` and `autobahn_client.zig` in the root of the project for the handler that's used for the autobahn tests.
+You can see `support/autobahn/server/main.zig` and `support/autobahn/client/main.zig` for the handler that's used for the autobahn tests.
 
 ## http.zig
 I'm also working on an HTTP 1.1 server for zig: [https://github.com/karlseguin/http.zig](https://github.com/karlseguin/http.zig).

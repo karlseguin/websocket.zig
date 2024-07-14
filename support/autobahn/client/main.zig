@@ -1,5 +1,5 @@
 const std = @import("std");
-const websocket = @import("./src/websocket.zig");
+const websocket = @import("websocket");
 
 pub fn main() !void {
 	var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -57,7 +57,7 @@ pub fn main() !void {
 	};
 
 	// wait 5 seconds for autobanh server to be up
-	std.time.sleep(5000000000);
+	std.time.sleep(std.time.ns_per_s * 5);
 
 	var buffer_provider = try websocket.bufferProvider(allocator, .{.count = 10, .size = 32768, .max = 20_000_000});
 	defer buffer_provider.deinit();

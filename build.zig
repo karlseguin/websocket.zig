@@ -4,9 +4,15 @@ pub fn build(b: *std.Build) !void {
 	const target = b.standardTargetOptions(.{});
 	const optimize = b.standardOptimizeOption(.{});
 
-	_ = b.addModule("websocket", .{
+	const websocket_module = b.addModule("websocket", .{
 		.root_source_file = b.path("src/websocket.zig"),
 	});
+
+	{
+		const options = b.addOptions();
+		options.addOption(bool, "force_blocking", false);
+		websocket_module.addOptions("build", options);
+	}
 
 	const lib_test = b.addTest(.{
 		.root_source_file = b.path("src/websocket.zig"),

@@ -1,5 +1,5 @@
 const std = @import("std");
-const websocket = @import("./src/websocket.zig");
+const websocket = @import("websocket");
 
 const Conn = websocket.Conn;
 const Message = websocket.Message;
@@ -15,7 +15,7 @@ pub fn main() !void {
 	var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 	defer _ = gpa.detectLeaks();
 
-	const allocator = gpa.allocator();
+	const allocator = if (@import("builtin").mode == .Debug) gpa.allocator() else std.heap.c_allocator;
 
 	var server = try websocket.Server(Handler).init(allocator, .{
 		.port = 9223,
@@ -62,7 +62,7 @@ const Handler = struct {
 	context: *Context,
 
 	pub fn init(_: Handshake, conn: *Conn, context: *Context) !Handler {
-		return Handler{
+		return .{
 			.conn = conn,
 			.context = context,
 		};

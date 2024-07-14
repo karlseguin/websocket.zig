@@ -4,7 +4,7 @@ const Thread = std.Thread;
 const Allocator = std.mem.Allocator;
 
 pub const Opts = struct {
-	count: u32,
+	count: u16,
 	backlog: u32,
 	buffer_size: usize,
 };

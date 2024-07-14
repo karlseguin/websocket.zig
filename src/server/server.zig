@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const proto = @import("../proto.zig");
 const buffer = @import("../buffer.zig");
 
@@ -32,14 +33,13 @@ const force_blocking: bool = blk: {
 };
 
 pub fn blockingMode() bool {
-	return true;
-	// if (force_blocking) {
-	// 	return true;
-	// }
-	// return switch (builtin.os.tag) {
-	// 	.linux, .macos, .ios, .tvos, .watchos, .freebsd, .netbsd, .dragonfly, .openbsd => false,
-	// 	else => true,
-	// };
+	if (force_blocking) {
+		return true;
+	}
+	return switch (builtin.os.tag) {
+		.linux, .macos, .ios, .tvos, .watchos, .freebsd, .netbsd, .dragonfly, .openbsd => false,
+		else => true,
+	};
 }
 
 pub const Config = struct {
@@ -47,8 +47,9 @@ pub const Config = struct {
 	address: []const u8 = "127.0.0.1",
 	unix_path: ?[]const u8 = null,
 
-	max_message_size: usize = 65536,
-	connection_buffer_size: usize = 4096,
+	max_conn: usize = 16_384,
+	max_message_size: usize = 65_536,
+	connection_buffer_size: usize = 4_096,
 
 	handshake: Config.Handshake = .{},
 	shutdown: Shutdown = .{},
@@ -89,25 +90,25 @@ pub fn Server(comptime H: type) type {
 		// these aren't used by the server themselves, but both Blocking and NonBlocking
 		// workers need them, so we put them here, and reference them in the workers,
 		// to avoid the duplicate code.
-		bp: buffer.Provider,
-		hp: Handshake.Pool,
+		handshake_pool: Handshake.Pool,
+		buffer_provider: buffer.Provider,
 
 		const Self = @This();
 
 		pub fn init(allocator: Allocator, config: Config) !Self {
-			var bp = try buffer.Provider.init(allocator, .{
+			var handshake_pool = try Handshake.Pool.init(allocator, config.handshake.pool_count orelse 32, config.handshake.max_size orelse 1024, config.handshake.max_headers orelse 10);
+			errdefer handshake_pool.deinit();
+
+			var buffer_provider = try buffer.Provider.init(allocator, .{
 				.max = config.max_message_size,
 				.count = config.large_buffers.count orelse 8,
-				.size = config.large_buffers.size orelse @min(config.max_message_size * 2, config.max_message_size),
+				.size = config.large_buffers.size orelse @min(config.connection_buffer_size * 2, config.max_message_size),
 			});
-			errdefer bp.deinit();
-
-			var hp = try Handshake.Pool.init(allocator, config.handshake.pool_count orelse 32, config.handshake.max_size orelse 1024, config.handshake.max_headers orelse 10);
-			errdefer hp.deinit();
+			errdefer buffer_provider.deinit();
 
 			return .{
-				.bp = bp,
-				.hp = hp,
+				.handshake_pool = handshake_pool,
+				.buffer_provider = buffer_provider,
 				.cond = .{},
 				.config = config,
 				.allocator = allocator,
@@ -115,8 +116,8 @@ pub fn Server(comptime H: type) type {
 		}
 
 		pub fn deinit(self: *Self) void {
-			self.bp.deinit();
-			self.hp.deinit();
+			self.handshake_pool.deinit();
+			self.buffer_provider.deinit();
 		}
 
 		pub fn listenInNewThread(self: *Self, context: anytype) !Thread {
@@ -129,7 +130,7 @@ pub fn Server(comptime H: type) type {
 			var no_delay = true;
 			const address = blk: {
 				if (config.unix_path) |unix_path| {
-					if (comptime @import("builtin").os.tag == .windows) {
+					if (comptime builtin.os.tag == .windows) {
 						return error.UnixPathNotSupported;
 					}
 					no_delay = false;
@@ -194,12 +195,13 @@ pub fn Server(comptime H: type) type {
 				thrd.join();
 			} else {
 				defer posix.close(socket);
+				const C = @TypeOf(context);
 				const signals = try posix.pipe2(.{.NONBLOCK = true});
 
-				var w = try NonBlocking(H).init(self);
+				var w = try NonBlocking(H, C).init(self, signals[1], context);
 				defer w.deinit();
 
-				const thrd = try Thread.spawn(.{}, NonBlocking(H).listen, .{&w, socket, signals[0], context});
+				const thrd = try Thread.spawn(.{}, NonBlocking(H, C).listen, .{&w, socket, signals[0]});
 				log.info("starting nonblocking worker to listen on {}", .{address});
 
 				// is this really the best way?
@@ -221,13 +223,13 @@ pub fn Server(comptime H: type) type {
 fn Blocking(comptime H: type) type {
 	return struct {
 		running: bool,
-		hp: *Handshake.Pool,
-		bp: *buffer.Provider,
 		allocator: Allocator,
 		config: *const Config,
 		handshake_timeout: Timeout,
 		handshake_max_size: u16,
 		handshake_max_headers: u16,
+		handshake_pool: *Handshake.Pool,
+		buffer_provider: *buffer.Provider,
 
 		// protects access to the conn_list and conn_pool
 		conn_lock: Thread.Mutex,
@@ -257,14 +259,14 @@ fn Blocking(comptime H: type) type {
 			errdefer conn_pool.deinit();
 
 			return .{
-				.bp = &server.bp,
-				.hp = &server.hp,
 				.running = true,
 				.config = config,
 				.conn_list = .{},
 				.conn_lock = .{},
 				.conn_pool = conn_pool,
 				.allocator = allocator,
+				.handshake_pool = &server.handshake_pool,
+				.buffer_provider = &server.buffer_provider,
 				.handshake_timeout = Timeout.init(config.handshake.timeout orelse MAX_TIMEOUT),
 				.handshake_max_size = config.handshake.max_size orelse DEFAULT_MAX_HANDSHAKE_SIZE,
 				.handshake_max_headers = config.handshake.max_headers orelse 0,
@@ -322,12 +324,9 @@ fn Blocking(comptime H: type) type {
 					.socket = socket,
 					.handler = null,
 					.handshake = null,
-					.reader = undefined,
+					.reader = null,
 					.conn = .{
 						._closed = false,
-						._rw_mode = .none,
-						._io_mode = .blocking,
-						._socket_flags = 0, // not needed in the blocking worker
 						.address = address,
 						.stream = .{.handle = socket},
 					},
@@ -362,12 +361,12 @@ fn Blocking(comptime H: type) type {
 
 			// we delay initializing the reader until AFTER the handshake to avoid
 			// unecessarily acllocate config.buffer_size
-			hc.reader = Reader.init(self.config.connection_buffer_size, self.bp) catch |err| {
+			hc.reader = Reader.init(self.config.connection_buffer_size, self.buffer_provider) catch |err| {
 				log.err("({}) error creating reader: {}", .{address, err});
 				return;
 			};
 
-			var reader = &hc.reader;
+			var reader = &hc.reader.?;
 			defer reader.deinit();
 
 			log.debug("({}) connection successfully upgraded", .{address});
@@ -422,12 +421,15 @@ fn Blocking(comptime H: type) type {
 			var arena = std.heap.ArenaAllocator.init(self.allocator);
 			defer arena.deinit();
 
-			const state = try self.hp.acquire();
-			defer self.hp.release(state);
+			const state = try self.handshake_pool.acquire();
+			defer self.handshake_pool.release(state);
 
 			const handshake = self.readHandshake(conn, state) catch |err| {
 				log.debug("({}) error reading handshake: {}", .{conn.address, err});
-				respondToHandshakeError(conn, err);
+				switch (err) {
+					error.BrokenPipe, error.Closed, error.ConnectionResetByPeer => {},
+					else => respondToHandshakeError(conn, err),
+				}
 				return null;
 			};
 
@@ -460,7 +462,7 @@ fn Blocking(comptime H: type) type {
 			while (state.len < buf.len) {
 				const n = try posix.read(socket, buf[state.len..]);
 				if (n == 0) {
-					return error.Close;
+					return error.Closed;
 				}
 
 				state.len += n;
@@ -479,58 +481,91 @@ fn Blocking(comptime H: type) type {
 	};
 }
 
-fn NonBlocking(comptime H: type) type {
-	const ThreadPool = @import("thread_pool.zig").ThreadPool(NonBlocking(H).dataAvailable);
-
+fn NonBlocking(comptime H: type, comptime C: type) type {
 	return struct {
+		ctx: C,
 		// KQueue or Epoll, depending on the platform
 		loop: Loop,
 		allocator: Allocator,
 		config: *const Config,
 
-		bp: *buffer.Provider,
-		hp: *Handshake.Pool,
-		tp: ThreadPool,
+		// The server creates a pipe. It's used for two things.
+		// 1-
+		// This worker monitors (via the loop) one end of the pipe.
+		// When the server is shutdown, it closes the write end of the pipe,
+		// which the worker detects and will then also shutdown.
+		// 2-
+		// When a thread pool thread is done processing a request, it needs to
+		// either rearm the monitor or cleanup the connection. It does so by
+		// writing the intFromPtr to the write end of the pipe, which the worker
+		// detects and then takes back control fo the connection.
+
+		// where in buf we've read up to (incase of a partial read)
+		signal_pos: usize,
+
+		// Buffer for reading from the signal fd
+		signal_buf: [64]usize,
+
+		// The write side of the signal. Ideally, this wouldn't be here and the worker
+		// would only know about the read side of the signal. This is needed by the
+		// server when shutting down (to close), and the thread pool to hand the connection
+		// back to the worker. But...the theradpool is really just a method of this
+		// worker (NonBlocking(H, C).dataAvailable), so having it here is the most
+		// logical place since the thread pool already reaches into the worker for
+		// various things (like the handshake_pool, buffer_provider and config).
+		signal_write: posix.fd_t,
+		// synchronize writes to signal_write
+		signal_lock: Thread.Mutex,
+
+		thread_pool: *ThreadPool,
+		handshake_pool: *Handshake.Pool,
+		buffer_provider: *buffer.Provider,
 
 		max_conn: usize,
 		conn_list: List(HandlerConn(H)),
 		conn_pool: std.heap.MemoryPool(HandlerConn(H)),
 
 		const Self = @This();
+		const ThreadPool = @import("thread_pool.zig").ThreadPool(Self.dataAvailable);
 
 		const Loop = switch (@import("builtin").os.tag) {
-			.macos, .ios, .tvos, .watchos, .freebsd, .netbsd, .dragonfly, .openbsd => KQueue(H),
-			.linux => EPoll(H),
+			.macos, .ios, .tvos, .watchos, .freebsd, .netbsd, .dragonfly, .openbsd => KQueue,
+			.linux => EPoll,
 			else => unreachable,
 		};
 
-		pub fn init(server: *Server(H)) !Self {
+		pub fn init(server: *Server(H), signal_write: posix.fd_t, ctx: C) !Self {
 			const config = &server.config;
 			const allocator = server.allocator;
 
 			const loop = try Loop.init();
 			errdefer loop.deinit();
 
-			const conn_pool = std.heap.MemoryPool(HandlerConn(H)).init(allocator);
+			var conn_pool = std.heap.MemoryPool(HandlerConn(H)).init(allocator);
 			errdefer conn_pool.deinit();
 
-			var tp = try ThreadPool.init(allocator, .{
-				.count = config.thread_pool.count,
+			var thread_pool = try ThreadPool.init(allocator, .{
+				.count = config.thread_pool.count orelse 4,
 				.backlog = config.thread_pool.backlog orelse 500,
 				.buffer_size = config.thread_pool.buffer_size orelse 32_768,
 			});
-			errdefer tp.deinit();
+			errdefer thread_pool.deinit();
 
 			return .{
+				.ctx = ctx,
 				.loop = loop,
 				.config = config,
-				.bp = &server.pb,
-				.hp = &server.hb,
-				.tp = tp,
+				.signal_pos = 0,
+				.signal_lock = .{},
+				.signal_buf = undefined,
+				.signal_write = signal_write,
+				.thread_pool = thread_pool,
+				.handshake_pool = &server.handshake_pool,
+				.buffer_provider = &server.buffer_provider,
 				.conn_list = .{},
 				.conn_pool = conn_pool,
 				.allocator = allocator,
-				.max_conn = config.workers.max_conn orelse 8192,
+				.max_conn = config.max_conn,
 			};
 		}
 
@@ -538,17 +573,15 @@ fn NonBlocking(comptime H: type) type {
 			closeAll(H, self.conn_list, &self.conn_pool, self.config.shutdown);
 			self.conn_pool.deinit();
 			self.loop.deinit();
-			self.bp.deinit();
 		}
 
-		pub fn listen(self: *Self, listener: posix.socket_t, signal: posix.fd_t, context: anytype) void {
-			_ = context;
+		pub fn listen(self: *Self, listener: posix.socket_t, signal_read: posix.fd_t) void {
 			self.loop.monitorAccept(listener) catch |err| {
 				log.err("failed to add monitor to listening socket: {}", .{err});
 				return;
 			};
 
-			self.loop.monitorSignal(signal) catch |err| {
+			self.loop.monitorSignal(signal_read) catch |err| {
 				log.err("failed to add monitor to signal pipe: {}", .{err});
 				return;
 			};
@@ -570,13 +603,16 @@ fn NonBlocking(comptime H: type) type {
 					}
 
 					if (data == 1) {
-						log.info("received shutdown signal", .{});
-						// for now, activity on the signal can only mean shutdown
-						return;
+						if (self.processSignal(signal_read)) {
+							log.info("received shutdown signal", .{});
+							// signal was closed, we're being told to shutdown
+							return;
+						}
+						continue;
 					}
 
 					const hc: *HandlerConn(H) = @ptrFromInt(data);
-					self.tp.spawn(self, hc);
+					self.thread_pool.spawn(.{self, hc});
 				}
 			}
 		}
@@ -599,9 +635,17 @@ fn NonBlocking(comptime H: type) type {
 
 				log.debug("({}) connected", .{address});
 
-				// set non blocking
-				const flags = (try posix.fcntl(socket, posix.F.GETFL, 0)) | @as(u32, @bitCast(posix.O{ .NONBLOCK = true }));
-				_ = try posix.fcntl(socket, posix.F.SETFL, flags);
+				{
+					// socket is _probably_ in NONBLOCKING mode (it inherits
+					// the flag from the listening socket).
+					const flags = try posix.fcntl(socket, posix.F.GETFL, 0);
+					const nonblocking = @as(u32, @bitCast(posix.O{ .NONBLOCK = true }));
+					if (flags & nonblocking == nonblocking) {
+						// Yup, it's in nonblocking mode. Disable that flag to
+						// put it in blocking mode.
+						_ = try posix.fcntl(socket, posix.F.SETFL, flags & ~nonblocking);
+					}
+				}
 
 				const hc = try self.conn_pool.create();
 				errdefer self.conn_pool.destroy(hc);
@@ -610,14 +654,11 @@ fn NonBlocking(comptime H: type) type {
 					.socket = socket,
 					.handler = null,
 					.handshake = null,
-					.reader = undefined,
+					.reader = null,
 					.conn = .{
 						._closed = false,
-						._rw_mode = .none,
-						._io_mode = .nonblocking,
 						.address = address,
 						.stream = .{.handle = socket},
-						._socket_flags = flags,
 					},
 				};
 				try self.loop.monitorRead(hc, false);
@@ -626,213 +667,392 @@ fn NonBlocking(comptime H: type) type {
 			}
 		}
 
+		fn processSignal(self: *Self, signal: posix.fd_t) bool {
+			const s_t = @sizeOf(usize);
+
+			const buflen = @typeInfo(@TypeOf(self.signal_buf)).Array.len * @sizeOf(usize);
+			const buf: *[buflen]u8 = @ptrCast(&self.signal_buf);
+			const start = self.signal_pos;
+
+			const n = posix.read(signal, buf[start..]) catch |err| switch (err) {
+				error.WouldBlock => return false,
+				else => 0,
+			};
+
+			if (n == 0) {
+				// assume closed, indicating a shutdown
+				return true;
+			}
+
+			const pos = start + n;
+			const connections = pos / s_t;
+
+			for (0..connections) |i| {
+				const data_start = (i * s_t);
+				const data_end = data_start + s_t;
+				const hc: *HandlerConn(H) = @ptrFromInt(@as(*usize, @alignCast(@ptrCast(buf[data_start..data_end]))).*);
+				if (hc.conn.isClosed()) {
+					self.cleanupConn(hc);
+				} else {
+					self.loop.monitorRead(hc, true) catch |err| {
+						log.debug("({}) failed to add read event monitor: {}", .{hc.conn.address, err});
+						hc.conn.close();
+						self.cleanupConn(hc);
+					};
+				}
+			}
+
+			const partial_len = @mod(pos, s_t);
+			const partial_start = pos - partial_len;
+			for (0..partial_len) |i| {
+				buf[i] = buf[partial_start + i];
+			}
+			self.signal_pos = partial_len;
+			return false;
+		}
 
 		// Called in a thread-pool thread/
 		// !! Access to self has to be synchronized !!
-		// Will not be called concurrently for the same hc.
-		// But, as always, the app can have a reference to hc.conn, so hc.conn
-		// has to be synchornized (which its methods are).
-		fn dataAvailable(self: *Self, hc: *HandlerConn, thread_buf: []u8) void {
-			if (hc.handshake) |*state| {
-				self.doHandshake(hc, state) catch {}; // TODO log
+		fn dataAvailable(self: *Self, hc: *HandlerConn(H), thread_buf: []u8) void {
+			// Both doHandshake and processIncoming return !bool. This is to deal with
+			// Zig's lack of error payloads. The error is used for uncaught errors -
+			// usually rare things. The bool, when false, is used to indicate that
+			// the connection should be closed, but not to log a generic uncaught
+			// error message (likely because something more meaningful was already logged)
+			var ok = true;
+			if (hc.handler == null) {
+				// if we don't have a handler yet, then we haven't done our handshake. It's that simple.
+				ok = self.doHandshake(hc) catch |err| blk: {
+					log.warn("({}) uncaugh error handling handshake: {}", .{hc.conn.address, err});
+					break :blk false;
+				};
 			} else {
-				self.processIncoming(hc, thread_buf) catch {}; // TODO log
+				ok = processIncoming(hc, thread_buf) catch |err| blk: {
+					log.warn("({}) uncaugh error handling data: {}", .{hc.conn.address, err});
+					break :blk false;
+				};
+			}
+
+			if (ok == false) {
+				hc.conn.close();
+			}
+
+			const buf = std.mem.asBytes(&@intFromPtr(hc));
+			var to_write: usize = @sizeOf(usize);
+			const pipe = self.signal_write;
+
+			self.signal_lock.lock();
+			defer self.signal_lock.unlock();
+			while (to_write > 0) {
+				to_write -= std.posix.write(pipe, buf) catch @panic("TODO");
 			}
 		}
 
-		fn doHandshake(self: *Self, hc: *HandlerConn, state: *Handshake.State) !void {
-			_ = self;
-			_ = hc;
-			_ = state;
+		// This is being usexecuted in a thread-pool thread. Access to self has to
+		// be synchronized.
+		// Normally access to hc.conn also has to be synchronized, but for doHandshake,
+		// that's only true after H.init is called (at which point, the application
+		// has access to &hc.conn and could do things concurrently to it).
+		fn doHandshake(self: *Self, hc: *HandlerConn(H)) !bool {
+			var state = hc.handshake orelse blk: {
+				const s = try self.handshake_pool.acquire();
+				hc.handshake = s;
+				break :blk s;
+			};
+
+			var buf = state.buf;
+			var conn = &hc.conn;
+			const len = state.len;
+
+			if (len == buf.len) {
+				log.warn("({}) handshake request exceeded maximum configured size ({d})", .{conn.address, buf.len});
+				return false;
+			}
+
+			// Normally, we need to manage the reality of having nonblocking reads
+			// and blocking writes. But here this isn't a concern. (a) the app hasn't
+			// been giving &conn yet, so can't be doing writes and (b) doHandshake
+			// is only called by a single thread per hc.
+			const n = posix.read(hc.socket, buf[len..]) catch |err| {
+				switch (err) {
+					error.BrokenPipe, error.ConnectionResetByPeer => log.debug("({}) handshake connection closed: {}", .{conn.address, err}),
+					else => log.warn("({}) handshake error reading from socket: {}", .{conn.address, err}),
+				}
+				return false;
+			};
+
+			if (n == 0) {
+				return error.Closed;
+			}
+			state.len += n;
+
+			const handshake = Handshake.parse(state) catch |err| {
+				log.debug("({}) error parsing handshake: {}", .{conn.address, err});
+				respondToHandshakeError(conn, err);
+				return false;
+			} orelse {
+				// we need more data
+				return true;
+			};
+
+			self.handshake_pool.release(state);
+			hc.handshake = null;
+
+			// After this, the app has access to &hc.conn, so any access to the
+			// conn has to be synchronized (which the conn does internally).
+
+			hc.handler = H.init(handshake, conn, self.ctx) catch |err| {
+				if (comptime std.meta.hasFn(H, "handshakeErrorResponse")) {
+					preHandOffWrite(H.handshakeErrorResponse(err));
+				} else {
+					respondToHandshakeError(conn, err);
+				}
+				log.debug("({}) " ++ @typeName(H) ++ ".init rejected request {}", .{conn.address, err});
+				return false;
+			};
+
+			try conn.writeFramed(&handshake.reply());
+
+			if (comptime std.meta.hasFn(H, "afterInit")) {
+				hc.handler.?.afterInit() catch |err| {
+					log.debug("({}) " ++ @typeName(H) ++ ".afterInit error: {}", .{conn.address, err});
+					return false;
+				};
+			}
+
+			hc.reader = Reader.init(self.config.connection_buffer_size, self.buffer_provider) catch |err| {
+				log.err("({}) error creating reader: {}", .{conn.address, err});
+				return false;
+			};
+			return true;
 		}
 
-
-		fn doDataAvailable(self: *Self, hc: *HandlerConn, thread_buf: []u8) !void {
-			_ = self;
-			_ = hc;
+		fn processIncoming(hc: *HandlerConn(H), thread_buf: []u8) !bool {
 			_ = thread_buf;
+
+			var conn = &hc.conn;
+			var reader = &hc.reader.?;
+			reader.fill(conn.stream) catch |err| {
+				switch (err) {
+					error.BrokenPipe, error.Closed, error.ConnectionResetByPeer => log.debug("({}) connection closed: {}", .{conn.address, err}),
+					else => log.warn("({}) error reading from connection: {}", .{conn.address, err}),
+				}
+				return false;
+			};
+
+			while (true) {
+				const has_more, const message = reader.read() catch |err| {
+					switch (err) {
+						error.LargeControl => conn.writeFramed(CLOSE_PROTOCOL_ERROR) catch {},
+						error.ReservedFlags => conn.writeFramed(CLOSE_PROTOCOL_ERROR) catch {},
+						else => {},
+					}
+					log.debug("({}) invalid websocket packet: {}", .{conn.address, err});
+					return false;
+				} orelse {
+					// we need more data
+					return true;
+				};
+
+				handleMessage(H, hc, message) catch |err| {
+					log.warn("({}) handle message error: {}", .{conn.address, err});
+					return false;
+				};
+
+				if (conn.isClosed()) {
+					return false;
+				}
+
+				if (has_more == false) {
+					// we don't have more data ready to be processed in our buffer
+					return true;
+				}
+			}
 		}
 
-		fn closeConn(self: *Self, hc: *HandlerConn) void {
-			posix.close(hc.conn.stream.handle);
-			self.conn_list.remove(hc.node);
-			self.coon_pool.destroy(hc);
+		fn cleanupConn(self: *Self, hc: *HandlerConn(H)) void {
+			if (hc.handshake) |hs| {
+				self.handshake_pool.release(hs);
+			}
+
+			if (hc.reader) |*r| {
+				r.deinit();
+			}
+
+			if (comptime std.meta.hasFn(H, "close")) {
+				if (hc.handler) |*h| {
+					h.close();
+				}
+			}
+			self.conn_list.remove(hc);
+			self.conn_pool.destroy(hc);
 		}
 	};
 }
 
-fn KQueue(comptime H: type) type {
-	return struct {
-		q: i32,
-		change_count: usize,
-		change_buffer: [16]Kevent,
-		event_list: [64]Kevent,
+const KQueue = struct {
+	q: i32,
+	change_count: usize,
+	change_buffer: [16]Kevent,
+	event_list: [64]Kevent,
 
-		const Kevent = posix.Kevent;
+	const Self = @This();
+	const Kevent = posix.Kevent;
 
-		fn init() !KQueue {
-			return .{
-				.q = try posix.kqueue(),
-				.change_count = 0,
-				.change_buffer = undefined,
-				.event_list = undefined,
-			};
+	fn init() !Self {
+		return .{
+			.q = try posix.kqueue(),
+			.change_count = 0,
+			.change_buffer = undefined,
+			.event_list = undefined,
+		};
+	}
+
+	fn deinit(self: Self) void {
+		posix.close(self.q);
+	}
+
+	fn monitorAccept(self: *Self, fd: c_int) !void {
+		try self.change(fd, 0, posix.system.EVFILT_READ, posix.system.EV_ADD);
+	}
+
+	fn monitorSignal(self: *Self, fd: c_int) !void {
+		try self.change(fd, 1, posix.system.EVFILT_READ, posix.system.EV_ADD);
+	}
+
+	fn monitorRead(self: *Self, hc: anytype, comptime rearm: bool) !void {
+		_ = rearm; // used by epoll
+		try self.change(hc.socket, @intFromPtr(hc), posix.system.EVFILT_READ, posix.system.EV_ADD | posix.system.EV_ENABLE | posix.system.EV_DISPATCH);
+	}
+
+	fn change(self: *Self, fd: posix.fd_t, data: usize, filter: i16, flags: u16) !void {
+		var change_count = self.change_count;
+		var change_buffer = &self.change_buffer;
+
+		if (change_count == change_buffer.len) {
+			// calling this with an empty event_list will return immediate
+			_ = try posix.kevent(self.q, change_buffer, &[_]Kevent{}, null);
+			change_count = 0;
 		}
+		change_buffer[change_count] = .{
+			.ident = @intCast(fd),
+			.filter = filter,
+			.flags = flags,
+			.fflags = 0,
+			.data = 0,
+			.udata = data,
+		};
+		self.change_count = change_count + 1;
+	}
 
-		fn deinit(self: KQueue) void {
-			posix.close(self.q);
-		}
+	fn wait(self: *Self) !Iterator {
+		const event_list = &self.event_list;
+		const event_count = try posix.kevent(self.q, self.change_buffer[0..self.change_count], event_list, null);
+		self.change_count = 0;
 
-		fn monitorAccept(self: *KQueue, fd: c_int) !void {
-			try self.change(fd, 0, posix.system.EVFILT_READ, posix.system.EV_ADD);
-		}
+		return .{
+			.index = 0,
+			.events = event_list[0..event_count],
+		};
+	}
 
-		fn monitorSignal(self: *KQueue, fd: c_int) !void {
-			try self.change(fd, 1, posix.system.EVFILT_READ, posix.system.EV_ADD);
-		}
+	const Iterator = struct {
+		index: usize,
+		events: []Kevent,
 
-		fn monitorRead(self: *KQueue, hc: *HandlerConn(H), comptime rearm: bool) !void {
-			_ = rearm; // used by epoll
-			try self.change(hc.socket, @intFromPtr(hc), posix.system.EVFILT_READ, posix.system.EV_ADD | posix.system.EV_ENABLE | posix.system.EV_DISPATCH);
-		}
-
-		fn remove(self: *KQueue, hc: *HandlerConn(H)) !void {
-			try self.change(hc.socket, 0, posix.system.EVFILT_READ, posix.system.EV_DELETE);
-		}
-
-		fn change(self: *KQueue, fd: posix.fd_t, data: usize, filter: i16, flags: u16) !void {
-			var change_count = self.change_count;
-			var change_buffer = &self.change_buffer;
-
-			if (change_count == change_buffer.len) {
-				// calling this with an empty event_list will return immediate
-				_ = try posix.kevent(self.q, change_buffer, &[_]Kevent{}, null);
-				change_count = 0;
+		fn next(self: *Iterator) ?usize {
+			const index = self.index;
+			const events = self.events;
+			if (index == events.len) {
+				return null;
 			}
-			change_buffer[change_count] = .{
-				.ident = @intCast(fd),
-				.filter = filter,
-				.flags = flags,
-				.fflags = 0,
-				.data = 0,
-				.udata = data,
-			};
-			self.change_count = change_count + 1;
+			self.index = index + 1;
+			return self.events[index].udata;
 		}
+	};
+};
 
-		fn wait(self: *KQueue) !Iterator {
-			const event_list = &self.event_list;
-			const event_count = try posix.kevent(self.q, self.change_buffer[0..self.change_count], event_list, null);
-			self.change_count = 0;
+const EPoll = struct {
+	q: i32,
+	event_list: [64]EpollEvent,
 
-			return .{
-				.index = 0,
-				.events = event_list[0..event_count],
-			};
-		}
+	const linux = std.os.linux;
 
-		const Iterator = struct {
-			index: usize,
-			events: []Kevent,
+	const Self = @This();
+	const EpollEvent = linux.epoll_event;
 
-			fn next(self: *Iterator) ?usize {
-				const index = self.index;
-				const events = self.events;
-				if (index == events.len) {
-					return null;
-				}
-				self.index = index + 1;
-				return self.events[index].udata;
+	fn init() !Self {
+		return .{
+			.event_list = undefined,
+			.q = try posix.epoll_create1(0),
+		};
+	}
+
+	fn deinit(self: Self) void {
+		posix.close(self.q);
+	}
+
+	fn monitorAccept(self: *Self, fd: c_int) !void {
+		var event = linux.epoll_event{ .events = linux.EPOLL.IN, .data = .{ .ptr = 0 } };
+		return std.posix.epoll_ctl(self.q, linux.EPOLL.CTL_ADD, fd, &event);
+	}
+
+	fn monitorSignal(self: *Self, fd: c_int) !void {
+		var event = linux.epoll_event{ .events = linux.EPOLL.IN, .data = .{ .ptr = 1 } };
+		return std.posix.epoll_ctl(self.q, linux.EPOLL.CTL_ADD, fd, &event);
+	}
+
+	fn monitorRead(self: *Self, hc: anytype, comptime rearm: bool) !void {
+		const op = if (rearm) linux.EPOLL.CTL_MOD else linux.EPOLL.CTL_ADD;
+		var event = linux.epoll_event{ .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT, .data = .{ .ptr = @intFromPtr(hc) } };
+		return posix.epoll_ctl(self.q, op, hc.socket, &event);
+	}
+
+	fn wait(self: *Self) !Iterator {
+		const event_list = &self.event_list;
+		const event_count = blk: while (true) {
+			const rc = linux.syscall6(
+				.epoll_pwait2,
+				@as(usize, @bitCast(@as(isize, self.q))),
+				@intFromPtr(event_list.ptr),
+				event_list.len,
+				0,
+				0,
+				@sizeOf(linux.sigset_t),
+			);
+
+			// taken from std.os.epoll_waits
+			switch (posix.errno(rc)) {
+				.SUCCESS => break :blk @as(usize, @intCast(rc)),
+				.INTR => continue,
+				.BADF => unreachable,
+				.FAULT => unreachable,
+				.INVAL => unreachable,
+				else => unreachable,
 			}
 		};
-	};
-}
 
-fn EPoll(comptime H: type) type {
-	return struct {
-		q: i32,
-		event_list: [64]EpollEvent,
-
-		const linux = std.os.linux;
-		const EpollEvent = linux.epoll_event;
-
-		fn init() !EPoll {
-			return .{
-				.event_list = undefined,
-				.q = try posix.epoll_create1(0),
-			};
-		}
-
-		fn deinit(self: EPoll) void {
-			posix.close(self.q);
-		}
-
-		fn monitorAccept(self: *EPoll, fd: c_int) !void {
-			var event = linux.epoll_event{ .events = linux.EPOLL.IN, .data = .{ .ptr = 0 } };
-			return std.posix.epoll_ctl(self.q, linux.EPOLL.CTL_ADD, fd, &event);
-		}
-
-		fn monitorSignal(self: *EPoll, fd: c_int) !void {
-			var event = linux.epoll_event{ .events = linux.EPOLL.IN, .data = .{ .ptr = 1 } };
-			return std.posix.epoll_ctl(self.q, linux.EPOLL.CTL_ADD, fd, &event);
-		}
-
-		fn monitorRead(self: *EPoll, hc: *HandlerConn(H), comptime rearm: bool) !void {
-			const op = if (rearm) linux.EPOLL.CTL_MOD else linux.EPOLL.CTL_ADD;
-			var event = linux.epoll_event{ .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT, .data = .{ .ptr = @intFromPtr(hc) } };
-			return posix.epoll_ctl(self.q, op, hc.socket, &event);
-		}
-
-		fn remove(self: *EPoll, hc: *HandlerConn(H)) !void {
-			return posix.epoll_ctl(self.q, linux.EPOLL.CTL_DEL, hc.socket, null);
-		}
-
-		fn wait(self: *EPoll) !Iterator {
-			const event_list = &self.event_list;
-			const event_count = blk: while (true) {
-				const rc = linux.syscall6(
-					.epoll_pwait2,
-					@as(usize, @bitCast(@as(isize, self.q))),
-					@intFromPtr(event_list.ptr),
-					event_list.len,
-					0,
-					0,
-					@sizeOf(linux.sigset_t),
-				);
-
-				// taken from std.os.epoll_waits
-				switch (posix.errno(rc)) {
-					.SUCCESS => break :blk @as(usize, @intCast(rc)),
-					.INTR => continue,
-					.BADF => unreachable,
-					.FAULT => unreachable,
-					.INVAL => unreachable,
-					else => unreachable,
-				}
-			};
-
-			return .{
-				.index = 0,
-				.events = event_list[0..event_count],
-			};
-		}
-
-		const Iterator = struct {
-			index: usize,
-			events: []EpollEvent,
-
-			fn next(self: *Iterator) ?usize {
-				const index = self.index;
-				const events = self.events;
-				if (index == events.len) {
-					return null;
-				}
-				self.index = index + 1;
-				return self.events[index].data.ptr;
-			}
+		return .{
+			.index = 0,
+			.events = event_list[0..event_count],
 		};
+	}
+
+	const Iterator = struct {
+		index: usize,
+		events: []EpollEvent,
+
+		fn next(self: *Iterator) ?usize {
+			const index = self.index;
+			const events = self.events;
+			if (index == events.len) {
+				return null;
+			}
+			self.index = index + 1;
+			return self.events[index].data.ptr;
+		}
 	};
-}
+};
 
 // We want to extract as much common logic as possible from the Blocking and
 // NonBlockign workers. The code from this point on is meant to be used with
@@ -857,9 +1077,9 @@ fn HandlerConn(comptime H: type) type {
 	return struct {
 		conn: Conn,
 		handler: ?H,
-		reader: Reader,
+		reader: ?Reader,
 		socket: posix.socket_t, // denormalization from conn.stream.handle
-		handshake: ?Handshake.State,
+		handshake: ?*Handshake.State,
 		next: ?*HandlerConn(H) = null,
 		prev: ?*HandlerConn(H) = null,
 	};
@@ -867,33 +1087,8 @@ fn HandlerConn(comptime H: type) type {
 
 pub const Conn = struct {
 	_closed: bool,
-	_io_mode: IOMode,
-	_rw_mode: RWMode,
-	_socket_flags: usize,
 	stream: net.Stream,
 	address: net.Address,
-
-	const IOMode = enum {
-		blocking,
-		nonblocking,
-	};
-
-	const RWMode = enum {
-		none,
-		read,
-		write,
-	};
-
-	pub fn blocking(self: *Conn) !void {
-		// in blockingMode, io_mode is ALWAYS blocking, so we can skip this
-		if (comptime blockingMode() == false) {
-			if (@atomicRmw(IOMode, &self._io_mode, .Xchg, .blocking, .monotonic) == .nonblock) {
-				// we don't care if the above check + this call isn't atomic.
-				// at worse, we're doing an unecessary syscall
-				_ = try posix.fcntl(self.stream.handle, posix.F.SETFL, self.socket_flags & ~@as(u32, @bitCast(posix.O{ .NONBLOCK = true })));
-			}
-		}
-	}
 
 	pub fn isClosed(self: *Conn) bool {
 		return @atomicLoad(bool, &self._closed, .monotonic);
@@ -978,7 +1173,7 @@ pub const Conn = struct {
 
 fn handleMessage(comptime H: type, hc: *HandlerConn(H), message: Message) !void {
 	const message_type = message.type;
-	defer hc.reader.done(message_type);
+	defer hc.reader.?.done(message_type);
 
 	log.debug("({}) received {s} message", .{hc.conn.address, @tagName(message_type)});
 
@@ -1098,19 +1293,7 @@ fn preHandOffWrite(conn: *Conn, response: []const u8) void {
 
 	var pos: usize = 0;
 	while (pos < response.len) {
-		const n = posix.write(socket, response[pos..]) catch |err| switch (err) {
-			error.WouldBlock => {
-				if (conn._io_mode == .blocking) {
-					// We were in blocking mode, which means we reached our timeout
-					// We're done trying to send the response.
-					return;
-				}
-				try conn.blocking();
-				continue;
-			},
-			else => return,
-		};
-
+		const n = posix.write(socket, response[pos..]) catch return;
 		if (n == 0) {
 			// closed
 			return;
