@@ -713,7 +713,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 
 		// Called in a thread-pool thread/
 		// !! Access to self has to be synchronized !!
-		fn dataAvailable(self: *Self, hc: *HandlerConn(H), thread_buf: []u8) void {
+		fn dataAvailable(self: *Self, hc: *HandlerConn(H), _: []u8) void {
 			// Both doHandshake and processIncoming return !bool. This is to deal with
 			// Zig's lack of error payloads. The error is used for uncaught errors -
 			// usually rare things. The bool, when false, is used to indicate that
@@ -727,7 +727,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 					break :blk false;
 				};
 			} else {
-				ok = processIncoming(hc, thread_buf) catch |err| blk: {
+				ok = processIncoming(hc) catch |err| blk: {
 					log.warn("({}) uncaugh error handling data: {}", .{hc.conn.address, err});
 					break :blk false;
 				};
@@ -827,9 +827,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 			return true;
 		}
 
-		fn processIncoming(hc: *HandlerConn(H), thread_buf: []u8) !bool {
-			_ = thread_buf;
-
+		fn processIncoming(hc: *HandlerConn(H)) !bool {
 			var conn = &hc.conn;
 			var reader = &hc.reader.?;
 			reader.fill(conn.stream) catch |err| {
@@ -1089,15 +1087,20 @@ pub const Conn = struct {
 	_closed: bool,
 	stream: net.Stream,
 	address: net.Address,
+	lock: Thread.Mutex = .{},
 
 	pub fn isClosed(self: *Conn) bool {
-		return @atomicLoad(bool, &self._closed, .monotonic);
+		self.lock.lock();
+		defer self.lock.unlock();
+		return self._closed;
 	}
 
 	pub fn close(self: *Conn) void {
-		if (self.isClosed() == false) {
+		self.lock.lock();
+		defer self.lock.unlock();
+		if (self._closed == false) {
 			posix.close(self.stream.handle);
-			@atomicStore(bool, &self._closed, true, .monotonic);
+			self._closed = true;
 		}
 	}
 
@@ -1137,16 +1140,17 @@ pub const Conn = struct {
 
 		// maximum possible prefix length. op_code + length_type + 8byte length
 		var buf: [10]u8 = undefined;
+		var header: []const u8 = undefined;
 		buf[0] = @intFromEnum(op_code);
 
 		if (l <= 125) {
 			buf[1] = @intCast(l);
-			try stream.writeAll(buf[0..2]);
+			header = buf[0..2];
 		} else if (l < 65536) {
 			buf[1] = 126;
 			buf[2] = @intCast((l >> 8) & 0xFF);
 			buf[3] = @intCast(l & 0xFF);
-			try stream.writeAll(buf[0..4]);
+			header = buf[0..4];
 		} else {
 			buf[1] = 127;
 			buf[2] = @intCast((l >> 56) & 0xFF);
@@ -1157,16 +1161,42 @@ pub const Conn = struct {
 			buf[7] = @intCast((l >> 16) & 0xFF);
 			buf[8] = @intCast((l >> 8) & 0xFF);
 			buf[9] = @intCast(l & 0xFF);
-			try stream.writeAll(buf[0..]);
+			header = buf[0..];
 		}
-		if (l > 0) {
-			try stream.writeAll(data);
+
+		if (l == 0) {
+			// no body, just write the header
+			self.lock.lock();
+			defer self.lock.unlock();
+			return stream.writeAll(header);
+		}
+
+		var vec = [2]std.posix.iovec_const{
+			.{ .len = header.len, .base = header.ptr },
+			.{ .len = data.len, .base = data.ptr },
+		};
+
+		var i: usize = 0;
+		const socket = stream.handle;
+
+		self.lock.lock();
+		defer self.lock.unlock();
+
+		while (true) {
+			var n = try std.posix.writev(socket, vec[i..]);
+			while (n >= vec[i].len) {
+				n -= vec[i].len;
+					i += 1;
+					if (i >= vec.len) return;
+			}
+			vec[i].base += n;
+			vec[i].len -= n;
 		}
 	}
 
-	// TODO: SO MUCH
-	// (WouldBlock handling, thread safety...)
-	pub fn writeFramed(self: Conn, data: []const u8) !void {
+	pub fn writeFramed(self: *Conn, data: []const u8) !void {
+		self.lock.lock();
+		defer self.lock.unlock();
 		try self.stream.writeAll(data);
 	}
 };

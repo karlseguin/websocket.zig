@@ -4,7 +4,7 @@ set -o nounset
 
 root=$(dirname $(realpath $BASH_SOURCE))
 echo "starting server..."
-cd support/autobahn/server/ && zig build -Doptimize=ReleaseFast run &
+cd support/autobahn/server/ && zig build run &
 pid=$!
 
 sleep 3 # give chance for socket to listen
