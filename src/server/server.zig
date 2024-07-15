@@ -1008,28 +1008,7 @@ const EPoll = struct {
 
 	fn wait(self: *Self) !Iterator {
 		const event_list = &self.event_list;
-		const event_count = blk: while (true) {
-			const rc = linux.syscall6(
-				.epoll_pwait2,
-				@as(usize, @bitCast(@as(isize, self.q))),
-				@intFromPtr(event_list.ptr),
-				event_list.len,
-				0,
-				0,
-				@sizeOf(linux.sigset_t),
-			);
-
-			// taken from std.os.epoll_waits
-			switch (posix.errno(rc)) {
-				.SUCCESS => break :blk @as(usize, @intCast(rc)),
-				.INTR => continue,
-				.BADF => unreachable,
-				.FAULT => unreachable,
-				.INVAL => unreachable,
-				else => unreachable,
-			}
-		};
-
+		const event_count = posix.epoll_wait(self.q, event_list, -1);
 		return .{
 			.index = 0,
 			.events = event_list[0..event_count],
@@ -1087,20 +1066,18 @@ pub const Conn = struct {
 	_closed: bool,
 	stream: net.Stream,
 	address: net.Address,
-	lock: Thread.Mutex = .{},
+	write_lock: Thread.Mutex = .{},
 
 	pub fn isClosed(self: *Conn) bool {
-		self.lock.lock();
-		defer self.lock.unlock();
-		return self._closed;
+		// don't use write_lock to protect _closed. `isClosed` is called from
+		// the worker thread and we don't want that potentially blocked while
+		// a write is going on.
+		return @atomicLoad(bool, &self._closed, .monotonic);
 	}
 
 	pub fn close(self: *Conn) void {
-		self.lock.lock();
-		defer self.lock.unlock();
-		if (self._closed == false) {
+		if (@atomicRmw(bool, &self._closed, .Xchg, true, .monotonic) == false) {
 			posix.close(self.stream.handle);
-			self._closed = true;
 		}
 	}
 
@@ -1166,8 +1143,8 @@ pub const Conn = struct {
 
 		if (l == 0) {
 			// no body, just write the header
-			self.lock.lock();
-			defer self.lock.unlock();
+			self.write_lock.lock();
+			defer self.write_lock.unlock();
 			return stream.writeAll(header);
 		}
 
@@ -1179,8 +1156,8 @@ pub const Conn = struct {
 		var i: usize = 0;
 		const socket = stream.handle;
 
-		self.lock.lock();
-		defer self.lock.unlock();
+		self.write_lock.lock();
+		defer self.write_lock.unlock();
 
 		while (true) {
 			var n = try std.posix.writev(socket, vec[i..]);
@@ -1195,8 +1172,8 @@ pub const Conn = struct {
 	}
 
 	pub fn writeFramed(self: *Conn, data: []const u8) !void {
-		self.lock.lock();
-		defer self.lock.unlock();
+		self.write_lock.lock();
+		defer self.write_lock.unlock();
 		try self.stream.writeAll(data);
 	}
 };
