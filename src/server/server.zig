@@ -85,7 +85,15 @@ pub fn Server(comptime H: type) type {
 	return struct {
 		config: Config,
 		allocator: Allocator,
-		cond: Thread.Condition,
+
+		// used to synchornize staring the server and stopping the server
+		run_mut: Thread.Mutex,
+		run_cond: Thread.Condition,
+
+		// used to synchronize listenInNewThread so that it only returns once
+		// the server has actually started.
+		launch_mut: Thread.Mutex,
+		launch_cond: Thread.Condition,
 
 		// these aren't used by the server themselves, but both Blocking and NonBlocking
 		// workers need them, so we put them here, and reference them in the workers,
@@ -109,7 +117,10 @@ pub fn Server(comptime H: type) type {
 			return .{
 				.handshake_pool = handshake_pool,
 				.buffer_provider = buffer_provider,
-				.cond = .{},
+				.run_mut = .{},
+				.run_cond = .{},
+				.launch_mut = .{},
+				.launch_cond = .{},
 				.config = config,
 				.allocator = allocator,
 			};
@@ -121,10 +132,18 @@ pub fn Server(comptime H: type) type {
 		}
 
 		pub fn listenInNewThread(self: *Self, context: anytype) !Thread {
-			return try Thread.spawn(.{}, Self.listen, .{self, context});
+			self.launch_mut.lock();
+			defer self.launch_mut.unlock();
+			const thrd = try Thread.spawn(.{}, Self.listen, .{self, context});
+			// this mess helps to minimze the window between this function
+			self.launch_cond.wait(&self.launch_mut);
+			return thrd;
 		}
 
 		pub fn listen(self: *Self, context: anytype) !void {
+			self.run_mut.lock();
+			errdefer self.run_mut.unlock();
+
 			const config = &self.config;
 
 			var no_delay = true;
@@ -174,10 +193,6 @@ pub fn Server(comptime H: type) type {
 				try posix.listen(socket, 1024); // kernel backlog
 			}
 
-			// used to block our thread until stop() is called
-			var mutex = Thread.Mutex{};
-			mutex.lock();
-
 			if (comptime blockingMode()) {
 				errdefer posix.close(socket);
 				var w = try Blocking(H).init(self);
@@ -185,11 +200,10 @@ pub fn Server(comptime H: type) type {
 
 				const thrd = try std.Thread.spawn(.{}, Blocking(H).listen, .{&w, socket, context});
 				log.info("starting blocking worker to listen on {}", .{address});
-
+				self.launch_cond.signal();
 				// is this really the best way?
 
-				self.cond.wait(&mutex);
-				mutex.unlock();
+				self.run_cond.wait(&self.run_mut);
 				w.stop();
 				posix.close(socket);
 				thrd.join();
@@ -203,18 +217,19 @@ pub fn Server(comptime H: type) type {
 
 				const thrd = try Thread.spawn(.{}, NonBlocking(H, C).listen, .{&w, socket, signals[0]});
 				log.info("starting nonblocking worker to listen on {}", .{address});
+				self.launch_cond.signal();
 
 				// is this really the best way?
-				self.cond.wait(&mutex);
-				mutex.unlock();
+				self.run_cond.wait(&self.run_mut);
 				posix.close(signals[1]);
 				thrd.join();
-				w.deinit();
 			}
 		}
 
 		pub fn stop(self: *Self) void {
-			self.cond.signal();
+			self.run_mut.lock();
+			defer self.run_mut.unlock();
+			self.run_cond.signal();
 		}
 	};
 }
@@ -573,6 +588,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 			closeAll(H, self.conn_list, &self.conn_pool, self.config.shutdown);
 			self.conn_pool.deinit();
 			self.loop.deinit();
+			self.thread_pool.deinit();
 		}
 
 		pub fn listen(self: *Self, listener: posix.socket_t, signal_read: posix.fd_t) void {
@@ -877,9 +893,9 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 				r.deinit();
 			}
 
-			if (comptime std.meta.hasFn(H, "close")) {
+			if (comptime std.meta.hasFn(H, "handleClose")) {
 				if (hc.handler) |*h| {
-					h.close();
+					h.handleClose();
 				}
 			}
 			self.conn_list.remove(hc);
@@ -1248,9 +1264,11 @@ fn handleMessage(comptime H: type, hc: *HandlerConn(H), message: Message) !void 
 fn closeAll(comptime H: type, conn_list: List(HandlerConn(H)), conn_pool: *std.heap.MemoryPool(HandlerConn(H)), shutdown: Config.Shutdown) void {
 	var next_node = conn_list.head;
 	while (next_node) |hc| {
-		if (shutdown.notify_handler) {
-			if (hc.handler) |*h| {
-				h.close();
+		if (comptime std.meta.hasFn(H, "handleClose")) {
+			if (shutdown.notify_handler) {
+				if (hc.handler) |*h| {
+					h.close();
+				}
 			}
 		}
 
@@ -1362,7 +1380,25 @@ fn List(comptime T: type) type {
 }
 
 const t = @import("../t.zig");
-test "List: insert & remove" {
+test "Server: shutdown" {
+	var server = try Server(TestHandler).init(t.allocator, .{
+		.port = 9292,
+		.address = "127.0.0.1",
+	});
+	const thrd = try server.listenInNewThread({});
+	server.stop();
+	thrd.join();
+	server.deinit();
+}
+
+const TestHandler = struct {
+	pub fn init(_: Handshake, _: *Conn, _: void) !TestHandler {
+		return .{};
+	}
+	pub fn handleMessage(_: *TestHandler, _: []const u8) !void {}
+};
+
+test "List" {
 	var list = List(TestNode){};
 	try expectList(&.{}, list);
 
