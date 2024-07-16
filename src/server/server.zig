@@ -47,6 +47,8 @@ pub const Config = struct {
 	address: []const u8 = "127.0.0.1",
 	unix_path: ?[]const u8 = null,
 
+	worker_count: ?u8 = null,
+
 	max_conn: usize = 16_384,
 	max_message_size: usize = 65_536,
 	connection_buffer_size: usize = 4_096,
@@ -198,10 +200,9 @@ pub fn Server(comptime H: type) type {
 				var w = try Blocking(H).init(self);
 				defer w.deinit();
 
-				const thrd = try std.Thread.spawn(.{}, Blocking(H).listen, .{&w, socket, context});
+				const thrd = try std.Thread.spawn(.{}, Blocking(H).run, .{&w, socket, context});
 				log.info("starting blocking worker to listen on {}", .{address});
 				self.launch_cond.signal();
-				// is this really the best way?
 
 				self.run_cond.wait(&self.run_mut);
 				w.stop();
@@ -210,19 +211,44 @@ pub fn Server(comptime H: type) type {
 			} else {
 				defer posix.close(socket);
 				const C = @TypeOf(context);
-				const signals = try posix.pipe2(.{.NONBLOCK = true});
+				const Worker = NonBlocking(H, C);
 
-				var w = try NonBlocking(H, C).init(self, signals[1], context);
-				defer w.deinit();
+				const allocator = self.allocator;
+				const worker_count = config.worker_count orelse 1;
 
-				const thrd = try Thread.spawn(.{}, NonBlocking(H, C).listen, .{&w, socket, signals[0]});
+				const signals = try allocator.alloc([2]posix.fd_t, worker_count);
+				const threads = try allocator.alloc(Thread, worker_count);
+				const workers = try allocator.alloc(Worker, worker_count);
+
+				var started: usize = 0;
+
+				defer {
+					for (0..started) |i| {
+						posix.close(signals[i][1]);
+						threads[i].join();
+						workers[i].deinit();
+					}
+					allocator.free(signals);
+					allocator.free(threads);
+					allocator.free(workers);
+				}
+
+				for (0..worker_count) |i| {
+					signals[i] = try posix.pipe2(.{.NONBLOCK = true});
+					errdefer posix.close(signals[i][1]);
+
+					workers[i] = try Worker.init(self, signals[i][1], context);
+					errdefer workers[i].deinit();
+
+					threads[i] = try Thread.spawn(.{}, Worker.run, .{ &workers[i], socket, signals[i][0] });
+					started += 1;
+				}
+
 				log.info("starting nonblocking worker to listen on {}", .{address});
 				self.launch_cond.signal();
 
 				// is this really the best way?
 				self.run_cond.wait(&self.run_mut);
-				posix.close(signals[1]);
-				thrd.join();
 			}
 		}
 
@@ -297,7 +323,7 @@ fn Blocking(comptime H: type) type {
 			@atomicStore(bool, &self.running, false, .monotonic);
 		}
 
-		pub fn listen(self: *Self, listener: posix.socket_t, context: anytype) void {
+		pub fn run(self: *Self, listener: posix.socket_t, context: anytype) void {
 			while (true) {
 				var address: net.Address = undefined;
 				var address_len: posix.socklen_t = @sizeOf(net.Address);
@@ -591,7 +617,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 			self.thread_pool.deinit();
 		}
 
-		pub fn listen(self: *Self, listener: posix.socket_t, signal_read: posix.fd_t) void {
+		pub fn run(self: *Self, listener: posix.socket_t, signal_read: posix.fd_t) void {
 			self.loop.monitorAccept(listener) catch |err| {
 				log.err("failed to add monitor to listening socket: {}", .{err});
 				return;
