@@ -65,7 +65,6 @@ pub const Config = struct {
 	};
 
 	const Shutdown = struct {
-		close_socket: bool = true,
 		notify_client: bool = true,
 		notify_handler: bool = true,
 	};
@@ -315,7 +314,6 @@ fn Blocking(comptime H: type) type {
 		}
 
 		pub fn deinit(self: *Self) void {
-			closeAll(H, self.conn_list, &self.conn_pool, self.config.shutdown);
 			self.conn_pool.deinit();
 		}
 
@@ -329,7 +327,7 @@ fn Blocking(comptime H: type) type {
 				var address_len: posix.socklen_t = @sizeOf(net.Address);
 				const socket = posix.accept(listener, &address.any, &address_len, posix.SOCK.CLOEXEC) catch |err| {
 					if (@atomicLoad(bool, &self.running, .monotonic) == false) {
-						return;
+						break;
 					}
 					log.err("failed to accept socket: {}", .{err});
 					continue;
@@ -342,6 +340,25 @@ fn Blocking(comptime H: type) type {
 					continue;
 				};
 				thread.detach();
+			}
+
+			{
+				self.conn_lock.lock();
+				defer self.conn_lock.unlock();
+				closeAll(H, self.conn_list, self.config.shutdown);
+			}
+
+			// wait up to 1 second for every connection to cleanly shutdown
+			var i: usize = 0;
+			while (i < 10) : (i += 1) {
+				{
+					self.conn_lock.lock();
+					defer self.conn_lock.unlock();
+					if (self.conn_list.len == 0) {
+						break;
+					}
+				}
+				std.time.sleep(std.time.ns_per_ms * 100);
 			}
 		}
 
@@ -377,147 +394,24 @@ fn Blocking(comptime H: type) type {
 				break :blk hc;
 			};
 
-			var conn = &hc.conn;
-
 			defer {
-				conn.close();
+				hc.conn.close();
+				hc.cleanup(self.handshake_pool);
 				self.conn_lock.lock();
 				self.conn_list.remove(hc);
 				self.conn_pool.destroy(hc);
 				self.conn_lock.unlock();
 			}
 
-			hc.handler = (try self.doHandshake(conn, context)) orelse return;
-
-			defer if (comptime std.meta.hasFn(H, "close")) {
-				hc.handler.?.close();
-			};
-
-			if (comptime std.meta.hasFn(H, "afterInit")) {
-				hc.handler.?.afterInit() catch |err| {
-					log.debug("({}) " ++ @typeName(H) ++ ".afterInit error: {}", .{address, err});
-					return;
-				};
-			}
-
-			// we delay initializing the reader until AFTER the handshake to avoid
-			// unecessarily acllocate config.buffer_size
-			hc.reader = Reader.init(self.config.connection_buffer_size, self.buffer_provider) catch |err| {
-				log.err("({}) error creating reader: {}", .{address, err});
+			if (handleHandshake(H, self, hc, context) == false) {
 				return;
-			};
-
-			var reader = &hc.reader.?;
-			defer reader.deinit();
-
-			log.debug("({}) connection successfully upgraded", .{address});
+			}
 
 			while (true) {
-
-				// fill our reader buffer with more data
-				reader.fill(hc.conn.stream) catch |err| {
-					switch (err) {
-						error.BrokenPipe, error.Closed, error.ConnectionResetByPeer => log.debug("({}) connection closed: {}", .{address, err}),
-						else => log.warn("({}) error reading from connection: {}", .{address, err}),
-					}
-					return;
-				};
-
-				while (true) {
-					const has_more, const message = reader.read() catch |err| {
-						switch (err) {
-							error.LargeControl => conn.writeFramed(CLOSE_PROTOCOL_ERROR) catch {},
-							error.ReservedFlags => conn.writeFramed(CLOSE_PROTOCOL_ERROR) catch {},
-							else => {},
-						}
-						log.debug("({}) invalid websocket packet: {}", .{address, err});
-						return;
-					} orelse break; // orelse, we need more data, go back to fill the buffer from the stream
-
-					// Is it ok to swallow these errors?
-					// It should be. handleMesage doesn't do any allocations.
-					// The error is either a result of a failed socket write, or an
-					// error returned by the handler, which, if the app cares about, they
-					// can handle within the handler itself.
-					handleMessage(H, hc, message) catch |err| {
-						log.warn("({}) handle message error: {}", .{address, err});
-						return;
-					};
-
-					if (conn.isClosed()) {
-						return;
-					}
-
-					if (has_more == false) {
-						// we don't have more data ready to be processed in our buffer
-						// break out of the inner loop, back to the outer loop, where
-						// we'll read more from the stream into our buffer
-						break;
-					}
+				if (handleIncoming(H, hc) == false) {
+					break;
 				}
 			}
-		}
-
-		fn doHandshake(self: *Self, conn: *Conn, context: anytype) !?H {
-			var arena = std.heap.ArenaAllocator.init(self.allocator);
-			defer arena.deinit();
-
-			const state = try self.handshake_pool.acquire();
-			defer self.handshake_pool.release(state);
-
-			const handshake = self.readHandshake(conn, state) catch |err| {
-				log.debug("({}) error reading handshake: {}", .{conn.address, err});
-				switch (err) {
-					error.BrokenPipe, error.Closed, error.ConnectionResetByPeer => {},
-					else => respondToHandshakeError(conn, err),
-				}
-				return null;
-			};
-
-			var handler = H.init(handshake, conn, context) catch |err| {
-				if (comptime std.meta.hasFn(H, "handshakeErrorResponse")) {
-					preHandOffWrite(H.handshakeErrorResponse(err));
-				} else {
-					respondToHandshakeError(conn, err);
-				}
-				log.debug("({}) " ++ @typeName(H) ++ ".init rejected request {}", .{conn.address, err});
-				return null;
-			};
-
-			conn.writeFramed(&handshake.reply()) catch |err| {
-				if (comptime std.meta.hasFn(H, "close")) {
-					handler.close();
-				}
-				log.warn("({}) error writing handshake response: {}", .{conn.address, err});
-				return null;
-			};
-			return handler;
-		}
-
-		fn readHandshake(self: *Self, conn: *Conn, state: *Handshake.State) !Handshake {
-			const socket = conn.stream.handle;
-			const timeout = self.handshake_timeout;
-			const deadline = timestamp() + timeout.sec;
-
-			var buf = state.buf;
-			while (state.len < buf.len) {
-				const n = try posix.read(socket, buf[state.len..]);
-				if (n == 0) {
-					return error.Closed;
-				}
-
-				state.len += n;
-				if (try Handshake.parse(state)) |handshake| {
-					return handshake;
-				}
-
-				// else, we need more data
-
-				if (timestamp() > deadline) {
-					return error.Timeout;
-				}
-			}
-			return error.RequestTooLarge;
 		}
 	};
 }
@@ -611,7 +505,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 		}
 
 		pub fn deinit(self: *Self) void {
-			closeAll(H, self.conn_list, &self.conn_pool, self.config.shutdown);
+			closeAll(H, self.conn_list, self.config.shutdown);
 			self.conn_pool.deinit();
 			self.loop.deinit();
 			self.thread_pool.deinit();
@@ -756,29 +650,12 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 		// Called in a thread-pool thread/
 		// !! Access to self has to be synchronized !!
 		fn dataAvailable(self: *Self, hc: *HandlerConn(H), _: []u8) void {
-			// Both doHandshake and processIncoming return !bool. This is to deal with
-			// Zig's lack of error payloads. The error is used for uncaught errors -
-			// usually rare things. The bool, when false, is used to indicate that
-			// the connection should be closed, but not to log a generic uncaught
-			// error message (likely because something more meaningful was already logged)
-			var ok = true;
-			if (hc.handler == null) {
-				// if we don't have a handler yet, then we haven't done our handshake. It's that simple.
-				ok = self.doHandshake(hc) catch |err| blk: {
-					log.warn("({}) uncaugh error handling handshake: {}", .{hc.conn.address, err});
-					break :blk false;
-				};
-			} else {
-				ok = processIncoming(hc) catch |err| blk: {
-					log.warn("({}) uncaugh error handling data: {}", .{hc.conn.address, err});
-					break :blk false;
-				};
-			}
-
+			const ok = if (hc.handler == null) handleHandshake(H, self, hc, self.ctx) else handleIncoming(H, hc);
 			if (ok == false) {
 				hc.conn.close();
 			}
 
+			// use our signal pipe to send the socket back to the worker
 			const buf = std.mem.asBytes(&@intFromPtr(hc));
 			var to_write: usize = @sizeOf(usize);
 			const pipe = self.signal_write;
@@ -786,144 +663,18 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 			self.signal_lock.lock();
 			defer self.signal_lock.unlock();
 			while (to_write > 0) {
-				to_write -= std.posix.write(pipe, buf) catch @panic("TODO");
-			}
-		}
-
-		// This is being usexecuted in a thread-pool thread. Access to self has to
-		// be synchronized.
-		// Normally access to hc.conn also has to be synchronized, but for doHandshake,
-		// that's only true after H.init is called (at which point, the application
-		// has access to &hc.conn and could do things concurrently to it).
-		fn doHandshake(self: *Self, hc: *HandlerConn(H)) !bool {
-			var state = hc.handshake orelse blk: {
-				const s = try self.handshake_pool.acquire();
-				hc.handshake = s;
-				break :blk s;
-			};
-
-			var buf = state.buf;
-			var conn = &hc.conn;
-			const len = state.len;
-
-			if (len == buf.len) {
-				log.warn("({}) handshake request exceeded maximum configured size ({d})", .{conn.address, buf.len});
-				return false;
-			}
-
-			// Normally, we need to manage the reality of having nonblocking reads
-			// and blocking writes. But here this isn't a concern. (a) the app hasn't
-			// been giving &conn yet, so can't be doing writes and (b) doHandshake
-			// is only called by a single thread per hc.
-			const n = posix.read(hc.socket, buf[len..]) catch |err| {
-				switch (err) {
-					error.BrokenPipe, error.ConnectionResetByPeer => log.debug("({}) handshake connection closed: {}", .{conn.address, err}),
-					else => log.warn("({}) handshake error reading from socket: {}", .{conn.address, err}),
-				}
-				return false;
-			};
-
-			if (n == 0) {
-				return error.Closed;
-			}
-			state.len += n;
-
-			const handshake = Handshake.parse(state) catch |err| {
-				log.debug("({}) error parsing handshake: {}", .{conn.address, err});
-				respondToHandshakeError(conn, err);
-				return false;
-			} orelse {
-				// we need more data
-				return true;
-			};
-
-			self.handshake_pool.release(state);
-			hc.handshake = null;
-
-			// After this, the app has access to &hc.conn, so any access to the
-			// conn has to be synchronized (which the conn does internally).
-
-			hc.handler = H.init(handshake, conn, self.ctx) catch |err| {
-				if (comptime std.meta.hasFn(H, "handshakeErrorResponse")) {
-					preHandOffWrite(H.handshakeErrorResponse(err));
-				} else {
-					respondToHandshakeError(conn, err);
-				}
-				log.debug("({}) " ++ @typeName(H) ++ ".init rejected request {}", .{conn.address, err});
-				return false;
-			};
-
-			try conn.writeFramed(&handshake.reply());
-
-			if (comptime std.meta.hasFn(H, "afterInit")) {
-				hc.handler.?.afterInit() catch |err| {
-					log.debug("({}) " ++ @typeName(H) ++ ".afterInit error: {}", .{conn.address, err});
-					return false;
-				};
-			}
-
-			hc.reader = Reader.init(self.config.connection_buffer_size, self.buffer_provider) catch |err| {
-				log.err("({}) error creating reader: {}", .{conn.address, err});
-				return false;
-			};
-			return true;
-		}
-
-		fn processIncoming(hc: *HandlerConn(H)) !bool {
-			var conn = &hc.conn;
-			var reader = &hc.reader.?;
-			reader.fill(conn.stream) catch |err| {
-				switch (err) {
-					error.BrokenPipe, error.Closed, error.ConnectionResetByPeer => log.debug("({}) connection closed: {}", .{conn.address, err}),
-					else => log.warn("({}) error reading from connection: {}", .{conn.address, err}),
-				}
-				return false;
-			};
-
-			while (true) {
-				const has_more, const message = reader.read() catch |err| {
+				to_write -= std.posix.write(pipe, buf) catch |err| {
 					switch (err) {
-						error.LargeControl => conn.writeFramed(CLOSE_PROTOCOL_ERROR) catch {},
-						error.ReservedFlags => conn.writeFramed(CLOSE_PROTOCOL_ERROR) catch {},
-						else => {},
+						error.BrokenPipe, error.NotOpenForWriting => return, // assume the pipe was closed, things are shutting down
+						else => log.err("({}) failed writing to internal pipe: {}", .{hc.conn.address, err})
 					}
-					log.debug("({}) invalid websocket packet: {}", .{conn.address, err});
-					return false;
-				} orelse {
-					// we need more data
-					return true;
+					return;
 				};
-
-				handleMessage(H, hc, message) catch |err| {
-					log.warn("({}) handle message error: {}", .{conn.address, err});
-					return false;
-				};
-
-				if (conn.isClosed()) {
-					return false;
-				}
-
-				if (has_more == false) {
-					// we don't have more data ready to be processed in our buffer
-					return true;
-				}
 			}
 		}
 
 		fn cleanupConn(self: *Self, hc: *HandlerConn(H)) void {
-			if (hc.handshake) |hs| {
-				self.handshake_pool.release(hs);
-			}
-
-			if (hc.reader) |*r| {
-				r.deinit();
-			}
-
-			if (comptime std.meta.hasFn(H, "handleClose")) {
-				if (hc.handler) |*h| {
-					h.handleClose();
-				}
-			}
+			hc.cleanup(self.handshake_pool);
 			self.conn_list.remove(hc);
 			self.conn_pool.destroy(hc);
 		}
@@ -1101,6 +852,28 @@ fn HandlerConn(comptime H: type) type {
 		handshake: ?*Handshake.State,
 		next: ?*HandlerConn(H) = null,
 		prev: ?*HandlerConn(H) = null,
+
+		const Self = @This();
+
+		fn cleanup(self: *Self, handshake_pool: *Handshake.Pool) void {
+			self.conn.lock.lock();
+			defer self.conn.lock.unlock();
+
+			if (self.handshake) |h| {
+				handshake_pool.release(h);
+			}
+
+			if (self.reader) |*r| {
+				r.deinit();
+			}
+
+			if (comptime std.meta.hasFn(H, "close")) {
+				if (self.handler) |*h| {
+					h.close();
+					self.handler = null;
+				}
+			}
+		}
 	};
 }
 
@@ -1108,10 +881,10 @@ pub const Conn = struct {
 	_closed: bool,
 	stream: net.Stream,
 	address: net.Address,
-	write_lock: Thread.Mutex = .{},
+	lock: Thread.Mutex = .{},
 
 	pub fn isClosed(self: *Conn) bool {
-		// don't use write_lock to protect _closed. `isClosed` is called from
+		// don't use lock to protect _closed. `isClosed` is called from
 		// the worker thread and we don't want that potentially blocked while
 		// a write is going on.
 		return @atomicLoad(bool, &self._closed, .monotonic);
@@ -1185,8 +958,8 @@ pub const Conn = struct {
 
 		if (l == 0) {
 			// no body, just write the header
-			self.write_lock.lock();
-			defer self.write_lock.unlock();
+			self.lock.lock();
+			defer self.lock.unlock();
 			return stream.writeAll(header);
 		}
 
@@ -1198,8 +971,8 @@ pub const Conn = struct {
 		var i: usize = 0;
 		const socket = stream.handle;
 
-		self.write_lock.lock();
-		defer self.write_lock.unlock();
+		self.lock.lock();
+		defer self.lock.unlock();
 
 		while (true) {
 			var n = try std.posix.writev(socket, vec[i..]);
@@ -1214,100 +987,240 @@ pub const Conn = struct {
 	}
 
 	pub fn writeFramed(self: *Conn, data: []const u8) !void {
-		self.write_lock.lock();
-		defer self.write_lock.unlock();
+		self.lock.lock();
+		defer self.lock.unlock();
 		try self.stream.writeAll(data);
 	}
 };
 
-fn handleMessage(comptime H: type, hc: *HandlerConn(H), message: Message) !void {
-	const message_type = message.type;
-	defer hc.reader.?.done(message_type);
+// This is being usexecuted in a thread-pool thread. Access to self has to
+// be synchronized.
+// Normally access to hc.conn also has to be synchronized, but for doHandshake,
+// that's only true after H.init is called (at which point, the application
+// has access to &hc.conn and could do things concurrently to it).
+fn handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx: anytype) bool {
+	return _handleHandshake(H, worker, hc, ctx) catch |err| {
+		log.warn("({}) uncaugh error processing handshake: {}", .{hc.conn.address, err});
+		return false;
+	};
+}
 
-	log.debug("({}) received {s} message", .{hc.conn.address, @tagName(message_type)});
+fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx: anytype) !bool {
+	std.debug.assert(hc.handler == null);
+
+	var state = hc.handshake orelse blk: {
+		const s = try worker.handshake_pool.acquire();
+		hc.handshake = s;
+		break :blk s;
+	};
+
+	var buf = state.buf;
+	var conn = &hc.conn;
+	const len = state.len;
+
+	if (len == buf.len) {
+		log.warn("({}) handshake request exceeded maximum configured size ({d})", .{conn.address, buf.len});
+		return false;
+	}
+
+	const n = posix.read(hc.socket, buf[len..]) catch |err| {
+		switch (err) {
+			error.BrokenPipe, error.ConnectionResetByPeer => log.debug("({}) handshake connection closed: {}", .{conn.address, err}),
+			else => log.warn("({}) handshake error reading from socket: {}", .{conn.address, err}),
+		}
+		return false;
+	};
+
+	if (n == 0) {
+		log.debug("({}) handshake connection closed", .{conn.address});
+		return false;
+	}
+
+	state.len += n;
+	const handshake = Handshake.parse(state) catch |err| {
+		log.debug("({}) error parsing handshake: {}", .{conn.address, err});
+		respondToHandshakeError(conn, err);
+		return false;
+	} orelse {
+		// we need more data
+		return true;
+	};
+
+	worker.handshake_pool.release(state);
+	hc.handshake = null;
+
+	// After this, the app has access to &hc.conn, so any access to the
+	// conn has to be synchronized (which the conn does internally).
+
+	hc.handler = H.init(handshake, conn, ctx) catch |err| {
+		if (comptime std.meta.hasFn(H, "handshakeErrorResponse")) {
+			preHandOffWrite(H.handshakeErrorResponse(err));
+		} else {
+			respondToHandshakeError(conn, err);
+		}
+		log.debug("({}) " ++ @typeName(H) ++ ".init rejected request {}", .{conn.address, err});
+		return false;
+	};
+
+	try conn.writeFramed(&handshake.reply());
+
+	if (comptime std.meta.hasFn(H, "afterInit")) {
+		hc.handler.?.afterInit() catch |err| {
+			log.debug("({}) " ++ @typeName(H) ++ ".afterInit error: {}", .{conn.address, err});
+			return false;
+		};
+	}
+
+	hc.reader = Reader.init(worker.config.connection_buffer_size, worker.buffer_provider) catch |err| {
+		log.err("({}) error creating reader: {}", .{conn.address, err});
+		return false;
+	};
+
+	log.debug("({}) connection successfully upgraded", .{conn.address});
+
+	return true;
+}
+
+fn handleIncoming(comptime H: type, hc: *HandlerConn(H)) bool {
+	std.debug.assert(hc.handshake == null);
+	return _handleIncoming(H, hc) catch |err| {
+		log.warn("({}) uncaugh error handling incoming data: {}", .{hc.conn.address, err});
+		return false;
+	};
+}
+
+fn _handleIncoming(comptime H: type, hc: *HandlerConn(H)) !bool {
+	var conn = &hc.conn;
+	var reader = &hc.reader.?;
+	reader.fill(conn.stream) catch |err| {
+		switch (err) {
+			error.BrokenPipe, error.Closed, error.ConnectionResetByPeer => log.debug("({}) connection closed: {}", .{conn.address, err}),
+			else => log.warn("({}) error reading from connection: {}", .{conn.address, err}),
+		}
+		return false;
+	};
 
 	const handler = &hc.handler.?;
+	while (true) {
+		const has_more, const message = reader.read() catch |err| {
+			switch (err) {
+				error.LargeControl => conn.writeFramed(CLOSE_PROTOCOL_ERROR) catch {},
+				error.ReservedFlags => conn.writeFramed(CLOSE_PROTOCOL_ERROR) catch {},
+				else => {},
+			}
+			log.debug("({}) invalid websocket packet: {}", .{conn.address, err});
+			return false;
+		} orelse {
+			// everything is fine, we just need more data
+			return true;
+		};
 
-	switch (message_type) {
-		.text, .binary => {
-			switch (comptime @typeInfo(@TypeOf(H.handleMessage)).Fn.params.len) {
-				2 => try handler.handleMessage(message.data),
-				3 => try handler.handleMessage(message.data, if (message_type == .text) .text else .binary),
-				else => @compileError(@typeName(H) ++ ".handleMessage must accept 2 or 3 parameters"),
-			}
-		},
-		.pong => if (comptime std.meta.hasFn(H, "handlePong")) {
-			try handler.handlePong();
-		},
-		.ping => {
-			const data = message.data;
-			if (comptime std.meta.hasFn(H, "handlePing")) {
-				try handler.handlePing(data);
-			} else if (data.len == 0) {
-				try hc.conn.writeFramed(EMPTY_PONG);
-			} else {
-				try hc.conn.writeFrame(.pong, data);
-			}
-		},
-		.close => {
-			const conn = &hc.conn;
-			defer conn.close();
-			const data = message.data;
-			if (comptime std.meta.hasFn(H, "handleClose")) {
-				return handler.handleClose(data);
-			}
+		const message_type = message.type;
+		defer reader.done(message_type);
 
-			const l = data.len;
-			if (l == 0) {
-				return conn.writeClose();
-			}
+		log.debug("({}) received {s} message", .{hc.conn.address, @tagName(message_type)});
+		switch (message_type) {
+			.text, .binary => {
+				switch (comptime @typeInfo(@TypeOf(H.handleMessage)).Fn.params.len) {
+					2 => handler.handleMessage(message.data) catch return false,
+					3 => handler.handleMessage(message.data, if (message_type == .text) .text else .binary) catch return false,
+					else => @compileError(@typeName(H) ++ ".handleMessage must accept 2 or 3 parameters"),
+				}
+			},
+			.pong => if (comptime std.meta.hasFn(H, "handlePong")) {
+				try handler.handlePong();
+			},
+			.ping => {
+				const data = message.data;
+				if (comptime std.meta.hasFn(H, "handlePing")) {
+					try handler.handlePing(data);
+				} else if (data.len == 0) {
+					try hc.conn.writeFramed(EMPTY_PONG);
+				} else {
+					try hc.conn.writeFrame(.pong, data);
+				}
+			},
+			.close => {
+				defer conn.close();
+				const data = message.data;
+				if (comptime std.meta.hasFn(H, "handleClose")) {
+					return handler.handleClose(data);
+				}
 
-			if (l == 1) {
-				// close with a payload always has to have at least a 2-byte payload,
-				// since a 2-byte code is required
-				return conn.writeFramed(CLOSE_PROTOCOL_ERROR);
-			}
+				const l = data.len;
+				if (l == 0) {
+					conn.writeClose();
+					return false;
+				}
 
-			const code = @as(u16, @intCast(data[1])) | (@as(u16, @intCast(data[0])) << 8);
-			if (code < 1000 or code == 1004 or code == 1005 or code == 1006 or (code > 1013 and code < 3000)) {
-				return conn.writeFramed(CLOSE_PROTOCOL_ERROR);
-			}
+				if (l == 1) {
+					// close with a payload always has to have at least a 2-byte payload,
+					// since a 2-byte code is required
+					try conn.writeFramed(CLOSE_PROTOCOL_ERROR);
+					return false;
+				}
 
-			if (l == 2) {
-				return try conn.writeFramed(CLOSE_NORMAL);
-			}
+				const code = @as(u16, @intCast(data[1])) | (@as(u16, @intCast(data[0])) << 8);
+				if (code < 1000 or code == 1004 or code == 1005 or code == 1006 or (code > 1013 and code < 3000)) {
+					try conn.writeFramed(CLOSE_PROTOCOL_ERROR);
+					return false;
+				}
 
-			const payload = data[2..];
-			if (!std.unicode.utf8ValidateSlice(payload)) {
-				// if we have a payload, it must be UTF8 (why?!)
-				return try conn.writeFramed(CLOSE_PROTOCOL_ERROR);
-			}
-			return conn.writeClose();
-		},
+				if (l == 2) {
+					try conn.writeFramed(CLOSE_NORMAL);
+					return false;
+				}
+
+				const payload = data[2..];
+				if (!std.unicode.utf8ValidateSlice(payload)) {
+					// if we have a payload, it must be UTF8 (why?!)
+					try conn.writeFramed(CLOSE_PROTOCOL_ERROR);
+				} else {
+					conn.writeClose();
+				}
+				return false;
+			},
+		}
+
+		if (conn.isClosed()) {
+			return false;
+		}
+
+		if (has_more == false) {
+			// we don't have more data ready to be processed in our buffer
+			// back to our caller for more data
+			return true;
+		}
 	}
 }
 
-fn closeAll(comptime H: type, conn_list: List(HandlerConn(H)), conn_pool: *std.heap.MemoryPool(HandlerConn(H)), shutdown: Config.Shutdown) void {
+fn closeAll(comptime H: type, conn_list: List(HandlerConn(H)), shutdown: Config.Shutdown) void {
 	var next_node = conn_list.head;
 	while (next_node) |hc| {
-		if (comptime std.meta.hasFn(H, "handleClose")) {
-			if (shutdown.notify_handler) {
-				if (hc.handler) |*h| {
-					h.close();
+		const conn = &hc.conn;
+
+		{
+			// Sloppy, but we use the conn lock to protect hc.handler
+			// it's used here and in HandlerConn(H).cleanup.
+			conn.lock.lock();
+			defer conn.lock.unlock();
+			if (comptime std.meta.hasFn(H, "close")) {
+				if (shutdown.notify_handler) {
+					if (hc.handler) |*h| {
+						h.close();
+						hc.handler = null;
+					}
 				}
 			}
 		}
 
-		const conn = &hc.conn;
-		if (shutdown.notify_client) {
-			conn.writeClose();
+		if (conn.isClosed() == false) {
+			if (shutdown.notify_client) {
+				conn.writeClose();
+			}
+			conn.close();
 		}
 
-		if (shutdown.close_socket) {
-			posix.close(hc.socket);
-		}
-
-		defer conn_pool.destroy(hc);
 		next_node = hc.next;
 	}
 }
@@ -1334,10 +1247,18 @@ fn buildError(comptime status: u16, comptime err: []const u8) []const u8 {
 	return std.fmt.comptimePrint("HTTP/1.1 {d} \r\nConnection: Close\r\nError: {s}\r\nContent-Length: 0\r\n\r\n", .{ status, err });
 }
 
-// Doesn't neeed to worry about Conn's threadsafety since this can only be
-// called from the initial thread that accepted the connection, well before
-// the conn is handed off to the app.
 fn preHandOffWrite(conn: *Conn, response: []const u8) void {
+	// "preHandOff" means we haven't given the applciation handler a reference
+	// to *Conn yet. In theory, this means we don't need to worry about thread-safety
+	// However, it is possible for the worker to be stopped while we're doing this
+	// which causes issues unless we lock
+	conn.lock.lock();
+	defer conn.lock.unlock();
+
+	if (conn.isClosed()) {
+		return;
+	}
+
 	const socket = conn.stream.handle;
 	const timeout = std.mem.toBytes(posix.timeval{ .tv_sec = 5, .tv_usec = 0 });
 	posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &timeout) catch return;
@@ -1406,22 +1327,101 @@ fn List(comptime T: type) type {
 }
 
 const t = @import("../t.zig");
-test "Server: shutdown" {
-	var server = try Server(TestHandler).init(t.allocator, .{
+
+var test_thread: Thread = undefined;
+var test_server: Server(TestHandler) = undefined;
+var global_test_allocator = std.heap.GeneralPurposeAllocator(.{}){};
+
+test "tests:beforeAll" {
+	test_server = try Server(TestHandler).init(global_test_allocator.allocator(), .{
 		.port = 9292,
 		.address = "127.0.0.1",
 	});
-	const thrd = try server.listenInNewThread({});
-	server.stop();
-	thrd.join();
-	server.deinit();
+	test_thread = try test_server.listenInNewThread({});
+}
+
+test "tests:afterAll" {
+	test_server.stop();
+	test_thread.join();
+	test_server.deinit();
+	try t.expectEqual(false, global_test_allocator.detectLeaks());
+}
+
+test "Server: invalid handshake" {
+	const stream = try testStream(false);
+	defer stream.close();
+
+	try stream.writeAll("GET / HTTP/1.1\r\n\r\n");
+	var buf: [1024]u8 = undefined;
+	var pos: usize = 0;
+	while (pos < buf.len) {
+		const n = try stream.read(buf[0..]);
+		if (n == 0) {
+			break;
+		}
+		pos += n;
+	} else {
+		unreachable;
+	}
+
+	try t.expectString("HTTP/1.1 400 \r\nConnection: Close\r\nError: missingheaders\r\nContent-Length: 0\r\n\r\n", buf[0..pos]);
+}
+
+test "Server: echo" {
+	const stream = try testStream(true);
+	defer stream.close();
+
+	try stream.writeAll(&proto.frame(.text, "over"));
+	var buf: [12]u8 = undefined;
+	_ = try stream.readAtLeast(&buf, 6);
+	try t.expectSlice(u8, &.{129, 4, '9', '0', '0', '0'}, buf[0..6]);
+
+}
+
+fn testStream(handshake: bool) !net.Stream {
+	const timeout = std.mem.toBytes(std.posix.timeval{.tv_sec = 0, .tv_usec = 20_000});
+	const address = try std.net.Address.parseIp("127.0.0.1", 9292);
+	const stream = try std.net.tcpConnectToAddress(address);
+	try std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &timeout);
+	try std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, &timeout);
+
+	if (handshake == false) {
+		return stream;
+	}
+
+	try stream.writeAll("GET / HTTP/1.1\r\ncontent-length: 0\r\nupgrade: websocket\r\nsec-websocket-version: 13\r\nconnection: upgrade\r\nsec-websocket-key: my-key\r\n\r\n");
+	var buf: [1024]u8 = undefined;
+	var pos: usize = 0;
+	while (pos < buf.len) {
+		const n = try stream.read(buf[0..]);
+		if (n == 0) break;
+
+		pos += n;
+		if (std.mem.endsWith(u8, buf[0..pos], "\r\n\r\n")) {
+			break;
+		}
+	} else {
+		unreachable;
+	}
+
+	try t.expectString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: upgrade\r\nSec-Websocket-Accept: L8KGBs4w2MNLLzhfzlVoM0scCIE=\r\n\r\n", buf[0..pos]);
+
+	return stream;
 }
 
 const TestHandler = struct {
-	pub fn init(_: Handshake, _: *Conn, _: void) !TestHandler {
-		return .{};
+	conn: *Conn,
+
+	pub fn init(_: Handshake, conn: *Conn, _: void) !TestHandler {
+		return .{
+			.conn = conn,
+		};
 	}
-	pub fn handleMessage(_: *TestHandler, _: []const u8) !void {}
+	pub fn handleMessage(self: *TestHandler, data: []const u8,) !void {
+		if (std.mem.eql(u8, data, "over")) {
+			try self.conn.writeText("9000");
+		}
+	}
 };
 
 test "List" {

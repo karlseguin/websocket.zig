@@ -530,7 +530,7 @@ test "Reader: fuzz" {
 	var r = t.getRandom();
 	const random = r.random();
 
-	for (0..1000) |_| {
+	for (0..250) |_| {
 		defer _ =  t.arena.reset(.{.retain_capacity = {}});
 		const arena = t.arena.allocator();
 

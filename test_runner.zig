@@ -85,10 +85,6 @@ pub fn main() !void {
 		const result = t.func();
 		current_test = null;
 
-		if (is_unnamed_test) {
-			continue;
-		}
-
 		const ns_taken = slowest.endTiming(friendly_name);
 
 		if (std.testing.allocator_instance.deinit() == .leak) {
