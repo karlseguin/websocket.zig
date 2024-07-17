@@ -1241,7 +1241,7 @@ fn _handleIncoming(comptime H: type, hc: *HandlerConn(H), allocator: Allocator, 
 		log.debug("({}) received {s} message", .{hc.conn.address, @tagName(message_type)});
 		switch (message_type) {
 			.text, .binary => {
-				const params = @typeInfo(@TypeOf(H.handleMessage)).Fn.params;
+				const params = @typeInfo(@TypeOf(H.clientMessage)).Fn.params;
 				const needs_allocator = comptime params[1].type == Allocator;
 
 				var arena: std.heap.ArenaAllocator = undefined;
@@ -1267,23 +1267,23 @@ fn _handleIncoming(comptime H: type, hc: *HandlerConn(H), allocator: Allocator, 
 				};
 
 				switch (comptime params.len) {
-					2 => handler.handleMessage(message.data) catch return false,
+					2 => handler.clientMessage(message.data) catch return false,
 					3 => if (needs_allocator) {
-						handler.handleMessage(aa, message.data) catch return false;
+						handler.clientMessage(aa, message.data) catch return false;
 					} else {
-						handler.handleMessage(message.data, if (message_type == .text) .text else .binary) catch return false;
+						handler.clientMessage(message.data, if (message_type == .text) .text else .binary) catch return false;
 					},
-					4 => handler.handleMessage(aa, message.data, if (message_type == .text) .text else .binary) catch return false,
-					else => @compileError(@typeName(H) ++ ".handleMessage has invalid parameter count"),
+					4 => handler.clientMessage(aa, message.data, if (message_type == .text) .text else .binary) catch return false,
+					else => @compileError(@typeName(H) ++ ".clientMessage has invalid parameter count"),
 				}
 			},
-			.pong => if (comptime std.meta.hasFn(H, "handlePong")) {
-				try handler.handlePong();
+			.pong => if (comptime std.meta.hasFn(H, "clientPong")) {
+				try handler.clientPong();
 			},
 			.ping => {
 				const data = message.data;
-				if (comptime std.meta.hasFn(H, "handlePing")) {
-					try handler.handlePing(data);
+				if (comptime std.meta.hasFn(H, "clientPing")) {
+					try handler.clientPing(data);
 				} else if (data.len == 0) {
 					try hc.conn.writeFramed(EMPTY_PONG);
 				} else {
@@ -1293,8 +1293,8 @@ fn _handleIncoming(comptime H: type, hc: *HandlerConn(H), allocator: Allocator, 
 			.close => {
 				defer conn.close();
 				const data = message.data;
-				if (comptime std.meta.hasFn(H, "handleClose")) {
-					return handler.handleClose(data);
+				if (comptime std.meta.hasFn(H, "clientClose")) {
+					return handler.clientClose(data);
 				}
 
 				const l = data.len;
@@ -1543,7 +1543,7 @@ const TestHandler = struct {
 			.conn = conn,
 		};
 	}
-	pub fn handleMessage(self: *TestHandler, allocator: Allocator, data: []const u8,) !void {
+	pub fn clientMessage(self: *TestHandler, allocator: Allocator, data: []const u8,) !void {
 		if (std.mem.eql(u8, data, "over")) {
 			return self.conn.writeText("9000");
 		}
