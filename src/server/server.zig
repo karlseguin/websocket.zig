@@ -7,6 +7,7 @@ const net = std.net;
 const posix = std.posix;
 const Thread = std.Thread;
 const Allocator = std.mem.Allocator;
+const FixedBufferAllocator = std.heap.FixedBufferAllocator;
 
 const log = std.log.scoped(.websocket);
 
@@ -14,6 +15,7 @@ const OpCode = proto.OpCode;
 const Reader = proto.Reader;
 const Message = proto.Message;
 const Handshake = @import("handshake.zig").Handshake;
+const FallbackAllocator = @import("fallback_allocator.zig").FallbackAllocator;
 
 const MAX_TIMEOUT = 2_147_483_647;
 const DEFAULT_WORKER_COUNT = 1;
@@ -381,7 +383,7 @@ fn Blocking(comptime H: type) type {
 			try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &Timeout.none);
 
 			while (true) {
-				if (handleIncoming(H, hc) == false) {
+				if (handleIncoming(H, hc, self.allocator, undefined) == false) {
 					break;
 				}
 			}
@@ -568,7 +570,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 		// be shutting down while we're processing data...but hopefully the way we
 		// shutdown (by waiting for all the thread pools threads to end) solves this.
 		// Else, we'll need to throw a bunch of locking around HC just to handle shutdown.
-		fn dataAvailable(self: *Self, hc: *HandlerConn(H), _: []u8) void {
+		fn dataAvailable(self: *Self, hc: *HandlerConn(H), thread_buf: []u8) void {
 			var ok: bool = undefined;
 			if (hc.handler == null) {
 				ok = handleHandshake(H, self, hc, self.ctx);
@@ -576,7 +578,8 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 					self.conn_manager.inactive(hc);
 				}
 			} else {
-				ok = handleIncoming(H, hc);
+				var fba = FixedBufferAllocator.init(thread_buf);
+				ok = handleIncoming(H, hc, self.allocator, &fba);
 			}
 
 			var conn = &hc.conn;
@@ -1198,15 +1201,15 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
 	return true;
 }
 
-fn handleIncoming(comptime H: type, hc: *HandlerConn(H)) bool {
+fn handleIncoming(comptime H: type, hc: *HandlerConn(H), allocator: Allocator, fba: *FixedBufferAllocator) bool {
 	std.debug.assert(hc.handshake == null);
-	return _handleIncoming(H, hc) catch |err| {
+	return _handleIncoming(H, hc, allocator, fba) catch |err| {
 		log.warn("({}) uncaugh error handling incoming data: {}", .{hc.conn.address, err});
 		return false;
 	};
 }
 
-fn _handleIncoming(comptime H: type, hc: *HandlerConn(H)) !bool {
+fn _handleIncoming(comptime H: type, hc: *HandlerConn(H), allocator: Allocator, fba: *FixedBufferAllocator) !bool {
 	var conn = &hc.conn;
 	var reader = &hc.reader.?;
 	reader.fill(conn.stream) catch |err| {
@@ -1238,10 +1241,40 @@ fn _handleIncoming(comptime H: type, hc: *HandlerConn(H)) !bool {
 		log.debug("({}) received {s} message", .{hc.conn.address, @tagName(message_type)});
 		switch (message_type) {
 			.text, .binary => {
-				switch (comptime @typeInfo(@TypeOf(H.handleMessage)).Fn.params.len) {
+				const params = @typeInfo(@TypeOf(H.handleMessage)).Fn.params;
+				const needs_allocator = comptime params[1].type == Allocator;
+
+				var arena: std.heap.ArenaAllocator = undefined;
+				var fallback_allocator: FallbackAllocator = undefined;
+				var aa: Allocator = undefined;
+
+				if (comptime needs_allocator) {
+					arena = std.heap.ArenaAllocator.init(allocator);
+					if (comptime blockingMode()) {
+						aa = arena.allocator();
+					} else {
+						fallback_allocator = FallbackAllocator{
+							.fba = fba,
+							.fallback = arena.allocator(),
+							.fixed = fba.allocator(),
+						};
+						aa = fallback_allocator.allocator();
+					}
+				}
+
+				defer if (comptime needs_allocator) {
+					arena.deinit();
+				};
+
+				switch (comptime params.len) {
 					2 => handler.handleMessage(message.data) catch return false,
-					3 => handler.handleMessage(message.data, if (message_type == .text) .text else .binary) catch return false,
-					else => @compileError(@typeName(H) ++ ".handleMessage must accept 2 or 3 parameters"),
+					3 => if (needs_allocator) {
+						handler.handleMessage(aa, message.data) catch return false;
+					} else {
+						handler.handleMessage(message.data, if (message_type == .text) .text else .binary) catch return false;
+					},
+					4 => handler.handleMessage(aa, message.data, if (message_type == .text) .text else .binary) catch return false,
+					else => @compileError(@typeName(H) ++ ".handleMessage has invalid parameter count"),
 				}
 			},
 			.pong => if (comptime std.meta.hasFn(H, "handlePong")) {
@@ -1459,7 +1492,16 @@ test "Server: echo" {
 	var buf: [12]u8 = undefined;
 	_ = try stream.readAtLeast(&buf, 6);
 	try t.expectSlice(u8, &.{129, 4, '9', '0', '0', '0'}, buf[0..6]);
+}
 
+test "Server: handleMessage allocator" {
+	const stream = try testStream(true);
+	defer stream.close();
+
+	try stream.writeAll(&proto.frame(.text, "dyn"));
+	var buf: [12]u8 = undefined;
+	_ = try stream.readAtLeast(&buf, 12);
+	try t.expectSlice(u8, &.{129, 10, 'o', 'v', 'e', 'r', ' ', '9', '0', '0', '0', '!'}, buf[0..12]);
 }
 
 fn testStream(handshake: bool) !net.Stream {
@@ -1501,9 +1543,13 @@ const TestHandler = struct {
 			.conn = conn,
 		};
 	}
-	pub fn handleMessage(self: *TestHandler, data: []const u8,) !void {
+	pub fn handleMessage(self: *TestHandler, allocator: Allocator, data: []const u8,) !void {
 		if (std.mem.eql(u8, data, "over")) {
-			try self.conn.writeText("9000");
+			return self.conn.writeText("9000");
+		}
+
+		if (std.mem.eql(u8, data, "dyn")) {
+			return self.conn.writeText(try std.fmt.allocPrint(allocator, "over {d}!", .{9000}));
 		}
 	}
 };

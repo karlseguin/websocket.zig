@@ -68,7 +68,8 @@ const Handler = struct {
 		};
 	}
 
-	pub fn handleMessage(self: *Handler, data: []const u8, tpe: websocket.Message.TextType) !void {
+	pub fn handleMessage(self: *Handler, allocator: std.mem.Allocator, data: []const u8, tpe: websocket.Message.TextType) !void {
+		_ = try allocator.dupe(u8, data);
 		switch (tpe) {
 			.binary => try self.conn.writeBin(data),
 			.text => {
