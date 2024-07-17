@@ -40,7 +40,7 @@ pub fn ThreadPool(comptime F: anytype) type {
 	});
 
 	return struct {
-		stop: bool,
+		stopped: bool,
 		push: usize,
 		pull: usize,
 		pending: usize,
@@ -69,7 +69,7 @@ pub fn ThreadPool(comptime F: anytype) type {
 				.push = 0,
 				.pending = 0,
 				.mutex = .{},
-				.stop = false,
+				.stopped = false,
 				.queue = queue,
 				.pull_cond = .{},
 				.push_cond = .{},
@@ -80,7 +80,7 @@ pub fn ThreadPool(comptime F: anytype) type {
 
 			var started: usize = 0;
 			errdefer {
-				thread_pool.stop = true;
+				thread_pool.stopped = true;
 				thread_pool.pull_cond.broadcast();
 				for (0..started) |i| {
 					threads[i].join();
@@ -101,18 +101,27 @@ pub fn ThreadPool(comptime F: anytype) type {
 
 		pub fn deinit(self: *Self) void {
 			const allocator = self.allocator;
-			self.mutex.lock();
-			self.stop = true;
-			self.mutex.unlock();
+			self.stop();
+			allocator.free(self.threads);
+			allocator.free(self.queue);
+
+			allocator.destroy(self);
+		}
+
+		pub fn stop(self: *Self) void {
+			{
+				self.mutex.lock();
+				defer self.mutex.unlock();
+				if (self.stopped == true) {
+					return;
+				}
+				self.stopped = true;
+			}
 
 			self.pull_cond.broadcast();
 			for (self.threads) |thrd| {
 				thrd.join();
 			}
-			allocator.free(self.threads);
-			allocator.free(self.queue);
-
-			allocator.destroy(self);
 		}
 
 		pub fn empty(self: *Self) bool {
@@ -152,7 +161,7 @@ pub fn ThreadPool(comptime F: anytype) type {
 			while (true) {
 				self.mutex.lock();
 				while (self.pending == 0) {
-					if (self.stop) {
+					if (self.stopped) {
 						self.mutex.unlock();
 						return;
 					}

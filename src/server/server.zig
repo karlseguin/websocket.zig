@@ -70,7 +70,7 @@ pub const Config = struct {
 	};
 
 	const Handshake = struct {
-		timeout: ?u32 = null,
+		timeout: u32 = 10,
 		max_size: ?u16 = null,
 		max_headers: ?u16 = null,
 		pool_count: ?u16 = null,
@@ -266,8 +266,6 @@ fn Blocking(comptime H: type) type {
 		allocator: Allocator,
 		config: *const Config,
 		handshake_timeout: Timeout,
-		handshake_max_size: u16,
-		handshake_max_headers: u16,
 		handshake_pool: *Handshake.Pool,
 		buffer_provider: *buffer.Provider,
 		conn_manager: ConnManager(H),
@@ -277,12 +275,14 @@ fn Blocking(comptime H: type) type {
 			timeval: [@sizeOf(std.posix.timeval)]u8,
 
 			// if sec is null, it means we want to cancel the timeout.
-			fn init(sec: ?u32) Timeout {
+			fn init(sec: u32) Timeout {
 				return .{
-					.sec = if (sec) |s| s else MAX_TIMEOUT,
-					.timeval = std.mem.toBytes(posix.timeval{ .tv_sec = @intCast(sec orelse 0), .tv_usec = 0 }),
+					.sec = sec,
+					.timeval = std.mem.toBytes(posix.timeval{ .tv_sec = @intCast(sec), .tv_usec = 0 }),
 				};
 			}
+
+			pub const none = std.mem.toBytes(posix.timeval{.tv_sec = 0, .tv_usec = 0});
 		};
 
 		const Self = @This();
@@ -301,9 +301,7 @@ fn Blocking(comptime H: type) type {
 				.allocator = allocator,
 				.handshake_pool = &server.handshake_pool,
 				.buffer_provider = &server.buffer_provider,
-				.handshake_timeout = Timeout.init(config.handshake.timeout orelse MAX_TIMEOUT),
-				.handshake_max_size = config.handshake.max_size orelse DEFAULT_MAX_HANDSHAKE_SIZE,
-				.handshake_max_headers = config.handshake.max_headers orelse 0,
+				.handshake_timeout = Timeout.init(config.handshake.timeout),
 			};
 		}
 
@@ -358,16 +356,29 @@ fn Blocking(comptime H: type) type {
 
 		fn _handleConnection(self: *Self, socket: posix.socket_t, address: net.Address, context: anytype) !void {
 			const conn_manager = &self.conn_manager;
-			const hc = try conn_manager.create(socket, address);
+			const hc = try conn_manager.create(socket, address, timestamp());
 
 			defer {
 				hc.conn.close();
 				conn_manager.cleanup(hc);
 			}
+			const timeout = self.handshake_timeout;
+			const deadline = timestamp() + timeout.sec;
+			try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &timeout.timeval);
 
-			if (handleHandshake(H, self, hc, context) == false) {
-				return;
+			while (true) {
+				if (handleHandshake(H, self, hc, context) == false) {
+					return;
+				}
+				if (hc.handler != null) {
+					// if we have a handler, the our handshake completed
+					break;
+				}
+				if (timestamp() > deadline) {
+					return;
+				}
 			}
+			try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &Timeout.none);
 
 			while (true) {
 				if (handleIncoming(H, hc) == false) {
@@ -392,7 +403,6 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 
 		max_conn: usize,
 		conn_manager: ConnManager(H),
-
 
 		const Self = @This();
 		const ThreadPool = @import("thread_pool.zig").ThreadPool(Self.dataAvailable);
@@ -450,16 +460,32 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 				return;
 			};
 
+			const thread_pool = self.thread_pool;
+			const conn_manager = &self.conn_manager;
+			const handshake_timeout = self.config.handshake.timeout;
+
+			var now = timestamp();
+			var oldest_pending_start_time: ?u32 = null;
 			while (true) {
-				var it = self.loop.wait() catch |err| {
+				const handshake_cutoff = now - handshake_timeout;
+				const timeout = conn_manager.prepareToWait(handshake_cutoff) orelse blk: {
+					if (oldest_pending_start_time) |started| {
+						break :blk if (started < handshake_cutoff) 1 else @as(i32, @intCast(started - handshake_cutoff));
+					}
+					break :blk null;
+				};
+
+				var it = self.loop.wait(timeout) catch |err| {
 					log.err("failed to wait on events: {}", .{err});
 					std.time.sleep(std.time.ns_per_s);
 					continue;
 				};
+				now = timestamp();
+				oldest_pending_start_time = null;
 
 				while (it.next()) |data| {
 					if (data == 0) {
-						self.accept(listener) catch |err| {
+						self.accept(listener, now) catch |err| {
 							log.err("accept error: {}", .{err});
 							std.time.sleep(std.time.ns_per_ms);
 						};
@@ -468,8 +494,8 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 
 					if (data == 1) {
 						log.info("received shutdown signal", .{});
-
-						self.conn_manager.closeAll(self.config.shutdown);
+						self.thread_pool.stop();
+						conn_manager.closeAll(self.config.shutdown);
 						// only thing signal is currently used for is to indicating a
 						// shutdown
 						// signal was closed, we're being told to shutdown
@@ -477,12 +503,24 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 					}
 
 					const hc: *HandlerConn(H) = @ptrFromInt(data);
-					self.thread_pool.spawn(.{self, hc});
+					if (hc.state == .handshake) {
+						// we need to get this out of the pending list, so that it doesn't
+						// cause a timeout while we're processing it.
+						// But we stll need to care about its timeout.
+						if (oldest_pending_start_time) |s| {
+							oldest_pending_start_time = @min(hc.conn.started, s);
+						} else {
+							oldest_pending_start_time = hc.conn.started;
+						}
+						self.conn_manager.activate(hc);
+					}
+
+					thread_pool.spawn(.{self, hc});
 				}
 			}
 		}
 
-		fn accept(self: *Self, listener: posix.fd_t) !void {
+		fn accept(self: *Self, listener: posix.fd_t, now: u32) !void {
 			const max_conn = self.max_conn;
 			const conn_manager = &self.conn_manager;
 
@@ -512,7 +550,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 					}
 				}
 
-				const hc = try conn_manager.create(socket, address);
+				const hc = try conn_manager.create(socket, address, now);
 				self.loop.monitorRead(hc, false) catch |err| {
 					conn_manager.cleanup(hc);
 					return err;
@@ -522,10 +560,26 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 
 		// Called in a thread-pool thread/
 		// !! Access to self has to be synchronized !!
+		// There can only be 1 dataAvailable executing per HC at any given time.
+		// Access to HC *should not* need to be synchronized. Access to hc.conn
+		// needs to be synchronized once &hc.conn is passed to the handler during
+		// handshake (Conn is self-synchronized).
+		// Shutdown throws a wrench in our synchronization model, since we could
+		// be shutting down while we're processing data...but hopefully the way we
+		// shutdown (by waiting for all the thread pools threads to end) solves this.
+		// Else, we'll need to throw a bunch of locking around HC just to handle shutdown.
 		fn dataAvailable(self: *Self, hc: *HandlerConn(H), _: []u8) void {
-			var conn = &hc.conn;
+			var ok: bool = undefined;
+			if (hc.handler == null) {
+				ok = handleHandshake(H, self, hc, self.ctx);
+				if (ok and hc.handler == null) {
+					self.conn_manager.inactive(hc);
+				}
+			} else {
+				ok = handleIncoming(H, hc);
+			}
 
-			const ok = if (hc.handler == null) handleHandshake(H, self, hc, self.ctx) else handleIncoming(H, hc);
+			var conn = &hc.conn;
 			var closed: bool = undefined;
 			if (ok == false) {
 				conn.close();
@@ -553,10 +607,9 @@ const KQueue = struct {
 	change_buffer: [16]Kevent,
 	event_list: [64]Kevent,
 
-	const Self = @This();
 	const Kevent = posix.Kevent;
 
-	fn init() !Self {
+	fn init() !KQueue {
 		return .{
 			.q = try posix.kqueue(),
 			.change_count = 0,
@@ -565,19 +618,19 @@ const KQueue = struct {
 		};
 	}
 
-	fn deinit(self: Self) void {
+	fn deinit(self: KQueue) void {
 		posix.close(self.q);
 	}
 
-	fn monitorAccept(self: *Self, fd: c_int) !void {
+	fn monitorAccept(self: *KQueue, fd: c_int) !void {
 		try self.change(fd, 0, posix.system.EVFILT_READ, posix.system.EV_ADD);
 	}
 
-	fn monitorSignal(self: *Self, fd: c_int) !void {
+	fn monitorSignal(self: *KQueue, fd: c_int) !void {
 		try self.change(fd, 1, posix.system.EVFILT_READ, posix.system.EV_ADD);
 	}
 
-	fn monitorRead(self: *Self, hc: anytype, comptime rearm: bool) !void {
+	fn monitorRead(self: *KQueue, hc: anytype, comptime rearm: bool) !void {
 		if (rearm) {
 			const event = Kevent{
 				.ident = @intCast(hc.socket),
@@ -593,7 +646,7 @@ const KQueue = struct {
 		}
 	}
 
-	fn change(self: *Self, fd: posix.fd_t, data: usize, filter: i16, flags: u16) !void {
+	fn change(self: *KQueue, fd: posix.fd_t, data: usize, filter: i16, flags: u16) !void {
 		var change_count = self.change_count;
 		var change_buffer = &self.change_buffer;
 
@@ -613,16 +666,17 @@ const KQueue = struct {
 		self.change_count = change_count + 1;
 	}
 
-	fn wait(self: *Self) !Iterator {
-		const event_list = &self.event_list;
-		const event_count = try posix.kevent(self.q, self.change_buffer[0..self.change_count], event_list, null);
-		self.change_count = 0;
+		fn wait(self: *KQueue, timeout_sec: ?i32) !Iterator {
+			const event_list = &self.event_list;
+			const timeout: ?posix.timespec = if (timeout_sec) |ts| posix.timespec{ .tv_sec = ts, .tv_nsec = 0 } else null;
+			const event_count = try posix.kevent(self.q, self.change_buffer[0..self.change_count], event_list, if (timeout) |ts| &ts else null);
+			self.change_count = 0;
 
-		return .{
-			.index = 0,
-			.events = event_list[0..event_count],
-		};
-	}
+			return .{
+				.index = 0,
+				.events = event_list[0..event_count],
+			};
+		}
 
 	const Iterator = struct {
 		index: usize,
@@ -645,40 +699,48 @@ const EPoll = struct {
 	event_list: [64]EpollEvent,
 
 	const linux = std.os.linux;
-
-	const Self = @This();
 	const EpollEvent = linux.epoll_event;
 
-	fn init() !Self {
+	fn init() !EPoll {
 		return .{
 			.event_list = undefined,
 			.q = try posix.epoll_create1(0),
 		};
 	}
 
-	fn deinit(self: Self) void {
+	fn deinit(self: EPoll) void {
 		posix.close(self.q);
 	}
 
-	fn monitorAccept(self: *Self, fd: c_int) !void {
+	fn monitorAccept(self: *EPoll, fd: c_int) !void {
 		var event = linux.epoll_event{ .events = linux.EPOLL.IN, .data = .{ .ptr = 0 } };
 		return std.posix.epoll_ctl(self.q, linux.EPOLL.CTL_ADD, fd, &event);
 	}
 
-	fn monitorSignal(self: *Self, fd: c_int) !void {
+	fn monitorSignal(self: *EPoll, fd: c_int) !void {
 		var event = linux.epoll_event{ .events = linux.EPOLL.IN, .data = .{ .ptr = 1 } };
 		return std.posix.epoll_ctl(self.q, linux.EPOLL.CTL_ADD, fd, &event);
 	}
 
-	fn monitorRead(self: *Self, hc: anytype, comptime rearm: bool) !void {
+	fn monitorRead(self: *EPoll, hc: anytype, comptime rearm: bool) !void {
 		const op = if (rearm) linux.EPOLL.CTL_MOD else linux.EPOLL.CTL_ADD;
 		var event = linux.epoll_event{ .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT, .data = .{ .ptr = @intFromPtr(hc) } };
 		return posix.epoll_ctl(self.q, op, hc.socket, &event);
 	}
 
-	fn wait(self: *Self) !Iterator {
+	fn wait(self: *EPoll, timeout_sec: ?i32) !Iterator {
 		const event_list = &self.event_list;
-		const event_count = posix.epoll_wait(self.q, event_list, -1);
+		var timeout: i32 = -1;
+		if (timeout_sec) |sec| {
+			if (sec > 2147483) {
+				// max supported timeout by epoll_wait.
+				timeout = 2147483647;
+			} else {
+				timeout = sec * 1000;
+			}
+		}
+
+		const event_count = posix.epoll_wait(self.q, event_list, timeout);
 		return .{
 			.index = 0,
 			.events = event_list[0..event_count],
@@ -705,8 +767,6 @@ const EPoll = struct {
 // NonBlockign workers. The code from this point on is meant to be used with
 // both workers, independently from the blocking/nonblocking nonsense.
 
-
-
 // In the Blocking worker, all the state could be stored on the spawn'd thread's
 // stack. The only reason we use a HandlerConn(H) in there is to be able to re-use
 // code with the NonBlocking worker.
@@ -722,6 +782,7 @@ const EPoll = struct {
 //   some data ready).
 fn HandlerConn(comptime H: type) type {
 	return struct {
+		state: State,
 		conn: Conn,
 		handler: ?H,
 		reader: ?Reader,
@@ -729,13 +790,19 @@ fn HandlerConn(comptime H: type) type {
 		handshake: ?*Handshake.State,
 		next: ?*HandlerConn(H) = null,
 		prev: ?*HandlerConn(H) = null,
+
+		const State = enum {
+			handshake,
+			active,
+		};
 	};
 }
 
 fn ConnManager(comptime H: type) type {
 	return struct {
 		lock: Thread.Mutex,
-		list: List(HandlerConn(H)),
+		active: List(HandlerConn(H)),
+		pending: List(HandlerConn(H)),
 		pool: std.heap.MemoryPool(HandlerConn(H)),
 		handshake_pool: *Handshake.Pool,
 
@@ -747,8 +814,9 @@ fn ConnManager(comptime H: type) type {
 
 			return .{
 				.lock = .{},
-				.list = .{},
 				.pool = pool,
+				.active = .{},
+				.pending = .{},
 				.handshake_pool = handshake_pool,
 			};
 		}
@@ -760,10 +828,13 @@ fn ConnManager(comptime H: type) type {
 		fn count(self: *Self) usize {
 			self.lock.lock();
 			defer self.lock.unlock();
-			return self.list.len;
+			if (comptime blockingMode()) {
+				return self.active.len;
+			}
+			return self.active.len  + self.pending.len;
 		}
 
-		fn create(self: *Self, socket: posix.socket_t, address: net.Address) !*HandlerConn(H) {
+		fn create(self: *Self, socket: posix.socket_t, address: net.Address, now: u32) !*HandlerConn(H) {
 			errdefer posix.close(socket);
 
 			self.lock.lock();
@@ -771,19 +842,53 @@ fn ConnManager(comptime H: type) type {
 
 			const hc = try self.pool.create();
 			hc.* = .{
+				.state = if (comptime blockingMode()) .active else .handshake,
 				.socket = socket,
 				.handler = null,
 				.handshake = null,
 				.reader = null,
 				.conn = .{
 					._closed = false,
+					.started = now,
 					.address = address,
 					.stream = .{.handle = socket},
 				},
 			};
 
-			self.list.insert(hc);
+			if (comptime blockingMode()) {
+				self.active.insert(hc);
+			} else {
+				// only care about this in nonblocking mode, because in blocking mode
+				// the handshake timeout is handled by the spawned thread for the connection
+				self.pending.insert(hc);
+			}
 			return hc;
+		}
+
+		fn activate(self: *Self, hc: *HandlerConn(H)) void {
+			std.debug.assert(blockingMode() == false);
+
+			// our caller made sute this was the case
+			std.debug.assert(hc.state == .handshake);
+			self.lock.lock();
+			defer self.lock.unlock();
+			self.pending.remove(hc);
+			self.active.insert(hc);
+			hc.state = .active;
+		}
+
+		fn inactive(self: *Self, hc: *HandlerConn(H)) void {
+			std.debug.assert(blockingMode() == false);
+
+			// this should only be called when we need more data to complete the handshake
+			// which should only happen on an active connection
+			std.debug.assert(hc.state == .active);
+			hc.state = .handshake;
+
+			self.lock.lock();
+			defer self.lock.unlock();
+			self.active.remove(hc);
+			self.pending.insert(hc);
 		}
 
 		fn cleanup(self: *Self, hc: *HandlerConn(H)) void {
@@ -795,17 +900,20 @@ fn ConnManager(comptime H: type) type {
 				r.deinit();
 			}
 
-			if (comptime std.meta.hasFn(H, "close")) {
-				hc.conn.lock.lock();
-				defer hc.conn.lock.unlock();
-				if (hc.handler) |*h| {
+			if (hc.handler) |*h| {
+				if (comptime std.meta.hasFn(H, "close")) {
 					h.close();
-					hc.handler = null;
 				}
+				hc.handler = null;
 			}
 
 			self.lock.lock();
-			self.list.remove(hc);
+			if (hc.state == .active) {
+				self.active.remove(hc);
+			} else {
+				self.pending.remove(hc);
+			}
+
 			self.pool.destroy(hc);
 			self.lock.unlock();
 		}
@@ -813,16 +921,19 @@ fn ConnManager(comptime H: type) type {
 		fn closeAll(self: *Self, shutdown: Config.Shutdown) void {
 			self.lock.lock();
 			defer self.lock.unlock();
-			var next_node = self.list.head;
+
+			closeList(self.active.head, shutdown);
+			if (comptime blockingMode() == false) {
+				closeList(self.pending.head, shutdown);
+			}
+		}
+
+		fn closeList(head: ?*HandlerConn(H), shutdown: Config.Shutdown) void {
+			var next_node = head;
 			while (next_node) |hc| {
-				const conn = &hc.conn;
 
 				if (comptime std.meta.hasFn(H, "close")) {
 					if (shutdown.notify_handler) {
-						// Sloppy, but we use the conn lock to protect hc.handler
-						// it's used here and in HandlerConn(H).cleanup.
-						conn.lock.lock();
-						defer conn.lock.unlock();
 						if (hc.handler) |*h| {
 							h.close();
 							hc.handler = null;
@@ -830,6 +941,7 @@ fn ConnManager(comptime H: type) type {
 					}
 				}
 
+				const conn = &hc.conn;
 				if (conn.isClosed() == false) {
 					if (shutdown.notify_client) {
 						conn.writeClose();
@@ -839,11 +951,45 @@ fn ConnManager(comptime H: type) type {
 				next_node = hc.next;
 			}
 		}
+
+		// Enforces timeouts, and returns when the next timeout should be checked.
+		fn prepareToWait(self: *Self, cutoff: u32) ?i32 {
+			std.debug.assert(blockingMode() == false);
+
+			// always ordered from oldest to newest, so once we find a conneciton
+			// that isn't timed out, we can stop
+			self.lock.lock();
+			defer self.lock.unlock();
+			var next_conn = self.pending.head;
+			while (next_conn) |hc| {
+				const conn = &hc.conn;
+				const started = conn.started;
+				if (started > cutoff) {
+					// This is the first connection which hasn't timed out
+					// return the time until it times out.
+					return @intCast(started - cutoff);
+				}
+
+				next_conn = hc.next;
+
+				// this connection has timed out. Don't use self.cleanup since there's
+				// a bunch of stuff we can assume here..like there's no handler or reader
+				conn.close();
+				log.debug("({}) handshake timeout", .{conn.address});
+				if (hc.handshake) |h| {
+					self.handshake_pool.release(h);
+				}
+				self.pending.remove(hc);
+				self.pool.destroy(hc);
+			}
+			return null;
+		}
 	};
 }
 
 pub const Conn = struct {
 	_closed: bool,
+	started: u32,
 	stream: net.Stream,
 	address: net.Address,
 	lock: Thread.Mutex = .{},
@@ -992,6 +1138,10 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
 	const n = posix.read(hc.socket, buf[len..]) catch |err| {
 		switch (err) {
 			error.BrokenPipe, error.ConnectionResetByPeer => log.debug("({}) handshake connection closed: {}", .{conn.address, err}),
+			error.WouldBlock => {
+				std.debug.assert(blockingMode());
+				log.debug("({}) handshake timeout", .{conn.address});
+			},
 			else => log.warn("({}) handshake error reading from socket: {}", .{conn.address, err}),
 		}
 		return false;
@@ -1018,7 +1168,7 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
 	// After this, the app has access to &hc.conn, so any access to the
 	// conn has to be synchronized (which the conn does internally).
 
-	hc.handler = H.init(handshake, conn, ctx) catch |err| {
+	const handler = H.init(handshake, conn, ctx) catch |err| {
 		if (comptime std.meta.hasFn(H, "handshakeErrorResponse")) {
 			preHandOffWrite(H.handshakeErrorResponse(err));
 		} else {
@@ -1028,10 +1178,12 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
 		return false;
 	};
 
+
+	hc.handler = handler;
 	try conn.writeFramed(&handshake.reply());
 
 	if (comptime std.meta.hasFn(H, "afterInit")) {
-		hc.handler.?.afterInit() catch |err| {
+		handler.afterInit() catch |err| {
 			log.debug("({}) " ++ @typeName(H) ++ ".afterInit error: {}", .{conn.address, err});
 			return false;
 		};
@@ -1043,7 +1195,6 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
 	};
 
 	log.debug("({}) connection successfully upgraded", .{conn.address});
-
 	return true;
 }
 
@@ -1219,8 +1370,6 @@ fn timestamp() u32 {
 }
 
 // intrusive doubly-linked list with count, not thread safe
-// Blocking worker has to guard this with a mutex
-// NonBlocking worker doesn't have to guard this
 fn List(comptime T: type) type {
 	return struct {
 		len: usize = 0,
