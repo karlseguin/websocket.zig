@@ -89,14 +89,8 @@ pub fn Server(comptime H: type) type {
 		config: Config,
 		allocator: Allocator,
 
-		// used to synchornize staring the server and stopping the server
-		run_mut: Thread.Mutex,
-		run_cond: Thread.Condition,
-
-		// used to synchronize listenInNewThread so that it only returns once
-		// the server has actually started.
-		launch_mut: Thread.Mutex,
-		launch_cond: Thread.Condition,
+		mut: Thread.Mutex,
+		cond: Thread.Condition,
 
 		// these aren't used by the server themselves, but both Blocking and NonBlocking
 		// workers need them, so we put them here, and reference them in the workers,
@@ -120,10 +114,8 @@ pub fn Server(comptime H: type) type {
 			return .{
 				.handshake_pool = handshake_pool,
 				.buffer_provider = buffer_provider,
-				.run_mut = .{},
-				.run_cond = .{},
-				.launch_mut = .{},
-				.launch_cond = .{},
+				.mut = .{},
+				.cond = .{},
 				.config = config,
 				.allocator = allocator,
 			};
@@ -135,17 +127,20 @@ pub fn Server(comptime H: type) type {
 		}
 
 		pub fn listenInNewThread(self: *Self, context: anytype) !Thread {
-			self.launch_mut.lock();
-			defer self.launch_mut.unlock();
+			self.mut.lock();
+			defer self.mut.unlock();
 			const thrd = try Thread.spawn(.{}, Self.listen, .{self, context});
-			// this mess helps to minimze the window between this function
-			self.launch_cond.wait(&self.launch_mut);
+
+			// we don't return until listen() signals us that the server is up
+			self.cond.wait(&self.mut);
 			return thrd;
 		}
 
 		pub fn listen(self: *Self, context: anytype) !void {
-			self.run_mut.lock();
-			errdefer self.run_mut.unlock();
+			// incase "stop" is waiting
+			defer self.cond.signal();
+			self.mut.lock();
+			defer self.mut.unlock();
 
 			const config = &self.config;
 
@@ -203,9 +198,11 @@ pub fn Server(comptime H: type) type {
 
 				const thrd = try std.Thread.spawn(.{}, Blocking(H).run, .{&w, socket, context});
 				log.info("starting blocking worker to listen on {}", .{address});
-				self.launch_cond.signal();
 
-				self.run_cond.wait(&self.run_mut);
+				// in case startInNewThread is waiting
+				self.cond.signal();
+
+				self.cond.wait(&self.mut);
 				w.stop();
 				posix.close(socket);
 				thrd.join();
@@ -246,17 +243,20 @@ pub fn Server(comptime H: type) type {
 				}
 
 				log.info("starting nonblocking worker to listen on {}", .{address});
-				self.launch_cond.signal();
+
+				// in case startInNewThread is waiting
+				self.cond.signal();
 
 				// is this really the best way?
-				self.run_cond.wait(&self.run_mut);
+				self.cond.wait(&self.mut);
 			}
 		}
 
 		pub fn stop(self: *Self) void {
-			self.run_mut.lock();
-			defer self.run_mut.unlock();
-			self.run_cond.signal();
+			self.mut.lock();
+			self.cond.signal();
+			 // we don't return until listen signals us that the server is down
+			self.cond.timedWait(&self.mut, std.time.ns_per_s * 5) catch {};
 		}
 	};
 }

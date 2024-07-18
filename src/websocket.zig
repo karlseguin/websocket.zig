@@ -12,6 +12,7 @@ const server = @import("server/server.zig");
 
 pub const Conn = server.Conn;
 pub const Server = server.Server;
+pub const blockingMode = server.blockingMode;
 pub const Handshake = @import("server/handshake.zig").Handshake;
 
 pub fn bufferProvider(allocator: std.mem.Allocator, config: buffer.Config) !buffer.Provider {
