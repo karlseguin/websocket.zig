@@ -54,15 +54,15 @@ pub const OpCode = enum(u8) {
 // into a pooled buffer, yet make sure any over-read fits back into our static buffer.
 
 pub const Reader = struct {
-	// The current buffer that we're reading into. This could be our static buffer.
-	// If the current message is larger than the static buffer (but smaller than
+	// The current buffer that we're reading into. This could be our initial static buffer.
+	// If the current message is larger than the static buffer (but staticer than
 	// our max-allowed message), this could point to a pooled buffer from the large
 	// buffer pool, or a dynamic buffer.
 	buf: buffer.Buffer,
 
-	static: buffer.Buffer,
+	static: []u8,
 
-	bp: *buffer.Provider,
+	large_buffer_provider: *buffer.Provider,
 
 	// Position within buf that we've read into. We might read more than one
 	// message in a single read, so this could span beyond 1 message.
@@ -79,18 +79,15 @@ pub const Reader = struct {
 	// fragment), the state of the fragmented message is maintained here.)
 	fragment: ?Fragmented,
 
-	pub fn init(static_size: usize, bp: *buffer.Provider) !Reader {
-		const static = try bp.static(static_size);
-		errdefer bp.free(static);
-
+	pub fn init(static: []u8, large_buffer_provider: *buffer.Provider) Reader {
 		return .{
-			.bp = bp,
 			.pos = 0,
 			.start = 0,
-			.buf = static,
+			.buf = .{.type = .static, .data = static},
 			.static = static,
 			.message_len = 0,
 			.fragment = null,
+			.large_buffer_provider = large_buffer_provider,
 		};
 	}
 
@@ -99,9 +96,11 @@ pub const Reader = struct {
 			f.deinit();
 		}
 
-		// noop if buf == static
-		self.bp.release(self.buf);
-		self.bp.free(self.static);
+		// not our job to manage the static buffer, its buf was given to us an init and we
+		// can't know where it came from.
+		if (self.usingLargeBuffer()) {
+			self.large_buffer_provider.release(self.buf);
+		}
 	}
 
 	pub fn fill(self: *Reader, stream: anytype) !void {
@@ -171,9 +170,9 @@ pub const Reader = struct {
 					// We don't have enough space in our buffer.
 
 					const current_buf = self.buf;
-					defer self.bp.release(current_buf);
+					defer self.large_buffer_provider.release(current_buf);
 
-					const new_buffer = try self.bp.alloc(message_len);
+					const new_buffer = try self.large_buffer_provider.alloc(message_len);
 					@memcpy(new_buffer.data[0..data_len], current_buf.data[start..pos]);
 
 					self.buf = new_buffer;
@@ -249,6 +248,9 @@ pub const Reader = struct {
 			if (next == self.pos) {
 				// Best case. We didn't read part (of a whole) 2nd message, we can just
 				// reset our pos & start to 0.
+				// This should always be true if we're into a dynamic buffer, since the
+				// dynamic buffer would have been sized exactly for the message, with no
+				// spare room for more data.
 				self.pos = 0;
 				self.start = 0;
 			} else {
@@ -300,7 +302,7 @@ pub const Reader = struct {
 				return error.NestedFragment;
 			}
 
-			self.fragment = try Fragmented.init(self.bp, message_type, payload);
+			self.fragment = try Fragmented.init(self.large_buffer_provider, message_type, payload);
 			self.restoreStatic();
 
 			if (more) {
@@ -323,16 +325,21 @@ pub const Reader = struct {
 		self.restoreStatic();
 	}
 
+	pub fn isEmpty(self: *Reader) bool {
+		return self.pos == 0 and self.fragment == null and self.usingLargeBuffer() == false;
+	}
+
 	fn restoreStatic(self: *Reader) void {
-		if (self.isStaticActive() == false) {
+		if (self.usingLargeBuffer()) {
+			std.debug.assert(self.pos == 0);
 			std.debug.assert(self.start == 0);
-			self.bp.release(self.buf);
-			self.buf = self.static;
+			self.large_buffer_provider.release(self.buf);
+			self.buf = .{.type = .static, .data = self.static};
 			return;
 		}
 
 		const start = self.start;
-		if (start > self.static.data.len / 2) {
+		if (start > self.static.len / 2) {
 			// only copy the data back to the start of our static buffer If
 			// we've used up half the buffer.
 
@@ -341,14 +348,14 @@ pub const Reader = struct {
 			// the static buffer or not.
 			const pos = self.pos;
 			const data_len = pos - start;
-			std.mem.copyForwards(u8, self.buf.data[0..data_len], self.buf.data[start..pos]);
+			std.mem.copyForwards(u8, self.static[0..data_len], self.static[start..pos]);
 			self.pos = data_len;
 			self.start = 0;
 		}
 	}
 
-	inline fn isStaticActive(self: *const Reader) bool {
-		return self.buf.data.ptr == self.static.data.ptr;
+	inline fn usingLargeBuffer(self: *const Reader) bool {
+		return self.buf.type != .static;
 	}
 };
 
@@ -619,7 +626,7 @@ test "Reader: fuzz" {
 
 		// fragmentation could make messages very large
 		var reader = testReader(.{.max = MAX_MESSAGE_SIZE * (MAX_FRAGMENTS+1), .static = static_size, .count = large_buffer_count, .size = large_buffer_size});
-		defer reader.bp.deinit();
+		defer reader.large_buffer_provider.deinit();
 		defer reader.deinit();
 
 		i = 0;
@@ -708,7 +715,9 @@ test "Fragmented" {
 fn testReader(opts: anytype) Reader {
 	const T = @TypeOf(opts);
 
-	const bp = t.arena.allocator().create(buffer.Provider) catch unreachable;
+	const aa = t.arena.allocator();
+
+	const bp = aa.create(buffer.Provider) catch unreachable;
 	bp.* = buffer.Provider.init(t.allocator, .{
 		.max = if (@hasField(T, "max")) opts.max else 20,
 		.size = if (@hasField(T, "size")) opts.size else 0,
@@ -716,7 +725,8 @@ fn testReader(opts: anytype) Reader {
 	}) catch unreachable;
 
 	const static_size = if (@hasField(T, "static")) opts.static else 16;
-	return Reader.init(static_size, bp) catch unreachable;
+	const reader_buf = aa.alloc(u8, static_size) catch unreachable;
+	return Reader.init(reader_buf, bp);
 }
 
 fn testRead(reader: *Reader, pair: t.SocketPair) !Message {

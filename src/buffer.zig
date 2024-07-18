@@ -64,13 +64,6 @@ pub const Provider = struct {
 		}
 	}
 
-	pub fn static(self: *const Provider, size: usize) !Buffer {
-		return .{
-			.type = .static,
-			.data = try self.allocator.alloc(u8, size),
-		};
-	}
-
 	pub fn alloc(self: *Provider, size: usize) !Buffer {
 		if (size > self.max_buffer_size) {
 			return error.TooLarge;
@@ -81,8 +74,8 @@ pub const Provider = struct {
 			if (self.pool.acquire()) |buffer| {
 				// See the Reader struct comment to see why this is necessary
 				var copy = buffer;
-				copy.data.len = size;
-				return copy;
+				copy.len = size;
+				return .{.type = .pooled, .data = copy};
 			}
 		}
 
@@ -114,8 +107,8 @@ pub const Provider = struct {
 		switch (buffer.type) {
 			.pooled => {
 				// this resize is necessary because on alloc, we potentially shrink data
-				var copy = buffer;
-				copy.data.len = self.pool_buffer_size;
+				var copy = buffer.data;
+				copy.len = self.pool_buffer_size;
 				self.pool.release(copy);
 			},
 			.static => self.allocator.free(buffer.data),
@@ -128,8 +121,8 @@ pub const Provider = struct {
 			.static => {},
 			.pooled => {
 				// this resize is necessary because on alloc, we potentially shrink data
-				var copy = buffer;
-				copy.data.len = self.pool_buffer_size;
+				var copy = buffer.data;
+				copy.len = self.pool_buffer_size;
 				self.pool.release(copy);
 			},
 			.dynamic => self.allocator.free(buffer.data),
@@ -138,19 +131,17 @@ pub const Provider = struct {
 };
 
 pub const Pool = struct {
+	buffer_size: usize,
 	available: usize,
-	buffers: []Buffer,
+	buffers: [][]u8,
 	allocator: Allocator,
 	mutex: std.Thread.Mutex,
 
 	pub fn init(allocator: Allocator, count: usize, buffer_size: usize) !Pool {
-		const buffers = try allocator.alloc(Buffer, count);
+		const buffers = try allocator.alloc([]u8, count);
 
 		for (0..count) |i| {
-			buffers[i] = .{
-				.type = .pooled,
-				.data = try allocator.alloc(u8, buffer_size),
-			};
+			buffers[i] = try allocator.alloc(u8, buffer_size);
 		}
 
 		return .{
@@ -158,41 +149,50 @@ pub const Pool = struct {
 			.buffers = buffers,
 			.available = count,
 			.allocator = allocator,
+			.buffer_size = buffer_size,
 		};
 	}
 
 	pub fn deinit(self: *Pool) void {
 		const allocator = self.allocator;
 		for (self.buffers) |buf| {
-			allocator.free(buf.data);
+			allocator.free(buf);
 		}
 		allocator.free(self.buffers);
 	}
 
-	pub fn acquire(self: *Pool) ?Buffer {
+	pub fn acquire(self: *Pool) ?[]u8 {
 		const buffers = self.buffers;
 
 		self.mutex.lock();
+		defer self.mutex.unlock();
 		const available = self.available;
 		if (available == 0) {
-			// dont hold the lock over factory
-			self.mutex.unlock();
 			return null;
 		}
 		const index = available - 1;
 		const buffer = buffers[index];
 		self.available = index;
-		self.mutex.unlock();
-
 		return buffer;
 	}
 
-	pub fn release(self: *Pool, buffer: Buffer) void {
+	pub fn acquireOrCreate(self: *Pool) ![]u8 {
+		return self.acquire() orelse self.allocator.alloc(u8, self.buffer_size);
+	}
+
+	pub fn release(self: *Pool, buffer: []u8) void {
+		var buffers = self.buffers;
+
 		self.mutex.lock();
-		defer self.mutex.unlock();
 		const available = self.available;
-		self.buffers[available] = buffer;
+		if (available == buffers.len) {
+			self.mutex.unlock();
+			self.allocator.free(buffer);
+			return;
+		}
+		buffers[available] = buffer;
 		self.available = available + 1;
+		self.mutex.unlock();
 	}
 };
 
@@ -268,8 +268,8 @@ test "buffer: grow" {
 
 	{
 		// grow a static buffer
-		var buf1 = try p.static(15);
-		defer p.free(buf1);
+		var buf1 = Buffer{.type = .static, .data = try t.allocator.alloc(u8, 15)};
+		defer t.allocator.free(buf1.data);
 		@memcpy(buf1.data[0..6], "hello2");
 
 		const buf2 = try p.grow(buf1, 6, 21);
@@ -291,15 +291,3 @@ test "buffer: grow" {
 	}
 }
 
-test "buffer: static release " {
-	var p = try Provider.init(t.allocator, .{.count = 0, .size = 10, .max = 30});
-
-	const buffer = try p.static(20);
-	defer p.free(buffer);
-
-	try t.expectEqual(.static, buffer.type);
-	try t.expectEqual(20, buffer.data.len);
-
-	p.release(buffer); // noop for static
-	buffer.data[0] = 'a';
-}

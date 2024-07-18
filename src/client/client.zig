@@ -63,18 +63,18 @@ pub const Client = struct {
 		const stream = Stream.init(net_stream, tls_client);
 
 		var own_bp = false;
-		var bp: *buffer.Provider = undefined;
+		var buffer_provider: *buffer.Provider = undefined;
 
 		// If a buffer_provider is provided, we'll use that.
 		// If it isn't, we need to create one which also means we now "own" it
 		// and we're responsible for cleaning it up
 		if (config.buffer_provider) |shared_bp| {
-			bp = shared_bp;
+			buffer_provider = shared_bp;
 		} else {
 			own_bp = true;
-			bp = try allocator.create(buffer.Provider);
-			errdefer allocator.destroy(bp);
-			bp.* = try buffer.Provider.init(allocator, .{
+			buffer_provider = try allocator.create(buffer.Provider);
+			errdefer allocator.destroy(buffer_provider);
+			buffer_provider.* = try buffer.Provider.init(allocator, .{
 				.size = 0,
 				.count = 0,
 				.max = config.max_size,
@@ -82,28 +82,34 @@ pub const Client = struct {
 		}
 
 		errdefer if (own_bp) {
-			bp.deinit();
-			allocator.destroy(bp);
+			buffer_provider.deinit();
+			allocator.destroy(buffer_provider);
 		};
+
+		const reader_buf = try buffer_provider.allocator.alloc(u8, config.buffer_size);
+		errdefer buffer_provider.allocator.free(reader_buf);
 
 		return .{
 			.stream = stream,
 			._closed = false,
 			._own_bp = own_bp,
 			._mask_fn = config.mask_fn,
-			._reader = try Reader.init(config.buffer_size, bp),
+			._reader = Reader.init(reader_buf, buffer_provider),
 		};
 	}
 
 	pub fn deinit(self: *Client) void {
 		self.close();
+
+		const larger_buffer_provider = self._reader.large_buffer_provider;
+		const allocator = larger_buffer_provider.allocator;
+		allocator.free(self._reader.static);
+
 		self._reader.deinit();
 
 		if (self._own_bp) {
-			const bp = self._reader.bp;
-			const allocator = bp.allocator;
-			bp.deinit();
-			allocator.destroy(bp);
+			larger_buffer_provider.deinit();
+			allocator.destroy(larger_buffer_provider);
 		}
 	}
 
@@ -113,7 +119,7 @@ pub const Client = struct {
 
 		// we've already setup our reader, and the reader has a static buffer
 		// we might as well use it!
-		const buf = self._reader.static.data;
+		const buf = self._reader.static;
 
 		const key = blk: {
 			const bin_key = generateKey();
@@ -642,11 +648,13 @@ fn testClient(stream: net.Stream) Client {
 	const bp = t.allocator.create(buffer.Provider) catch unreachable;
 	bp.* = buffer.Provider.init(t.allocator, .{.count = 0, .size = 0, .max = 4096}) catch unreachable;
 
+	const reader_buf = bp.allocator.alloc(u8, 1024) catch unreachable;
+
 	return .{
 		._closed = false,
 		._own_bp = true,
 		._mask_fn = generateMask,
 		.stream = .{.stream = stream},
-		._reader = Reader.init(1024, bp) catch undefined,
+		._reader = Reader.init(reader_buf, bp),
 	};
 }

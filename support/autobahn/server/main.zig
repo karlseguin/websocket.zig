@@ -4,6 +4,7 @@ const websocket = @import("websocket");
 const Conn = websocket.Conn;
 const Message = websocket.Message;
 const Handshake = websocket.Handshake;
+const Allocator = std.mem.Allocator;
 
 pub const std_options = .{
 	.log_scope_levels = &[_]std.log.ScopeLevel{
@@ -11,61 +12,78 @@ pub const std_options = .{
 	}
 };
 
+var nonblocking_server: websocket.Server(Handler) = undefined;
+var nonblocking_bp_server: websocket.Server(Handler) = undefined;
+
 pub fn main() !void {
 	var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+	const allocator = gpa.allocator();
 	defer _ = gpa.detectLeaks();
 
-	const allocator = if (@import("builtin").mode == .Debug) gpa.allocator() else std.heap.c_allocator;
+	try std.posix.sigaction(std.posix.SIG.TERM, &.{
+		.handler = .{.handler = shutdown},
+		.mask = std.posix.empty_sigset,
+		.flags = 0,
+	}, null);
 
-	var server = try websocket.Server(Handler).init(allocator, .{
-		.port = 9223,
+	const t1 = try startNonBlocking(allocator);
+	const t2 = try startNonBlockingBufferPool(allocator);
 
+	t1.join();
+	t2.join();
+
+	nonblocking_server.deinit();
+	nonblocking_bp_server.deinit();
+}
+
+fn startNonBlocking(allocator: Allocator) !std.Thread {
+	nonblocking_server = try websocket.Server(Handler).init(allocator, .{
+		.port = 9224,
 		.address = "127.0.0.1",
-
-		// On connection, each client will get buffer_size bytes allocated
-		// to process messages. This will be a single allocation and will only
-		// be allocated after the request has been successfully parsed and
-		// identified as a websocket request.
-		.connection_buffer_size = 8192,
-
-		// Maximum allowed message size. If max_size == buffer_size, then the
-		// system will never allocate more than the initial buffer_size.
-		// The system will dynamically allocate up to max_size bytes to deal
-		// with messages large than buffer_size. There is no guarantee around
-		// how long (or short) this memory will remain allocated.
-		// Messages larger than max_size will be rejected.
-
-		// IMPORTANT NOTE: autobahn tests with large messages (16MB).
+		.buffers = .{
+			.pool = 0,
+			.size = 8192,
+		},
+		// autobahn tests with large messages (16MB).
 		// You almost certainly want to use a small value here.
 		.max_message_size = 20_000_000,
-
 		.handshake = .{
 			.timeout = 3,
 			.max_size = 1024,
 			.max_headers = 10,
 		},
 	});
-	defer server.deinit();
+	return try nonblocking_server.listenInNewThread({});
+}
 
-	// abitrary context object that will get passed to your handler
-	var context = Context{};
-
-	// Start websocket listening on the given port,
-	// speficying the handler struct that will servi
-	try server.listen(&context);
+fn startNonBlockingBufferPool(allocator: Allocator) !std.Thread {
+	nonblocking_bp_server = try websocket.Server(Handler).init(allocator, .{
+		.port = 9225,
+		.address = "127.0.0.1",
+		.buffers = .{
+			.pool = 3,
+			.size = 8192,
+		},
+		// autobahn tests with large messages (16MB).
+		// You almost certainly want to use a small value here.
+		.max_message_size = 20_000_000,
+		.handshake = .{
+			.timeout = 3,
+			.max_size = 1024,
+			.max_headers = 10,
+		},
+	});
+	return try nonblocking_bp_server.listenInNewThread({});
 }
 
 const Context = struct {};
 
 const Handler = struct {
 	conn: *Conn,
-	context: *Context,
 
-	pub fn init(_: Handshake, conn: *Conn, context: *Context) !Handler {
-		return .{
-			.conn = conn,
-			.context = context,
-		};
+	pub fn init(_: Handshake, conn: *Conn, ctx: void) !Handler {
+		_ = ctx;
+		return .{.conn = conn};
 	}
 
 	pub fn clientMessage(self: *Handler, allocator: std.mem.Allocator, data: []const u8, tpe: websocket.Message.TextType) !void {
@@ -82,3 +100,8 @@ const Handler = struct {
 		}
 	}
 };
+
+fn shutdown(_: c_int) callconv(.C) void {
+	nonblocking_server.stop();
+	nonblocking_bp_server.stop();
+}
