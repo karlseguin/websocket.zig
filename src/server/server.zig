@@ -18,6 +18,7 @@ const Handshake = @import("handshake.zig").Handshake;
 const FallbackAllocator = @import("fallback_allocator.zig").FallbackAllocator;
 
 const DEFAULT_BUFFER_SIZE = 2048;
+const DEFAULT_WORKER_COUNT = 1;
 
 const EMPTY_PONG = ([2]u8{ @intFromEnum(OpCode.pong), 0 })[0..];
 // CLOSE, 2 length, code
@@ -88,6 +89,11 @@ pub fn Server(comptime H: type) type {
 		config: Config,
 		allocator: Allocator,
 
+		// close these to signal the workers to shutdown
+		// In NonBlocking, this is one end of a pipe
+		// In Blocking, this is the listening socket
+		signals: []posix.fd_t,
+
 		mut: Thread.Mutex,
 		cond: Thread.Condition,
 
@@ -118,12 +124,16 @@ pub fn Server(comptime H: type) type {
 			});
 			errdefer buffer_provider.deinit();
 
+			const signals = try allocator.alloc(posix.fd_t, config.worker_count orelse DEFAULT_WORKER_COUNT);
+			errdefer allocator.free(signals);
+
 			return .{
 				.handshake_pool = handshake_pool,
 				.buffer_provider = buffer_provider,
 				.mut = .{},
 				.cond = .{},
 				.config = config,
+				.signals = signals,
 				.allocator = allocator,
 			};
 		}
@@ -131,6 +141,7 @@ pub fn Server(comptime H: type) type {
 		pub fn deinit(self: *Self) void {
 			self.handshake_pool.deinit();
 			self.buffer_provider.deinit();
+			self.allocator.free(self.signals);
 		}
 
 		pub fn listenInNewThread(self: *Self, context: anytype) !Thread {
@@ -144,10 +155,8 @@ pub fn Server(comptime H: type) type {
 		}
 
 		pub fn listen(self: *Self, context: anytype) !void {
-			// incase "stop" is waiting
-			defer self.cond.signal();
 			self.mut.lock();
-			defer self.mut.unlock();
+			errdefer self.mut.unlock();
 
 			const config = &self.config;
 
@@ -206,12 +215,12 @@ pub fn Server(comptime H: type) type {
 				const thrd = try std.Thread.spawn(.{}, Blocking(H).run, .{&w, socket, context});
 				log.info("starting blocking worker to listen on {}", .{address});
 
-				// in case startInNewThread is waiting
+				// incase listenInNewThread was used and is waiting for us to start
 				self.cond.signal();
 
-				self.cond.wait(&self.mut);
-				w.stop();
-				posix.close(socket);
+				// this is what we'll shutdown when stop() is called
+				self.signals[0] = socket;
+				self.mut.unlock();
 				thrd.join();
 			} else {
 				defer posix.close(socket);
@@ -219,33 +228,37 @@ pub fn Server(comptime H: type) type {
 				const Worker = NonBlocking(H, C);
 
 				const allocator = self.allocator;
-				const worker_count = config.worker_count orelse 1;
+				var signals = self.signals;
 
-				const signals = try allocator.alloc([2]posix.fd_t, worker_count);
+				const worker_count = signals.len;
 				const threads = try allocator.alloc(Thread, worker_count);
 				const workers = try allocator.alloc(Worker, worker_count);
 
 				var started: usize = 0;
 
+				errdefer for (0..started) |i| {
+					// on success, these will be closed by a call to stop();
+					posix.close(signals[i]);
+				};
+
 				defer {
 					for (0..started) |i| {
-						posix.close(signals[i][1]);
-						threads[i].join();
 						workers[i].deinit();
 					}
-					allocator.free(signals);
 					allocator.free(threads);
 					allocator.free(workers);
 				}
 
 				for (0..worker_count) |i| {
-					signals[i] = try posix.pipe2(.{.NONBLOCK = true});
-					errdefer posix.close(signals[i][1]);
+					const pipe = try posix.pipe2(.{.NONBLOCK = true});
+					errdefer posix.close(pipe[1]);
 
 					workers[i] = try Worker.init(self, context);
 					errdefer workers[i].deinit();
 
-					threads[i] = try Thread.spawn(.{}, Worker.run, .{ &workers[i], socket, signals[i][0] });
+					threads[i] = try Thread.spawn(.{}, Worker.run, .{ &workers[i], socket, pipe[0] });
+
+					signals[i] = pipe[1];
 					started += 1;
 				}
 
@@ -254,16 +267,20 @@ pub fn Server(comptime H: type) type {
 				// in case startInNewThread is waiting
 				self.cond.signal();
 
-				// is this really the best way?
-				self.cond.wait(&self.mut);
+				self.mut.unlock();
+
+				for (threads) |thrd |{
+					thrd.join();
+				}
 			}
 		}
 
 		pub fn stop(self: *Self) void {
 			self.mut.lock();
-			self.cond.signal();
-			 // we don't return until listen signals us that the server is down
-			self.cond.timedWait(&self.mut, std.time.ns_per_s * 5) catch {};
+			defer self.mut.unlock();
+			for (self.signals) |s| {
+				posix.close(s);
+			}
 		}
 	};
 }
@@ -271,7 +288,6 @@ pub fn Server(comptime H: type) type {
 // This is our Blocking worker. It's very different than NonBlocking and much simpler.
 fn Blocking(comptime H: type) type {
 	return struct {
-		running: bool,
 		allocator: Allocator,
 		config: *const Config,
 		handshake_timeout: Timeout,
@@ -305,7 +321,6 @@ fn Blocking(comptime H: type) type {
 			errdefer conn_manager.deinit();
 
 			return .{
-				.running = true,
 				.config = config,
 				.conn_manager = conn_manager,
 				.allocator = allocator,
@@ -320,17 +335,14 @@ fn Blocking(comptime H: type) type {
 			self.conn_manager.deinit();
 		}
 
-		pub fn stop(self: *Self) void {
-			@atomicStore(bool, &self.running, false, .monotonic);
-		}
-
 		pub fn run(self: *Self, listener: posix.socket_t, context: anytype) void {
 			while (true) {
 				var address: net.Address = undefined;
 				var address_len: posix.socklen_t = @sizeOf(net.Address);
 				const socket = posix.accept(listener, &address.any, &address_len, posix.SOCK.CLOEXEC) catch |err| {
-					if (@atomicLoad(bool, &self.running, .monotonic) == false) {
-						break;
+					if (err == error.ConnectionAborted) {
+						log.info("received shutdown signal", .{});
+						return;
 					}
 					log.err("failed to accept socket: {}", .{err});
 					continue;
