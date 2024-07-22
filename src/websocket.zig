@@ -8,9 +8,10 @@ pub const Message = proto.Message;
 
 pub const Client = @import("client/client.zig").Client;
 
-const server = @import("server/server.zig");
+pub const server = @import("server/server.zig");
 
 pub const Conn = server.Conn;
+pub const Config = server.Config;
 pub const Server = server.Server;
 pub const blockingMode = server.blockingMode;
 pub const Handshake = @import("server/handshake.zig").Handshake;
