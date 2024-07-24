@@ -268,7 +268,7 @@ fn Blocking(comptime H: type) type {
 		allocator: Allocator,
 		handshake_timeout: Timeout,
 		connection_buffer_size: usize,
-		conn_manager: ConnManager(H),
+		conn_manager: ConnManager(H, false),
 		handshake_pool: *Handshake.Pool,
 		buffer_provider: *buffer.Provider,
 
@@ -292,13 +292,13 @@ fn Blocking(comptime H: type) type {
 		pub fn init(allocator: Allocator, state: *WorkerState) !Self {
 			const config = &state.config;
 
-			var conn_manager = try ConnManager(H).init(allocator, &state.handshake_pool);
+			var conn_manager = try ConnManager(H, false).init(allocator);
 			errdefer conn_manager.deinit();
 
 			return .{
 				.conn_manager = conn_manager,
 				.allocator = allocator,
-				.handshake_pool = &state.handshake_pool,
+				.handshake_pool = state.handshake_pool,
 				.buffer_provider = &state.buffer_provider,
 				.handshake_timeout = Timeout.init(config.handshake.timeout),
 				.connection_buffer_size = config.buffers.size orelse DEFAULT_BUFFER_SIZE,
@@ -310,6 +310,7 @@ fn Blocking(comptime H: type) type {
 		}
 
 		pub fn run(self: *Self, listener: posix.socket_t, ctx: anytype) void {
+			defer self.shutdown();
 			while (true) {
 				var address: net.Address = undefined;
 				var address_len: posix.socklen_t = @sizeOf(net.Address);
@@ -330,7 +331,6 @@ fn Blocking(comptime H: type) type {
 				};
 				thread.detach();
 			}
-			self.shutdown();
 		}
 
 		// Called in a thread started above in listen.
@@ -376,8 +376,7 @@ fn Blocking(comptime H: type) type {
 		pub fn readLoop(self: *Self, hc: *HandlerConn(H)) !void {
 			defer self.cleanupConn(hc);
 
-			std.debug.print("readLoop {d}\n", .{hc.socket});
-			// try posix.setsockopt(hc.socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &Timeout.none);
+			try posix.setsockopt(hc.socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &Timeout.none);
 
 			// In BlockingMode, we always assign a reader for the duration of the connection
 			// In scenarios where client rarely send data, this is going to use up an unecessary amount
@@ -387,8 +386,8 @@ fn Blocking(comptime H: type) type {
 
 			hc.reader = Reader.init(reader_buf, self.buffer_provider);
 			while (true) {
-							if (handleIncoming(H, hc, self.allocator, undefined) == false) {
-								break;
+				if (handleClientData(H, hc, self.allocator, undefined) == false) {
+					break;
 				}
 			}
 		}
@@ -400,7 +399,7 @@ fn Blocking(comptime H: type) type {
 
 		fn shutdown(self: *Self) void {
 			var conn_manager = &self.conn_manager;
-			conn_manager.closeAll();
+			conn_manager.shutdown(self);
 
 			// wait up to 1 second for every connection to cleanly shutdown
 			var i: usize = 0;
@@ -411,123 +410,70 @@ fn Blocking(comptime H: type) type {
 				std.time.sleep(std.time.ns_per_ms * 100);
 			}
 		}
+
+		// called for each hc when shutting down
+		fn shutdownCleanup(_: *Self, _: *HandlerConn(H)) void {
+
+		}
 	};
 }
 
 fn NonBlocking(comptime H: type, comptime C: type) type {
 	return struct {
 		ctx: C,
-		// KQueue or Epoll, depending on the platform
-		loop: Loop,
-		allocator: Allocator,
-
-		thread_pool: *ThreadPool,
-		handshake_pool: *Handshake.Pool,
-		buffer_provider: *buffer.Provider,
-
-		// App can configure the use of a "small" buffer pool. This is the difference
-		// between assigning a buffer to the connection just-in-time per message, or always
-		small_buffer_pool: ?buffer.Pool,
-		connection_buffer_size: usize,
 		handshake_timeout: u32,
-
-		max_conn: usize,
-		conn_manager: ConnManager(H),
+		handshake_pool: *Handshake.Pool,
+		base: NonBlockingBase(H, Self.dataAvailable, true),
 
 		const Self = @This();
-		const ThreadPool = @import("thread_pool.zig").ThreadPool(Self.dataAvailable);
 
 		pub fn init(allocator: Allocator, state: *WorkerState, ctx: C) !Self {
-			const config = &state.config;
-
-			const loop = try Loop.init();
-			errdefer loop.deinit();
-
-			var conn_manager = try ConnManager(H).init(allocator, &state.handshake_pool);
-			errdefer conn_manager.deinit();
-
-			var thread_pool = try ThreadPool.init(allocator, .{
-				.count = config.thread_pool.count orelse 4,
-				.backlog = config.thread_pool.backlog orelse 500,
-				.buffer_size = config.thread_pool.buffer_size orelse 32_768,
-			});
-			errdefer thread_pool.deinit();
-
-			const connection_buffer_size = config.buffers.size orelse DEFAULT_BUFFER_SIZE;
-			var small_buffer_pool: ?buffer.Pool = null;
-			if (config.buffers.pool) |pool_count| {
-				small_buffer_pool = try buffer.Pool.init(allocator, pool_count, connection_buffer_size);
-			}
-
-			errdefer if (small_buffer_pool) |sbp| {
-				sbp.deinit();
-			};
+			var base = try NonBlockingBase(H, Self.dataAvailable, true).init(allocator, state);
+			errdefer base.deinit();
 
 			return .{
 				.ctx = ctx,
-				.loop = loop,
-				.thread_pool = thread_pool,
-				.handshake_pool = &state.handshake_pool,
-				.small_buffer_pool = small_buffer_pool,
-				.connection_buffer_size = connection_buffer_size,
-				.buffer_provider = &state.buffer_provider,
-				.allocator = allocator,
-				.max_conn = config.max_conn,
-				.conn_manager = conn_manager,
-				.handshake_timeout = config.handshake.timeout,
+				.base = base,
+				.handshake_pool = state.handshake_pool,
+				.handshake_timeout = state.config.handshake.timeout,
 			};
 		}
 
 		pub fn deinit(self: *Self) void {
-			self.conn_manager.deinit();
-			self.loop.deinit();
-			self.thread_pool.deinit();
-			if (self.small_buffer_pool) |*sbp| {
-				sbp.deinit();
-			}
+			self.base.deinit();
 		}
 
-		// allow listener to be null so that this worker can be started as part of
-		// an existing webserver which is doing its own listening.
-		fn run(self: *Self, listener: ?posix.socket_t, signal: posix.fd_t) void {
-			if (listener) |l| {
-				self.loop.monitorAccept(l) catch |err| {
-					log.err("failed to add monitor to listening socket: {}", .{err});
-					return;
-				};
+		fn run(self: *Self, listener: posix.socket_t, signal: posix.fd_t) void {
+			if (self.base.setupMonitors(listener, signal) == false) {
+				return;
 			}
 
-			self.loop.monitorSignal(signal) catch |err| {
-				log.err("failed to add monitor to signal pipe: {}", .{err});
-				return;
-			};
-
-			const thread_pool = self.thread_pool;
-			const conn_manager = &self.conn_manager;
+			const thread_pool = self.base.thread_pool;
+			const conn_manager = &self.base.conn_manager;
 			const handshake_timeout = self.handshake_timeout;
 
 			var now = timestamp();
 			var oldest_pending_start_time: ?u32 = null;
 			while (true) {
 				const handshake_cutoff = now - handshake_timeout;
-				const timeout = conn_manager.prepareToWait(handshake_cutoff) orelse blk: {
+				const timeout = self.prepareToWait(handshake_cutoff) orelse blk: {
 					if (oldest_pending_start_time) |started| {
 						break :blk if (started < handshake_cutoff) 1 else @as(i32, @intCast(started - handshake_cutoff));
 					}
 					break :blk null;
 				};
 
-				var it = self.loop.wait(timeout) catch |err| {
+				var it = self.base.loop.wait(timeout) catch |err| {
 					log.err("failed to wait on events: {}", .{err});
 					std.time.sleep(std.time.ns_per_s);
 					continue;
 				};
+
 				now = timestamp();
 				oldest_pending_start_time = null;
-
 				while (it.next()) |data| {
 					if (data == 0) {
-						self.accept(listener.?, now) catch |err| {
+						self.accept(listener, now) catch |err| {
 							log.err("accept error: {}", .{err});
 							std.time.sleep(std.time.ns_per_ms);
 						};
@@ -535,9 +481,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 					}
 
 					if (data == 1) {
-						// only thing signal is currently used for is to indicating a shutdown
-						log.info("received shutdown signal", .{});
-						self.shutdown();
+						self.base.shutdown();
 						return;
 					}
 
@@ -551,17 +495,50 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 						} else {
 							oldest_pending_start_time = hc.conn.started;
 						}
-						self.conn_manager.activate(hc);
+						conn_manager.activate(hc);
 					}
-
 					thread_pool.spawn(.{self, hc});
 				}
 			}
 		}
 
+		// Enforces timeouts, and returns when the next timeout should be checked.
+		fn prepareToWait(self: *Self, cutoff: u32) ?i32 {
+			const cm = &self.base.conn_manager;
+
+			// always ordered from oldest to newest, so once we find a conneciton
+			// that isn't timed out, we can stop
+			cm.lock.lock();
+			defer cm.lock.unlock();
+
+			var next_conn = cm.pending.head;
+			while (next_conn) |hc| {
+				const conn = &hc.conn;
+				const started = conn.started;
+				if (started > cutoff) {
+					// This is the first connection which hasn't timed out
+					// return the time until it times out.
+					return @intCast(started - cutoff);
+				}
+
+				next_conn = hc.next;
+
+				// this connection has timed out. Don't use self.cleanup since there's
+				// a bunch of stuff we can assume here..like there's no handler or reader
+				conn.close();
+				log.debug("({}) handshake timeout", .{conn.address});
+				if (hc.handshake) |h| {
+					h.release();
+				}
+				cm.pending.remove(hc);
+				cm.pool.destroy(hc);
+			}
+			return null;
+		}
+
 		fn accept(self: *Self, listener: posix.fd_t, now: u32) !void {
-			const max_conn = self.max_conn;
-			const conn_manager = &self.conn_manager;
+			const max_conn = self.base.max_conn;
+			const conn_manager = &self.base.conn_manager;
 
 			while (conn_manager.count() < max_conn) {
 				var address: net.Address = undefined;
@@ -588,12 +565,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 						_ = try posix.fcntl(socket, posix.F.SETFL, flags & ~nonblocking);
 					}
 				}
-
-				const hc = try conn_manager.create(socket, address, now);
-				self.loop.monitorRead(hc, false) catch |err| {
-					conn_manager.cleanup(hc);
-					return err;
-				};
+				return self.base.newConn(socket, address, now);
 			}
 		}
 
@@ -608,23 +580,156 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 		// shutdown (by waiting for all the thread pools threads to end) solves this.
 		// Else, we'll need to throw a bunch of locking around HC just to handle shutdown.
 		fn dataAvailable(self: *Self, hc: *HandlerConn(H), thread_buf: []u8) void {
-			var ok = false;
-			var conn = &hc.conn;
-
+			var success = false;
 			if (hc.handler == null) {
-				ok = self.dataForHandshake(hc) catch |err| blk: {
-					log.err("({}) error processing handshake: {}", .{conn.address, err});
+				success = self.dataForHandshake(hc) catch |err| blk: {
+					log.err("({}) error processing handshake: {}", .{hc.conn.address, err});
 					break :blk false;
 				};
 			} else {
-				ok = self.dataForMessage(hc, thread_buf) catch |err| blk: {
-					log.err("({}) error processing message: {}", .{conn.address, err});
-					break :blk false;
+				success = self.base.dataAvailable(hc, thread_buf);
+			}
+
+			self.base.postProcess(hc, success);
+		}
+
+		fn dataForHandshake(self: *Self, hc: *HandlerConn(H)) !bool {
+			if (handleHandshake(H, self, hc, self.ctx) == false) {
+				return false;
+			}
+
+			if (hc.handler == null) {
+				// still don't have a handshake
+				self.base.conn_manager.inactive(hc);
+			}
+
+			return true;
+		}
+	};
+}
+
+fn NonBlockingBase(comptime H: type, comptime TP: anytype, comptime MANAGE_HS: bool) type {
+	return struct {
+		// KQueue or Epoll, depending on the platform
+		loop: Loop,
+		allocator: Allocator,
+
+		thread_pool: *ThreadPool,
+		buffer_provider: *buffer.Provider,
+
+		// App can configure the use of a "small" buffer pool. This is the difference
+		// between assigning a buffer to the connection just-in-time per message, or always
+		small_buffer_pool: ?buffer.Pool,
+		connection_buffer_size: usize,
+
+		max_conn: usize,
+		conn_manager: ConnManager(H, MANAGE_HS),
+
+		const Self = @This();
+		const ThreadPool = @import("thread_pool.zig").ThreadPool(TP);
+
+		fn init(allocator: Allocator, state: *WorkerState) !Self {
+			const config = &state.config;
+
+			const loop = try Loop.init();
+			errdefer loop.deinit();
+
+			var conn_manager = try ConnManager(H, MANAGE_HS).init(allocator);
+			errdefer conn_manager.deinit();
+
+			var thread_pool = try ThreadPool.init(allocator, .{
+				.count = config.thread_pool.count orelse 4,
+				.backlog = config.thread_pool.backlog orelse 500,
+				.buffer_size = config.thread_pool.buffer_size orelse 32_768,
+			});
+			errdefer thread_pool.deinit();
+
+			const connection_buffer_size = config.buffers.size orelse DEFAULT_BUFFER_SIZE;
+			var small_buffer_pool: ?buffer.Pool = null;
+			if (config.buffers.pool) |pool_count| {
+				small_buffer_pool = try buffer.Pool.init(allocator, pool_count, connection_buffer_size);
+			}
+
+			errdefer if (small_buffer_pool) |sbp| {
+				sbp.deinit();
+			};
+
+			return .{
+				.loop = loop,
+				.allocator = allocator,
+				.thread_pool = thread_pool,
+				.max_conn = config.max_conn,
+				.conn_manager = conn_manager,
+				.small_buffer_pool = small_buffer_pool,
+				.buffer_provider = &state.buffer_provider,
+				.connection_buffer_size = connection_buffer_size,
+			};
+		}
+
+		fn deinit(self: *Self) void {
+			self.conn_manager.deinit();
+			self.loop.deinit();
+			self.thread_pool.deinit();
+			if (self.small_buffer_pool) |*sbp| {
+				sbp.deinit();
+			}
+		}
+
+		fn setupMonitors(self: *Self, listener: ?posix.socket_t, signal: posix.fd_t) bool {
+			if (listener) |l| {
+				self.loop.monitorAccept(l) catch |err| {
+					log.err("failed to add monitor to listening socket: {}", .{err});
+					return false;
 				};
 			}
 
+			self.loop.monitorSignal(signal) catch |err| {
+				log.err("failed to add monitor to signal pipe: {}", .{err});
+				return false;
+			};
+
+			return true;
+		}
+
+		fn newConn(self: *Self, socket: posix.socket_t, address: net.Address, time: u32) !void {
+				const hc = try self.conn_manager.create(socket, address, time);
+				self.loop.monitorRead(hc, false) catch |err| {
+					self.conn_manager.cleanup(hc);
+					return err;
+				};
+		}
+
+		fn dataAvailable(self: *Self, hc: *HandlerConn(H), thread_buf: []u8) bool {
+			return self._dataAvailable(hc, thread_buf) catch |err| {
+				log.err("({}) error processing client message: {}", .{hc.conn.address, err});
+				return false;
+			};
+		}
+
+		fn _dataAvailable(self: *Self, hc: *HandlerConn(H), thread_buf: []u8) !bool {
+			if (hc.reader == null) {
+				const reader_buf = if (self.small_buffer_pool) |*sbp| try sbp.acquireOrCreate() else try self.allocator.alloc(u8, self.connection_buffer_size);
+				hc.reader = Reader.init(reader_buf, self.buffer_provider);
+			}
+			const reader = &hc.reader.?;
+
+			var fba = FixedBufferAllocator.init(thread_buf);
+			const ok = handleClientData(H, hc, self.allocator, &fba);
+
+			if (self.small_buffer_pool) |*sbp| {
+				if (reader.isEmpty()) {
+					sbp.release(reader.static);
+					hc.reader = null;
+				}
+			}
+
+			return ok;
+		}
+
+		fn postProcess(self: *Self, hc: *HandlerConn(H), success: bool) void {
+			var conn = &hc.conn;
 			var closed: bool = undefined;
-			if (ok == false) {
+			if (success == false) {
 				conn.close();
 				closed = true;
 			} else {
@@ -642,41 +747,8 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 			}
 		}
 
-		fn dataForHandshake(self: *Self, hc: *HandlerConn(H)) !bool {
-			if (handleHandshake(H, self, hc, self.ctx) == false) {
-				return false;
-			}
-
-			if (hc.handler == null) {
-				// still don't have a handshake
-				self.conn_manager.inactive(hc);
-			}
-
-			return true;
-		}
-
-		fn dataForMessage(self: *Self, hc: *HandlerConn(H), thread_buf: []u8) !bool {
-			if (hc.reader == null) {
-				const reader_buf = if (self.small_buffer_pool) |*sbp| try sbp.acquireOrCreate() else try self.allocator.alloc(u8, self.connection_buffer_size);
-				hc.reader = Reader.init(reader_buf, self.buffer_provider);
-			}
-			const reader = &hc.reader.?;
-
-			var fba = FixedBufferAllocator.init(thread_buf);
-			const ok = handleIncoming(H, hc, self.allocator, &fba);
-
-			if (self.small_buffer_pool) |*sbp| {
-				if (reader.isEmpty()) {
-					sbp.release(reader.static);
-					hc.reader = null;
-				}
-			}
-
-			return ok;
-		}
-
 		fn cleanupConn(self: *Self, hc: *HandlerConn(H)) void {
-			if (hc.reader) |reader| {
+			if (hc.reader) |*reader| {
 				if (self.small_buffer_pool) |*sbp| {
 					sbp.release(reader.static);
 				} else {
@@ -687,8 +759,18 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 		}
 
 		fn shutdown(self: *Self) void {
+			log.info("received shutdown signal", .{});
 			self.thread_pool.stop();
-			self.conn_manager.closeAll();
+			self.conn_manager.shutdown(self);
+		}
+
+		// called for each hc when shutting down
+		fn shutdownCleanup(self: *Self, hc: *HandlerConn(H)) void {
+			if (hc.reader) |*reader| {
+				if (self.small_buffer_pool == null) {
+					self.allocator.free(reader.static);
+				}
+			}
 		}
 	};
 }
@@ -963,7 +1045,7 @@ pub fn ServerLoop(comptime H: type) type {
 // that a webserver can have websocket support without starting a full Server.
 const WorkerState = struct {
 	config: Config,
-	handshake_pool: Handshake.Pool,
+	handshake_pool: *Handshake.Pool,
 	buffer_provider: buffer.Provider,
 
 	pub fn init(allocator: Allocator, config: Config) !WorkerState {
@@ -1027,17 +1109,16 @@ fn HandlerConn(comptime H: type) type {
 	};
 }
 
-fn ConnManager(comptime H: type) type {
+fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
 	return struct {
 		lock: Thread.Mutex,
 		active: List(HandlerConn(H)),
 		pending: List(HandlerConn(H)),
 		pool: std.heap.MemoryPool(HandlerConn(H)),
-		handshake_pool: *Handshake.Pool,
 
 		const Self = @This();
 
-		fn init(allocator: Allocator, handshake_pool: *Handshake.Pool) !Self {
+		fn init(allocator: Allocator) !Self {
 			var pool = std.heap.MemoryPool(HandlerConn(H)).init(allocator);
 			errdefer pool.deinit();
 
@@ -1046,7 +1127,6 @@ fn ConnManager(comptime H: type) type {
 				.pool = pool,
 				.active = .{},
 				.pending = .{},
-				.handshake_pool = handshake_pool,
 			};
 		}
 
@@ -1057,7 +1137,7 @@ fn ConnManager(comptime H: type) type {
 		fn count(self: *Self) usize {
 			self.lock.lock();
 			defer self.lock.unlock();
-			if (comptime blockingMode()) {
+			if (MANAGE_HS == false) {
 				return self.active.len;
 			}
 			return self.active.len  + self.pending.len;
@@ -1071,7 +1151,7 @@ fn ConnManager(comptime H: type) type {
 
 			const hc = try self.pool.create();
 			hc.* = .{
-				.state = if (comptime blockingMode()) .active else .handshake,
+				.state = if (MANAGE_HS) .handshake else .active,
 				.socket = socket,
 				.handler = null,
 				.handshake = null,
@@ -1084,18 +1164,18 @@ fn ConnManager(comptime H: type) type {
 				},
 			};
 
-			if (comptime blockingMode()) {
-				self.active.insert(hc);
-			} else {
-				// only care about this in nonblocking mode, because in blocking mode
-				// the handshake timeout is handled by the spawned thread for the connection
+			if (comptime MANAGE_HS) {
+				// Still waiting for a handshake. Only care about this with the full
+				// NonBlocking worker
 				self.pending.insert(hc);
+			} else {
+				self.active.insert(hc);
 			}
 			return hc;
 		}
 
 		fn activate(self: *Self, hc: *HandlerConn(H)) void {
-			std.debug.assert(blockingMode() == false);
+			std.debug.assert(MANAGE_HS == true);
 
 			// our caller made sute this was the case
 			std.debug.assert(hc.state == .handshake);
@@ -1107,7 +1187,7 @@ fn ConnManager(comptime H: type) type {
 		}
 
 		fn inactive(self: *Self, hc: *HandlerConn(H)) void {
-			std.debug.assert(blockingMode() == false);
+			std.debug.assert(MANAGE_HS == false);
 
 			// this should only be called when we need more data to complete the handshake
 			// which should only happen on an active connection
@@ -1122,7 +1202,7 @@ fn ConnManager(comptime H: type) type {
 
 		fn cleanup(self: *Self, hc: *HandlerConn(H)) void {
 			if (hc.handshake) |h| {
-				self.handshake_pool.release(h);
+				h.release();
 			}
 
 			if (hc.reader) |*r| {
@@ -1147,17 +1227,20 @@ fn ConnManager(comptime H: type) type {
 			self.lock.unlock();
 		}
 
-		fn closeAll(self: *Self) void {
+		fn shutdown(self: *Self, worker: anytype) void {
 			self.lock.lock();
 			defer self.lock.unlock();
 
-			closeList(self.active.head);
-			if (comptime blockingMode() == false) {
-				closeList(self.pending.head);
-			}
+			shutdownList(self.active.head, worker);
+			shutdownList(self.pending.head, worker);
 		}
 
-		fn closeList(head: ?*HandlerConn(H)) void {
+		// This is sloppy and leaves things in an unrecoverable state. To keep
+		// things clean, we should call self.cleanup(hc) on each entry in the list
+		// but that does a bunch of things we don't need if we know that we're
+		// shutting down - like returning data to the pools, nd popping items
+		// out of the list.
+		fn shutdownList(head: ?*HandlerConn(H), worker: anytype) void {
 			var next_node = head;
 			while (next_node) |hc| {
 
@@ -1168,6 +1251,8 @@ fn ConnManager(comptime H: type) type {
 					}
 				}
 
+				worker.shutdownCleanup(hc);
+
 				const conn = &hc.conn;
 				if (conn.isClosed() == false) {
 					conn.writeClose();
@@ -1175,39 +1260,6 @@ fn ConnManager(comptime H: type) type {
 				}
 				next_node = hc.next;
 			}
-		}
-
-		// Enforces timeouts, and returns when the next timeout should be checked.
-		fn prepareToWait(self: *Self, cutoff: u32) ?i32 {
-			std.debug.assert(blockingMode() == false);
-
-			// always ordered from oldest to newest, so once we find a conneciton
-			// that isn't timed out, we can stop
-			self.lock.lock();
-			defer self.lock.unlock();
-			var next_conn = self.pending.head;
-			while (next_conn) |hc| {
-				const conn = &hc.conn;
-				const started = conn.started;
-				if (started > cutoff) {
-					// This is the first connection which hasn't timed out
-					// return the time until it times out.
-					return @intCast(started - cutoff);
-				}
-
-				next_conn = hc.next;
-
-				// this connection has timed out. Don't use self.cleanup since there's
-				// a bunch of stuff we can assume here..like there's no handler or reader
-				conn.close();
-				log.debug("({}) handshake timeout", .{conn.address});
-				if (hc.handshake) |h| {
-					self.handshake_pool.release(h);
-				}
-				self.pending.remove(hc);
-				self.pool.destroy(hc);
-			}
-			return null;
 		}
 	};
 }
@@ -1372,7 +1424,7 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
 		return false;
 	}
 
-	state.len += n;
+	state.len = len + n;
 	const handshake = Handshake.parse(state) catch |err| {
 		log.debug("({}) error parsing handshake: {}", .{conn.address, err});
 		respondToHandshakeError(conn, err);
@@ -1382,7 +1434,7 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
 		return true;
 	};
 
-	worker.handshake_pool.release(state);
+	state.release();
 	hc.handshake = null;
 
 	// After this, the app has access to &hc.conn, so any access to the
@@ -1413,15 +1465,15 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
 	return true;
 }
 
-fn handleIncoming(comptime H: type, hc: *HandlerConn(H), allocator: Allocator, fba: *FixedBufferAllocator) bool {
+fn handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator, fba: *FixedBufferAllocator) bool {
 	std.debug.assert(hc.handshake == null);
-	return _handleIncoming(H, hc, allocator, fba) catch |err| {
+	return _handleClientData(H, hc, allocator, fba) catch |err| {
 		log.warn("({}) uncaugh error handling incoming data: {}", .{hc.conn.address, err});
 		return false;
 	};
 }
 
-fn _handleIncoming(comptime H: type, hc: *HandlerConn(H), allocator: Allocator, fba: *FixedBufferAllocator) !bool {
+fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator, fba: *FixedBufferAllocator) !bool {
 	var conn = &hc.conn;
 	var reader = &hc.reader.?;
 	reader.fill(conn.stream) catch |err| {
@@ -1709,6 +1761,17 @@ test "Server: read and write" {
 test "Server: handleMessage allocator" {
 	const stream = try testStream(true);
 	defer stream.close();
+
+	try stream.writeAll(&proto.frame(.text, "dyn"));
+	var buf: [12]u8 = undefined;
+	_ = try stream.readAtLeast(&buf, 12);
+	try t.expectSlice(u8, &.{129, 10, 'o', 'v', 'e', 'r', ' ', '9', '0', '0', '0', '!'}, buf[0..12]);
+}
+
+// Same as above, but client doesn't shutdown the connection
+// When afterAll is runs and things are shutdown, this should still be properly cleaned up
+test "Server: dirty handleMessage allocator" {
+	const stream = try testStream(true);
 
 	try stream.writeAll(&proto.frame(.text, "dyn"));
 	var buf: [12]u8 = undefined;

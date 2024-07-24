@@ -133,27 +133,33 @@ pub const Handshake = struct {
 		// Headers
 		headers: KeyValue,
 
-		fn init(allocator: Allocator, buffer_size: usize, max_headers: usize) !State {
-			const buf = try allocator.alloc(u8, buffer_size);
+		pool: *M.Pool,
+
+		fn init(pool: *M.Pool) !State {
+			const allocator = pool.allocator;
+			const buf = try allocator.alloc(u8, pool.buffer_size);
 			errdefer allocator.free(buf);
 
-			const headers = try KeyValue.init(allocator, max_headers);
+			const headers = try KeyValue.init(allocator, pool.max_headers);
 			errdefer headers.deinit(allocator);
 
 			return .{
 				.buf = buf,
+				.pool = pool,
 				.headers = headers,
 			};
 		}
 
-		fn deinit(self: *State, allocator: Allocator) void {
+		fn deinit(self: *State) void {
+			const allocator = self.pool.allocator;
 			allocator.free(self.buf);
 			self.headers.deinit(allocator);
 		}
 
-		fn reset(self: *State) void {
+		pub fn release(self: *State) void {
 			self.len = 0;
 			self.headers.len = 0;
+			self.pool.release(self);
 		}
 	};
 };
@@ -224,18 +230,14 @@ pub const Pool = struct {
 	max_headers: usize,
 	states: []*Handshake.State,
 
-	pub fn init(allocator: Allocator, count: usize, buffer_size: usize, max_headers: usize) !Pool {
+	pub fn init(allocator: Allocator, count: usize, buffer_size: usize, max_headers: usize) !*Pool {
 		const states = try allocator.alloc(*Handshake.State, count);
+		errdefer allocator.free(states);
 
-		for (0..count) |i| {
-			const state = try allocator.create(Handshake.State);
-			errdefer allocator.destroy(state);
+		const pool = try allocator.create(Pool);
+		errdefer allocator.destroy(pool);
 
-			state.* = try Handshake.State.init(allocator, buffer_size, max_headers);
-			states[i] = state;
-		}
-
-		return .{
+		pool.* = .{
 			.mutex = .{},
 			.states = states,
 			.allocator = allocator,
@@ -243,15 +245,26 @@ pub const Pool = struct {
 			.max_headers = max_headers,
 			.buffer_size = buffer_size,
 		};
+
+		for (0..count) |i| {
+			const state = try allocator.create(Handshake.State);
+			errdefer allocator.destroy(state);
+
+			state.* = try Handshake.State.init(pool);
+			states[i] = state;
+		}
+
+		return pool;
 	}
 
 	pub fn deinit(self: *Pool) void {
 		const allocator = self.allocator;
 		for (self.states) |s| {
-			s.deinit(allocator);
+			s.deinit();
 			allocator.destroy(s);
 		}
 		allocator.free(self.states);
+		allocator.destroy(self);
 	}
 
 	pub fn acquire(self: *Pool) !*Handshake.State {
@@ -266,7 +279,7 @@ pub const Pool = struct {
 			const allocator = self.allocator;
 			const state = try allocator.create(Handshake.State);
 			errdefer allocator.destroy(state);
-			state.* = try Handshake.State.init(self.allocator, self.buffer_size, self.max_headers);
+			state.* = try Handshake.State.init(self);
 			return state;
 		}
 		const index = available - 1;
@@ -276,15 +289,14 @@ pub const Pool = struct {
 		return state;
 	}
 
-	pub fn release(self: *Pool, state: *Handshake.State) void {
-		state.reset();
+	fn release(self: *Pool, state: *Handshake.State) void {
 		var states = self.states;
 
 		self.mutex.lock();
 		const available = self.available;
 		if (available == states.len) {
 			self.mutex.unlock();
-			state.deinit(self.allocator);
+			state.deinit();
 			self.allocator.destroy(state);
 			return;
 		}
@@ -315,23 +327,30 @@ fn eql(a: []const u8, b: []const u8) bool {
 
 const t = @import("../t.zig");
 test "handshake: parse" {
-	var state = try Handshake.State.init(t.allocator, 512, 10);
-	defer state.deinit(t.allocator);
-
-	try t.expectEqual(null, try testHandshake("", &state));
-	try t.expectEqual(null, try testHandshake("GET", &state));
-	try t.expectEqual(null, try testHandshake("GET 1 HTTP/1.0\r", &state));
-	try t.expectEqual(null, try testHandshake("GET 1 HTTP/1.0\r\n", &state));
-
-	try t.expectError(error.InvalidProtocol, testHandshake("GET / HTTP/1.0\r\n\r\n", &state));
-	try t.expectError(error.MissingHeaders, testHandshake("GET / HTTP/1.1\r\n\r\n", &state));
-	try t.expectError(error.MissingHeaders, testHandshake("GET / HTTP/1.1\r\nConnection:  upgrade\r\n\r\n", &state));
-	try t.expectError(error.MissingHeaders, testHandshake("GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n", &state));
-	try t.expectError(error.MissingHeaders, testHandshake("GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nsec-websocket-version:13\r\n\r\n", &state));
+	var pool = try Pool.init(t.allocator, 1, 512, 10);
+	defer pool.deinit();
 
 	{
-		state.reset();
-		const h = (try testHandshake("GET /test?a=1   HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nsec-websocket-version:13\r\nsec-websocket-key: 9000!\r\nCustom:  Header-Value\r\n\r\n", &state)).?;
+		var state = try pool.acquire();
+		defer state.release();
+
+		try t.expectEqual(null, try testHandshake("", state));
+		try t.expectEqual(null, try testHandshake("GET", state));
+		try t.expectEqual(null, try testHandshake("GET 1 HTTP/1.0\r", state));
+		try t.expectEqual(null, try testHandshake("GET 1 HTTP/1.0\r\n", state));
+
+		try t.expectError(error.InvalidProtocol, testHandshake("GET / HTTP/1.0\r\n\r\n", state));
+		try t.expectError(error.MissingHeaders, testHandshake("GET / HTTP/1.1\r\n\r\n", state));
+		try t.expectError(error.MissingHeaders, testHandshake("GET / HTTP/1.1\r\nConnection:  upgrade\r\n\r\n", state));
+		try t.expectError(error.MissingHeaders, testHandshake("GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n", state));
+		try t.expectError(error.MissingHeaders, testHandshake("GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nsec-websocket-version:13\r\n\r\n", state));
+	}
+
+	{
+		var state = try pool.acquire();
+		defer state.release();
+
+		const h = (try testHandshake("GET /test?a=1   HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nsec-websocket-version:13\r\nsec-websocket-key: 9000!\r\nCustom:  Header-Value\r\n\r\n", state)).?;
 		try t.expectString("9000!", h.key);
 		try t.expectString("GET", h.method);
 		try t.expectString("/test?a=1", h.url);
@@ -426,10 +445,10 @@ test "Handshake.Pool: threadsafety" {
 		hs.buf[0] = 0;
 	}
 
-	const t1 = try std.Thread.spawn(.{}, testPool, .{&p});
-	const t2 = try std.Thread.spawn(.{}, testPool, .{&p});
-	const t3 = try std.Thread.spawn(.{}, testPool, .{&p});
-	const t4 = try std.Thread.spawn(.{}, testPool, .{&p});
+	const t1 = try std.Thread.spawn(.{}, testPool, .{p});
+	const t2 = try std.Thread.spawn(.{}, testPool, .{p});
+	const t3 = try std.Thread.spawn(.{}, testPool, .{p});
+	const t4 = try std.Thread.spawn(.{}, testPool, .{p});
 
 	t1.join(); t2.join(); t3.join(); t4.join();
 }
