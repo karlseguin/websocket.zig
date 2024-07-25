@@ -413,8 +413,8 @@ pub const Conn = struct {
 };
 
 const read_no_timeout = std.mem.toBytes(os.timeval{
-	.tv_sec = 0,
-	.tv_usec = 0,
+	.sec = 0,
+	.usec = 0,
 });
 
 // used in handshake tests
@@ -424,8 +424,8 @@ pub fn readRequest(stream: anytype, buf: []u8, timeout: ?u32) ![]u8 {
 	if (timeout) |ms| {
 		// our timeout for each individual read
 		read_timeout = std.mem.toBytes(os.timeval{
-			.tv_sec = @intCast(@divTrunc(ms, 1000)),
-			.tv_usec = @intCast(@mod(ms, 1000) * 1000),
+			.sec = @intCast(@divTrunc(ms, 1000)),
+			.usec = @intCast(@mod(ms, 1000) * 1000),
 		});
 		// our absolute deadline for reading the header
 		deadline = std.time.milliTimestamp() + ms;
