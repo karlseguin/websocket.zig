@@ -1275,8 +1275,25 @@ pub const Conn = struct {
 
 	pub fn writeCloseWithCode(self: *Conn, code: u16) void {
 		var buf: [2]u8 = undefined;
-		std.mem.writeInt(u16, &buf, code, .Big);
+		std.mem.writeInt(u16, &buf, code, .big);
 		self.writeFrame(.close, &buf) catch {};
+	}
+
+	pub fn writeCloseWithReason(self: *Conn, code: u16, reason: []const u8) !void {
+		if (reason.len > 123) {
+			return error.ReasonTooLong;
+		}
+		var buf: [4]u8 = undefined;
+		buf[0] = @intFromEnum(OpCode.close);
+		buf[1] = @intCast(reason.len + 2);
+		std.mem.writeInt(u16, buf[2..], code, .big);
+
+		var vec = [2]std.posix.iovec_const{
+			.{ .len = buf.len, .base = &buf },
+			.{ .len = reason.len, .base = reason.ptr },
+		};
+
+		return self.writeAllIOVec(&vec);
 	}
 
 	pub fn writeFrame(self: *Conn, op_code: OpCode, data: []const u8) !void {
@@ -1321,28 +1338,32 @@ pub const Conn = struct {
 			.{ .len = data.len, .base = data.ptr },
 		};
 
-		var i: usize = 0;
-		const socket = stream.handle;
-
-		self.lock.lock();
-		defer self.lock.unlock();
-
-		while (true) {
-			var n = try std.posix.writev(socket, vec[i..]);
-			while (n >= vec[i].len) {
-				n -= vec[i].len;
-					i += 1;
-					if (i >= vec.len) return;
-			}
-			vec[i].base += n;
-			vec[i].len -= n;
-		}
+		return self.writeAllIOVec(&vec);
 	}
 
 	pub fn writeFramed(self: *Conn, data: []const u8) !void {
 		self.lock.lock();
 		defer self.lock.unlock();
 		try self.stream.writeAll(data);
+	}
+
+	fn writeAllIOVec(self: *Conn, vec: []std.posix.iovec_const) !void {
+		const socket = self.stream.handle;
+
+			self.lock.lock();
+		defer self.lock.unlock();
+
+		var i: usize = 0;
+		while (true) {
+			var n = try std.posix.writev(socket, vec[i..]);
+			while (n >= vec[i].len) {
+				n -= vec[i].len;
+				i += 1;
+				if (i >= vec.len) return;
+			}
+			vec[i].base += n;
+			vec[i].len -= n;
+		}
 	}
 };
 
@@ -1743,6 +1764,38 @@ test "Server: dirty handleMessage allocator" {
 	try t.expectSlice(u8, &.{129, 10, 'o', 'v', 'e', 'r', ' ', '9', '0', '0', '0', '!'}, buf[0..12]);
 }
 
+test "Conn: close" {
+	{
+		// plain close
+		const stream = try testStream(true);
+		defer stream.close();
+		try stream.writeAll(&proto.frame(.text, "close1"));
+		var buf: [4]u8 = undefined;
+		_ = try stream.readAtLeast(&buf, 4);
+		try t.expectSlice(u8, &.{136, 2, 3, 232}, buf[0..4]);
+	}
+
+	{
+		// close with code
+		const stream = try testStream(true);
+		defer stream.close();
+		try stream.writeAll(&proto.frame(.text, "close2"));
+		var buf: [4]u8 = undefined;
+		_ = try stream.readAtLeast(&buf, 4);
+		try t.expectSlice(u8, &.{136, 2, 0, 0x7b}, buf[0..4]);
+	}
+
+	{
+		// close with reason
+		const stream = try testStream(true);
+		defer stream.close();
+		try stream.writeAll(&proto.frame(.text, "close3"));
+		var buf: [7]u8 = undefined;
+		_ = try stream.readAtLeast(&buf, 7);
+		try t.expectSlice(u8, &.{136, 5, 0, 0xea, 'b', 'y', 'e'}, buf[0..7]);
+	}
+}
+
 // test "ServerLoop" {
 // 	const pipe = try posix.pipe2(.{.NONBLOCK = !blockingMode()});
 // 	const server = pipe[0];
@@ -1816,6 +1869,15 @@ const TestHandler = struct {
 		}
 		if (std.mem.eql(u8, data, "dyn")) {
 			return self.conn.writeText(try std.fmt.allocPrint(allocator, "over {d}!", .{9000}));
+		}
+		if (std.mem.eql(u8, data, "close1")) {
+			return self.conn.writeClose();
+		}
+		if (std.mem.eql(u8, data, "close2")) {
+			return self.conn.writeCloseWithCode(123);
+		}
+		if (std.mem.eql(u8, data, "close3")) {
+			return self.conn.writeCloseWithReason(234, "bye");
 		}
 	}
 };
