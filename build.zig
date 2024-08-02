@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) !void {
 	{
 		const options = b.addOptions();
 		options.addOption(bool, "force_blocking", false);
-		websocket_module.addOptions("build", options);
+		websocket_module.addOptions("ws_build", options);
 	}
 
   {

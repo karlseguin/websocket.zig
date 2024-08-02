@@ -14,11 +14,10 @@ const log = std.log.scoped(.websocket);
 const OpCode = proto.OpCode;
 const Reader = proto.Reader;
 const Message = proto.Message;
-const Handshake = @import("handshake.zig").Handshake;
+pub const Handshake = @import("handshake.zig").Handshake;
 const FallbackAllocator = @import("fallback_allocator.zig").FallbackAllocator;
 
 const DEFAULT_BUFFER_SIZE = 2048;
-const DEFAULT_WORKER_COUNT = 1;
 
 const EMPTY_PONG = ([2]u8{ @intFromEnum(OpCode.pong), 0 })[0..];
 // CLOSE, 2 length, code
@@ -27,8 +26,8 @@ const CLOSE_PROTOCOL_ERROR = ([_]u8{ @intFromEnum(OpCode.close), 2, 3, 234 })[0.
 
 const force_blocking: bool = blk: {
 	const build = @import("build");
-	if (@hasDecl(build, "force_blocking")) {
-		break :blk  build.force_blocking;
+	if (@hasDecl(build, "websocket_blocking")) {
+		break :blk  build.websocket_blocking;
 	}
 	break :blk false;
 };
@@ -76,6 +75,13 @@ pub const Config = struct {
 		large_size: ?usize = null,
 		large_count: ?u16 = null,
 	};
+
+	fn workerCount(self: *const Config) usize {
+		if (comptime blockingMode()) {
+			return 1;
+		}
+		return self.worker_count orelse 1;
+	}
 };
 
 pub fn Server(comptime H: type) type {
@@ -99,7 +105,7 @@ pub fn Server(comptime H: type) type {
 				}
 			}
 
-			const signals = try allocator.alloc(posix.fd_t, config.worker_count orelse DEFAULT_WORKER_COUNT);
+			const signals = try allocator.alloc(posix.fd_t, config.workerCount());
 			errdefer allocator.free(signals);
 
 			var state = try WorkerState.init(allocator, config);
@@ -202,14 +208,14 @@ pub fn Server(comptime H: type) type {
 				thrd.join();
 			} else {
 				defer posix.close(socket);
-				const Worker = NonBlocking(H, C);
+				const W = NonBlocking(H, C);
 
 				const allocator = self.allocator;
 
 				var signals = self._signals;
 				const worker_count = signals.len;
 				const threads = try allocator.alloc(Thread, worker_count);
-				const workers = try allocator.alloc(Worker, worker_count);
+				const workers = try allocator.alloc(W, worker_count);
 
 				var started: usize = 0;
 
@@ -230,10 +236,10 @@ pub fn Server(comptime H: type) type {
 					const pipe = try posix.pipe2(.{.NONBLOCK = true});
 					errdefer posix.close(pipe[1]);
 
-					workers[i] = try Worker.init(self.allocator, &self._state, ctx);
+					workers[i] = try W.init(self.allocator, &self._state, ctx);
 					errdefer workers[i].deinit();
 
-					threads[i] = try Thread.spawn(.{}, Worker.run, .{ &workers[i], socket, pipe[0] });
+					threads[i] = try Thread.spawn(.{}, W.run, .{ &workers[i], socket, pipe[0] });
 
 					signals[i] = pipe[1];
 					started += 1;
@@ -263,7 +269,7 @@ pub fn Server(comptime H: type) type {
 }
 
 // This is our Blocking worker. It's very different than NonBlocking and much simpler.
-fn Blocking(comptime H: type) type {
+pub fn Blocking(comptime H: type) type {
 	return struct {
 		allocator: Allocator,
 		handshake_timeout: Timeout,
@@ -280,11 +286,11 @@ fn Blocking(comptime H: type) type {
 			fn init(sec: u32) Timeout {
 				return .{
 					.sec = sec,
-					.timeval = std.mem.toBytes(posix.timeval{ .tv_sec = @intCast(sec), .tv_usec = 0 }),
+					.timeval = std.mem.toBytes(posix.timeval{ .sec = @intCast(sec), .usec = 0 }),
 				};
 			}
 
-			pub const none = std.mem.toBytes(posix.timeval{.tv_sec = 0, .tv_usec = 0});
+			pub const none = std.mem.toBytes(posix.timeval{.sec = 0, .usec = 0});
 		};
 
 		const Self = @This();
@@ -803,33 +809,33 @@ const KQueue = struct {
 	}
 
 	fn monitorAccept(self: *KQueue, fd: c_int) !void {
-		try self.change(fd, 0, posix.system.EVFILT_READ, posix.system.EV_ADD);
+		try self.change(fd, 0, posix.system.EVFILT.READ, posix.system.EV.ADD);
 	}
 
 	fn monitorSignal(self: *KQueue, fd: c_int) !void {
-		try self.change(fd, 1, posix.system.EVFILT_READ, posix.system.EV_ADD);
+		try self.change(fd, 1, posix.system.EVFILT.READ, posix.system.EV.ADD);
 	}
 
 	// Normally, we add the socket in the worker thread with rearm == false.
 	// Because this is a DISPATCH, it'll only fire once until we rearm it which
 	// we do by re-enabling it with rearm == true.
-	// However, notice that the rearm path also has the EV_ADD flag. From the above
+	// However, notice that the rearm path also has the EV.ADD flag. From the above
 	// description, this should not be necessary.
 	// But monitorRead where rearm == true is also used by our generic ServerLoop when
-	// taking over a connection (say from httpz). Hence, we need the EV_ADD flag too.
+	// taking over a connection (say from httpz). Hence, we need the EV.ADD flag too.
 	fn monitorRead(self: *KQueue, hc: anytype, comptime rearm: bool) !void {
 		if (rearm) {
 			const event = Kevent{
 				.ident = @intCast(hc.socket),
-				.filter = posix.system.EVFILT_READ,
-				.flags = posix.system.EV_ADD | posix.system.EV_ENABLE | posix.system.EV_DISPATCH,
+				.filter = posix.system.EVFILT.READ,
+				.flags = posix.system.EV.ADD | posix.system.EV.ENABLE | posix.system.EV.DISPATCH,
 				.fflags = 0,
 				.data = 0,
 				.udata = @intFromPtr(hc),
 			};
 			_ = try posix.kevent(self.q, &.{event}, &[_]Kevent{}, null);
 		} else {
-			try self.change(hc.socket, @intFromPtr(hc), posix.system.EVFILT_READ, posix.system.EV_ADD | posix.system.EV_ENABLE | posix.system.EV_DISPATCH);
+			try self.change(hc.socket, @intFromPtr(hc), posix.system.EVFILT.READ, posix.system.EV.ADD | posix.system.EV.ENABLE | posix.system.EV.DISPATCH);
 		}
 	}
 
@@ -855,7 +861,7 @@ const KQueue = struct {
 
 		fn wait(self: *KQueue, timeout_sec: ?i32) !Iterator {
 			const event_list = &self.event_list;
-			const timeout: ?posix.timespec = if (timeout_sec) |ts| posix.timespec{ .tv_sec = ts, .tv_nsec = 0 } else null;
+			const timeout: ?posix.timespec = if (timeout_sec) |ts| posix.timespec{ .sec = ts, .nsec = 0 } else null;
 			const event_count = try posix.kevent(self.q, self.change_buffer[0..self.change_count], event_list, if (timeout) |ts| &ts else null);
 			self.change_count = 0;
 
@@ -957,84 +963,42 @@ const EPoll = struct {
 
 // Abstraction ontop of NonBlocking and Blocking. Exists solely for integration
 // with httpz (or any other http library I guess.). Serves a similar purpose
-// as Server, but doesn't actually serve (doesn't open a listening socket).
-pub fn ServerLoop(comptime H: type) type {
-	const Inner = if (blockingMode()) Blocking(H, void) else NonBlocking(H, void);
+// as Server, but doesn't accept/listen.
+pub fn Worker(comptime H: type) type {
 
 	return struct {
-		inner: Inner,
-		state: *WorkerState,
-		allocator: Allocator,
-		signal: ?posix.fd_t, // only used by non-blocking to stop
+		worker: W,
 
 		const Self = @This();
+		const W = if (blockingMode()) Blocking(H) else NonBlockingBase(H, Self.dataAvailable, false);
 
-		pub fn init(allocator: Allocator, config: Config) !Self {
-			const state = try allocator.create(WorkerState);
-			errdefer allocator.destroy(state);
-
-			state.* = try WorkerState.init(allocator, config);
-			errdefer state.deinit();
-
-			var inner = try Inner.init(allocator, state, {});
-			errdefer inner.deinit();
-
+		pub fn init(allocator: Allocator, state: *WorkerState) !Self {
 			return .{
-				.state = state,
-				.inner = inner,
-				.signal = null,
-				.allocator = allocator,
+				.worker = try W.init(allocator, state),
 			};
 		}
 
 		pub fn deinit(self: *Self) void {
-			self.inner.deinit();
-			self.state.deinit();
-			self.allocator.destroy(self.state);
+			self.worker.deinit();
 		}
 
-		pub fn run(self: *Self) !void {
-			if (comptime blockingMode()) {
-				// nothing to "start" with the blocking worker
-				return;
-			}
-
-			const signals = try posix.pipe2(.{.NONBLOCK = true});
-			self.signal = signals[1];
-			const thrd = try Thread.spawn(.{}, Inner.run, .{&self.inner, null, signals[0]});
-			thrd.detach();
+		pub fn createConn(self: *Self, socket: posix.socket_t, address: net.Address, now: u32) !*HandlerConn(H) {
+			return self.worker.conn_manager.create(socket, address, now);
 		}
 
-		pub fn stop(self: *Self) void {
-			if (self.signal) |s| {
-				posix.close(s);
-			}
-			self.inner.shutdown();
+		pub fn cleanupConn(self: *Self, hc: *HandlerConn(H)) void {
+			self.worker.cleanupConn(hc);
 		}
 
-		pub fn takeover(self: *Self, socket: posix.socket_t, address: net.Address, ctx: anytype) !void {
-			const inner = &self.inner;
-
-			const hc = try inner.conn_manager.create(socket, address, timestamp());
-			errdefer {
-				if (comptime std.meta.hasFn(H, "close")) {
-					if (hc.handler) |h| {
-						h.close();
-						hc.handler = null;
-					}
-				}
-				inner.cleanupConn(hc);
-			}
-
-			hc.handler = try H.init(&hc.conn, ctx);
-
-			if (comptime blockingMode()) {
-				const thrd = try Thread.spawn(.{}, Inner.readLoop, .{&self.inner, hc});
-				thrd.detach();
-			} else {
-				try inner.loop.monitorRead(hc, false);
-			}
+		pub fn shutdown(self: *Self) void {
+			self.worker.shutdown();
 		}
+
+		fn dataAvailable(self: *Self, hc: *HandlerConn(H), thread_buf: []u8) void {
+			const success = self.worker.dataAvailable(hc, thread_buf);
+			self.worker.postProcess(hc, success);
+		}
+
 	};
 }
 
@@ -1043,7 +1007,7 @@ pub fn ServerLoop(comptime H: type) type {
 // Server(H) having handshake_pool and buffer_provider fields, but it was extracted
 // into its own struct for integration with webservers (i.e. httpz). The goal is
 // that a webserver can have websocket support without starting a full Server.
-const WorkerState = struct {
+pub const WorkerState = struct {
 	config: Config,
 	handshake_pool: *Handshake.Pool,
 	buffer_provider: buffer.Provider,
@@ -1091,7 +1055,7 @@ const WorkerState = struct {
 // * If handler is null AND handshake is null, it means we havent' received
 //   any data yet (we delay creating the handshake state until we at least have
 //   some data ready).
-fn HandlerConn(comptime H: type) type {
+pub fn HandlerConn(comptime H: type) type {
 	return struct {
 		state: State,
 		conn: Conn,
@@ -1109,7 +1073,7 @@ fn HandlerConn(comptime H: type) type {
 	};
 }
 
-fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
+pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
 	return struct {
 		lock: Thread.Mutex,
 		active: List(HandlerConn(H)),
@@ -1118,7 +1082,7 @@ fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
 
 		const Self = @This();
 
-		fn init(allocator: Allocator) !Self {
+		pub fn init(allocator: Allocator) !Self {
 			var pool = std.heap.MemoryPool(HandlerConn(H)).init(allocator);
 			errdefer pool.deinit();
 
@@ -1130,11 +1094,11 @@ fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
 			};
 		}
 
-		fn deinit(self: *Self) void {
+		pub fn deinit(self: *Self) void {
 			self.pool.deinit();
 		}
 
-		fn count(self: *Self) usize {
+		pub fn count(self: *Self) usize {
 			self.lock.lock();
 			defer self.lock.unlock();
 			if (MANAGE_HS == false) {
@@ -1143,7 +1107,7 @@ fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
 			return self.active.len  + self.pending.len;
 		}
 
-		fn create(self: *Self, socket: posix.socket_t, address: net.Address, now: u32) !*HandlerConn(H) {
+		pub fn create(self: *Self, socket: posix.socket_t, address: net.Address, now: u32) !*HandlerConn(H) {
 			errdefer posix.close(socket);
 
 			self.lock.lock();
@@ -1174,7 +1138,7 @@ fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
 			return hc;
 		}
 
-		fn activate(self: *Self, hc: *HandlerConn(H)) void {
+		pub fn activate(self: *Self, hc: *HandlerConn(H)) void {
 			std.debug.assert(MANAGE_HS == true);
 
 			// our caller made sute this was the case
@@ -1186,7 +1150,7 @@ fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
 			hc.state = .active;
 		}
 
-		fn inactive(self: *Self, hc: *HandlerConn(H)) void {
+		pub fn inactive(self: *Self, hc: *HandlerConn(H)) void {
 			std.debug.assert(MANAGE_HS == false);
 
 			// this should only be called when we need more data to complete the handshake
@@ -1200,7 +1164,7 @@ fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
 			self.pending.insert(hc);
 		}
 
-		fn cleanup(self: *Self, hc: *HandlerConn(H)) void {
+		pub fn cleanup(self: *Self, hc: *HandlerConn(H)) void {
 			if (hc.handshake) |h| {
 				h.release();
 			}
@@ -1227,7 +1191,7 @@ fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
 			self.lock.unlock();
 		}
 
-		fn shutdown(self: *Self, worker: anytype) void {
+		pub fn shutdown(self: *Self, worker: anytype) void {
 			self.lock.lock();
 			defer self.lock.unlock();
 
@@ -1452,12 +1416,12 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
 
 
 	hc.handler = handler;
-	try conn.writeFramed(&handshake.reply());
+	try conn.writeFramed(&Handshake.createReply(handshake.key));
 
 	if (comptime std.meta.hasFn(H, "afterInit")) {
-		handler.afterInit() catch |err| {
+		handler.afterInit(ctx) catch |err| {
 			log.debug("({}) " ++ @typeName(H) ++ ".afterInit error: {}", .{conn.address, err});
-		return false;
+			return false;
 		};
 	}
 
@@ -1643,7 +1607,7 @@ fn preHandOffWrite(conn: *Conn, response: []const u8) void {
 	}
 
 	const socket = conn.stream.handle;
-	const timeout = std.mem.toBytes(posix.timeval{ .tv_sec = 5, .tv_usec = 0 });
+	const timeout = std.mem.toBytes(posix.timeval{ .sec = 5, .usec = 0 });
 	posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &timeout) catch return;
 
 	var pos: usize = 0;
@@ -1663,7 +1627,7 @@ fn timestamp() u32 {
 	}
 	var ts: posix.timespec = undefined;
 	posix.clock_gettime(posix.CLOCK.REALTIME, &ts) catch unreachable;
-	return @intCast(ts.tv_sec);
+	return @intCast(ts.sec);
 }
 
 // intrusive doubly-linked list with count, not thread safe
@@ -1808,7 +1772,7 @@ test "Server: dirty handleMessage allocator" {
 // }
 
 fn testStream(handshake: bool) !net.Stream {
-	const timeout = std.mem.toBytes(std.posix.timeval{.tv_sec = 0, .tv_usec = 20_000});
+	const timeout = std.mem.toBytes(std.posix.timeval{.sec = 0, .usec = 20_000});
 	const address = try std.net.Address.parseIp("127.0.0.1", 9292);
 	const stream = try std.net.tcpConnectToAddress(address);
 	try std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &timeout);

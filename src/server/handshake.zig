@@ -98,7 +98,7 @@ pub const Handshake = struct {
 		};
 	}
 
-	pub fn reply(self: *const Handshake) [129]u8 {
+	pub fn createReply(key: []const u8) [129]u8 {
 		// HTTP/1.1 101 Switching Protocols\r\n
 		// Upgrade: websocket\r\n
 		// Connection: upgrade\r\n
@@ -114,7 +114,7 @@ pub const Handshake = struct {
 
 		var h: [20]u8 = undefined;
 		var hasher = std.crypto.hash.Sha1.init(.{});
-		hasher.update(self.key);
+		hasher.update(key);
 		hasher.update("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
 		hasher.final(&h);
 
@@ -360,16 +360,8 @@ test "handshake: parse" {
 }
 
 test "handshake: reply" {
-	const h = Handshake{
-		.url = "",
-		.method = "",
-		.raw_header = "",
-		.headers = undefined,
-		.key = "this is my key",
-	};
-
 	const expected = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: upgrade\r\nSec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n\r\n";
-	try t.expectString(expected , &h.reply());
+	try t.expectString(expected , &Handshake.createReply("this is my key"));
 }
 
 test "KeyValue: get" {
