@@ -52,7 +52,7 @@ pub const Handshake = struct {
 				required_headers |= 2;
 			} else if (mem.eql(u8, "connection", name)) {
 				// find if connection header has upgrade in it, example header: 
-				//		Connection: keep-alive, Upgrade
+				// Connection: keep-alive, Upgrade
 				if (ascii.indexOfIgnoreCase(value, "upgrade") == null) {
 					return error.InvalidConnection;
 				}
