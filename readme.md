@@ -314,6 +314,7 @@ As you can see, these methods take a `[]u8`, not a `[]const u8` as they **will**
 
 More advanced methods are:
 * `closeWithCode(u16)` - Sends a close message with the specified code and closes the connection
+* * `closeWithReson(u16, []const u8)` - Sends a close message with the specified code and reason. The reason must be <= 123 bytes long. Closes the connection.
 * `writePing([]u8)` - Writes a ping frame
 * `writePong([]u8)` - Writes a pong frame
 * `writeFrame(websocket.OpCode, []u8) - Writes an arbitrary frame`. `OpCode` is an enum with possible values of: `text`, `binary`, `close`, `ping`, `pong`

@@ -222,8 +222,25 @@ pub const Conn = struct {
 
 	pub fn writeCloseWithCode(self: *Conn, code: u16) !void {
 		var buf: [2]u8 = undefined;
-		std.mem.writeInt(u16, &buf, code, .Big);
+		std.mem.writeInt(u16, &buf, code, .big);
 		return self.writeFrame(.close, &buf);
+	}
+
+	pub fn writeCloseWithReason(self: *Conn, code: u16, reason: []const u8) !void {
+		if (reason.len > 123) {
+			return error.ReasonTooLong;
+		}
+		var buf: [4]u8 = undefined;
+		buf[0] = @intFromEnum(OpCode.close);
+		buf[1] = @intCast(reason.len + 2);
+		std.mem.writeInt(u16, buf[2..], code, .big);
+
+		var vec = [2]std.posix.iovec_const{
+			.{ .len = buf.len, .base = &buf },
+			.{ .len = reason.len, .base = reason.ptr },
+		};
+
+		try writeAllIOVec(self.stream.handle, &vec);
 	}
 
 	pub fn writeFrame(self: Conn, op_code: OpCode, data: []const u8) !void {
@@ -411,6 +428,20 @@ pub const Conn = struct {
 		}
 	};
 };
+
+fn writeAllIOVec(socket: std.posix.socket_t, vec: []std.posix.iovec_const) !void {
+	var i: usize = 0;
+	while (true) {
+		var n = try std.posix.writev(socket, vec[i..]);
+		while (n >= vec[i].len) {
+			n -= vec[i].len;
+			i += 1;
+			if (i >= vec.len) return;
+		}
+		vec[i].base += n;
+		vec[i].len -= n;
+	}
+}
 
 const read_no_timeout = std.mem.toBytes(os.timeval{
 	.sec = 0,
@@ -728,6 +759,22 @@ test "conn: writer" {
 		try wb.flush();
 		pair.server.close();
 		try expectFrames(&.{Expect.binary("." ** 1000)}, &pair);
+	}
+}
+
+test "conn: closeWithReason" {
+	{
+		var pair = t.SocketPair.init();
+		defer pair.deinit();
+
+		var tf = TestConnFactory.init(pair.server);
+		defer tf.deinit();
+
+		// short message (no growth)
+		var conn = tf.conn();
+		try conn.writeCloseWithReason(9100, "not with a bang");
+		pair.server.close();
+		try expectFrames(&.{Expect.close(&.{0x23, 0x8C, 'n', 'o', 't', ' ', 'w', 'i', 't', 'h', ' ', 'a', ' ', 'b', 'a', 'n', 'g'})}, &pair);
 	}
 }
 
