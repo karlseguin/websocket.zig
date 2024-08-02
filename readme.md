@@ -313,8 +313,8 @@ The main methods of `*websocket.Client` are:
 As you can see, these methods take a `[]u8`, not a `[]const u8` as they **will** mutate the data (websocket payloads are always masked). If you don't want the data mutated, pass a dupe. (By not just automatically duping the data, the library allows the application to decide if whether the data can be mutated or not, and thus whether to pay the dupe performance cost or not).
 
 More advanced methods are:
-* `closeWithCode(u16)` - Sends a close message with the specified code and closes the connection
-* * `closeWithReson(u16, []const u8)` - Sends a close message with the specified code and reason. The reason must be <= 123 bytes long. Closes the connection.
+* `writeCloseWithCode(u16)` - Sends a close message with the specified code.
+* `writeCloseWithReason(u16, []const u8)` - Sends a close message with the specified code and reason. The reason must be <= 123 bytes long.
 * `writePing([]u8)` - Writes a ping frame
 * `writePong([]u8)` - Writes a pong frame
 * `writeFrame(websocket.OpCode, []u8) - Writes an arbitrary frame`. `OpCode` is an enum with possible values of: `text`, `binary`, `close`, `ping`, `pong`
