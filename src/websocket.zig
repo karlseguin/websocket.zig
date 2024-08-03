@@ -17,76 +17,76 @@ pub const blockingMode = server.blockingMode;
 pub const Handshake = @import("server/handshake.zig").Handshake;
 
 pub fn bufferProvider(allocator: std.mem.Allocator, config: buffer.Config) !buffer.Provider {
-	return buffer.Provider.init(allocator, config);
+    return buffer.Provider.init(allocator, config);
 }
 
 pub fn frameText(comptime msg: []const u8) [proto.calculateFrameLen(msg)]u8 {
-	return proto.frame(.text, msg);
+    return proto.frame(.text, msg);
 }
 
 pub fn frameBin(comptime msg: []const u8) [proto.calculateFrameLen(msg)]u8 {
-	return proto.frame(.binary, msg);
+    return proto.frame(.binary, msg);
 }
 
 comptime {
-	std.testing.refAllDecls(@This());
+    std.testing.refAllDecls(@This());
 }
 
 const t = @import("t.zig");
 test "frameText" {
-	{
-		// short
-		const framed = frameText("hello");
-		try t.expectString(&[_]u8{129, 5, 'h', 'e', 'l', 'l', 'o'}, &framed);
-	}
+    {
+        // short
+        const framed = frameText("hello");
+        try t.expectString(&[_]u8{ 129, 5, 'h', 'e', 'l', 'l', 'o' }, &framed);
+    }
 
-	{
-		const msg = "A" ** 130;
-		const framed = frameText(msg);
+    {
+        const msg = "A" ** 130;
+        const framed = frameText(msg);
 
-		try t.expectEqual(134, framed.len);
+        try t.expectEqual(134, framed.len);
 
-		// text type
-		try t.expectEqual(129, framed[0]);
+        // text type
+        try t.expectEqual(129, framed[0]);
 
-		// 2 byte length marker
-		try t.expectEqual(126, framed[1]);
+        // 2 byte length marker
+        try t.expectEqual(126, framed[1]);
 
-		try t.expectEqual(0, framed[2]);
-		try t.expectEqual(130, framed[3]);
+        try t.expectEqual(0, framed[2]);
+        try t.expectEqual(130, framed[3]);
 
-		// payload
-		for (framed[4..]) |f| {
-			try t.expectEqual('A', f);
-		}
-	}
+        // payload
+        for (framed[4..]) |f| {
+            try t.expectEqual('A', f);
+        }
+    }
 }
 
 test "frameBin" {
-	{
-		// short
-		const framed = frameBin("hello");
-		try t.expectString(&[_]u8{130, 5, 'h', 'e', 'l', 'l', 'o'}, &framed);
-	}
+    {
+        // short
+        const framed = frameBin("hello");
+        try t.expectString(&[_]u8{ 130, 5, 'h', 'e', 'l', 'l', 'o' }, &framed);
+    }
 
-	{
-		const msg = "A" ** 130;
-		const framed = frameBin(msg);
+    {
+        const msg = "A" ** 130;
+        const framed = frameBin(msg);
 
-		try t.expectEqual(134, framed.len);
+        try t.expectEqual(134, framed.len);
 
-		// text type
-		try t.expectEqual(130, framed[0]);
+        // text type
+        try t.expectEqual(130, framed[0]);
 
-		// 2 byte length marker
-		try t.expectEqual(126, framed[1]);
+        // 2 byte length marker
+        try t.expectEqual(126, framed[1]);
 
-		try t.expectEqual(0, framed[2]);
-		try t.expectEqual(130, framed[3]);
+        try t.expectEqual(0, framed[2]);
+        try t.expectEqual(130, framed[3]);
 
-		// payload
-		for (framed[4..]) |f| {
-			try t.expectEqual('A', f);
-		}
-	}
+        // payload
+        for (framed[4..]) |f| {
+            try t.expectEqual('A', f);
+        }
+    }
 }
