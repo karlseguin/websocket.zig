@@ -1341,6 +1341,40 @@ pub const Conn = struct {
             vec[i].len -= n;
         }
     }
+
+    pub fn writeBuffer(self: *Conn, allocator: Allocator, op_code: OpCode) Writer {
+        return .{
+            .conn = self,
+            .op_code = op_code,
+            .buf = std.ArrayList(u8).init(allocator),
+        };
+    }
+
+    pub const Writer = struct {
+        conn: *Conn,
+        op_code: OpCode,
+        buf: std.ArrayList(u8),
+
+        pub const Error = Allocator.Error;
+        pub const IOWriter = std.io.Writer(*Writer, error{OutOfMemory}, Writer.write);
+
+        pub fn deinit(self: *Writer) void {
+            self.buf.deinit();
+        }
+
+        pub fn writer(self: *Writer) IOWriter {
+            return .{.context = self};
+        }
+
+        pub fn write(self: *Writer, data: []const u8) Allocator.Error!usize {
+            try self.buf.appendSlice(data);
+            return data.len;
+        }
+
+        pub fn flush(self: *Writer) !void {
+            try self.conn.writeFrame(self.op_code, self.buf.items);
+        }
+    };
 };
 
 fn handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx: anytype) bool {
@@ -1723,7 +1757,7 @@ test "Server: read and write" {
     try t.expectSlice(u8, &.{ 129, 4, '9', '0', '0', '0' }, buf[0..6]);
 }
 
-test "Server: handleMessage allocator" {
+test "Server: clientMessage allocator" {
     const stream = try testStream(true);
     defer stream.close();
 
@@ -1733,9 +1767,19 @@ test "Server: handleMessage allocator" {
     try t.expectSlice(u8, &.{ 129, 10, 'o', 'v', 'e', 'r', ' ', '9', '0', '0', '0', '!' }, buf[0..12]);
 }
 
+test "Server: clientMessage writer" {
+    const stream = try testStream(true);
+    defer stream.close();
+
+    try stream.writeAll(&proto.frame(.text, "writer"));
+    var buf: [9]u8 = undefined;
+    _ = try stream.readAtLeast(&buf, 9);
+    try t.expectSlice(u8, &.{ 129, 7, '9', '0', '0', '0', '!', '!', '!' }, buf[0..9]);
+}
+
 // Same as above, but client doesn't shutdown the connection
 // When afterAll is runs and things are shutdown, this should still be properly cleaned up
-test "Server: dirty handleMessage allocator" {
+test "Server: dirty clientMessage allocator" {
     const stream = try testStream(true);
 
     try stream.writeAll(&proto.frame(.text, "dyn"));
@@ -1815,16 +1859,17 @@ const TestHandler = struct {
             .conn = conn,
         };
     }
-    pub fn clientMessage(
-        self: *TestHandler,
-        allocator: Allocator,
-        data: []const u8,
-    ) !void {
+    pub fn clientMessage(self: *TestHandler, allocator: Allocator, data: []const u8,) !void {
         if (std.mem.eql(u8, data, "over")) {
             return self.conn.writeText("9000");
         }
         if (std.mem.eql(u8, data, "dyn")) {
             return self.conn.writeText(try std.fmt.allocPrint(allocator, "over {d}!", .{9000}));
+        }
+        if (std.mem.eql(u8, data, "writer")) {
+            var wb = self.conn.writeBuffer(allocator, .text);
+            try std.fmt.format(wb.writer(), "{d}!!!", .{9000});
+            return wb.flush();
         }
         if (std.mem.eql(u8, data, "close1")) {
             return self.conn.writeClose();

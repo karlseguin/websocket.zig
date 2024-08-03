@@ -115,7 +115,7 @@ Finally, `clientMessage` can take an optional `std.mem.Allocator`. If you need t
 
 ```zig
 // clientMessage that takes an allocator
-clientMessage(h: *Handler, allocator: Allocator, data: []const u8) !void`
+clientMessage(h: *Handler, allocator: Allocator, data: []const u8) !void
 
 // cilentMessage that takes an allocator AND a Message.TextType
 clientMessage(h: *Handler, allocator: Allocator, data: []const u8, tpe: ws.Message.TextType) !void`
@@ -147,16 +147,27 @@ The call to `init` includes a `*websocket.Conn`. It is expected that handlers wi
 You can also use `conn.closeWithCode(code: u16)` and `conn.closeWithReason(code: u16, reason: []const u8)`. Refer to [RFC6455](https://datatracker.ietf.org/doc/html/rfc6455#section-7.4.1) for valid codes. The `reason` must be <= 123 bytes.
 
 ### Writer
-It's possible to get a `std.io.Writer` from a `*Conn`. Because websocket messages are framed, the writter will buffer the message in memory and requires an explicit "flush". Buffering will use the global buffer pool (described in the Config section), but can still result in dynamic allocations if the pool is empty or the message being written is larger than the configured max size.
+It's possible to get a `std.io.Writer` from a `*Conn`. Because websocket messages are framed, the writter will buffer the message in memory and requires an explicit "flush". Buffering requires an allocator. 
 
 ```zig
 // .text or .binary
-var wb = try conn.writeBuffer(.text);
+var wb = conn.writeBuffer(.text, allocator);
 defer wb.deinit();
-
 try std.fmt.format(wb.writer(), "it's over {d}!!!", .{9000});
-
 try wb.flush();
+```
+
+Consider using the `clientMessage` overload which accepts an allocator. Not only is this allocator fast (it's a thread-local buffer than fallsback to an arena), but it also eliminates the need to call `deinit`:
+
+```zig
+pub fn clientMessage(h: *Handler, allocator: Allocator, data: []const u8) !void {
+    // Use the provided allocator.
+    // It's faster and doesn't require `deinit` to be called
+
+    var wb = conn.writeBuffer(.text, allocator);
+    try std.fmt.format(wb.writer(), "it's over {d}!!!", .{9000});
+    try wb.flush();
+}
 ```
 
 ## Thread Safety
@@ -265,9 +276,6 @@ pub const Config = struct {
     };
 }
 ```
-The handshake pool/buffer is separate from the main `buffer` to reduce the memory cost of invalid handshakes. Unless you're expecting a very large handshake request (a large URL, querystring or headers), the initial handshake is usually < 1KB. This data is also short-lived. Once the websocket is established however, you may want a larger buffer for handling incoming requests (and this buffer is generally much longer lived). By using a small pooled buffer for the initial handshake, invalid connections don't use up [as much] memory and thus the server may be more resilient to basic DOS attacks. Keep in mind that the websocket protocol requires a number of mandatory headers, so `handshake_max_size` can't be set to a super small value. Also keep in mind that the current pool implementation does not block when empty, but rather creates dynamic buffers of `handshake_max_size`.
-
-Websockets have their own fragmentation "feature" (not the same as TCP fragmentation) which this library could handle more efficiently. However, I'm not aware of any client (e.g. browsers) which use this feature at all.
 
 ## Advanced
 
@@ -278,8 +286,7 @@ Websocket message have their own special framing. When you use `conn.write` or `
 const UNKNOWN_COMMAND = websocket.frameText("unknown command");
 ...
 
-pub fn handle(self: *Handler, message: Message) !void {
-    const data = message.data;
+pub fn clientMessage(self: *Handler, data: []const u8) !void {
     if (std.mem.startsWith(u8, data, "join: ")) {
         self.handleJoin(data)
     } else if (std.mem.startsWith(u8, data, "leave: ")) {
@@ -310,6 +317,9 @@ In non-blocking mode, the `buffers.pool` and `buffers.size` should be set for yo
 However, if you expect clients to only send messages sporadically, such as a chat application, enabling the pool can reduce memory usage at the cost of a bit of overhead.
 
 In blocking mode, these settings are ignored and each connection always gets its own buffer (though there is still a shared large buffer pool).
+
+### Stopping
+`server.stop()` can be called to stop the webserver. It is safe to call this from a different thread (i.e. a `sigaction` handler).
 
 ## Testing
 The library comes with some helpers for testing:
