@@ -1,18 +1,9 @@
-A zig websocket server.
-
-Zig 0.12-dev is rapidly changing and constantly breaking features. I'll try to keep this up to date as much as possible. Note that 0.12-dev currently does not support async, so I've reverted to threads.
-
-See the [v0.10.1-compat](https://github.com/karlseguin/websocket.zig/tree/v0.10.1-compat) tag for a release that's compatible with Zig 0.10.1.
+# A zig websocket server.
+This project follows Zig master. See available branches if you're targetting a specific version.
 
 # Server
-The server is meant to be flexible and easy to use. Until async is re-added to zig, every connection spawns a thread. We try to limit the creation of resources until after a successful handshake (this can be fine-tuned via the configuration).
-
-## Example
 ```zig
-const websocket = @import("websocket");
-const Conn = websocket.Conn;
-const Message = websocket.Message;
-const Handshake = websocket.Handshake;
+const ws = @import("websocket");
 
 // Define a struct for "global" data passed into your websocket handler
 // This is whatever you want. You pass it to `listen` and the library will
@@ -22,51 +13,62 @@ const Context = struct {
 };
 
 pub fn main() !void {
-    var general_purpose_allocator = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = general_purpose_allocator.allocator();
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
 
-    // this is the instance of your "global" struct to pass into your handlers
-    var context = Context{}; 
+    // Arbitrary (application-specific) data to pass into each handler
+    // Could be Void ({}) if you don't have any data to pass
 
-    try websocket.listen(Handler, allocator, &context, .{
-        .port = 9223,
-        .max_headers = 10,
+    var app = App{
+        //.db =  a pool of db connections, for example
+    };
+
+    var server = try websocket.Server(Handler).init(allocator, .{
+        .port = 9224,
         .address = "127.0.0.1",
+        .handshake = .{
+            .timeout = 3,
+            .max_size = 1024,
+            .max_headers = 10,
+        },
     });
+
+    // this blocks
+    server.listen();
 }
 
+// This is your application-specific wrapper around a websocket connection
 const Handler = struct {
-    conn: *Conn,
-    context: *Context,
+    app: *App,
+    conn: *ws.Conn,
 
-    pub fn init(h: Handshake, conn: *Conn, context: *Context) !Handler {
+    // You must define a public init function which takes
+    pub fn init(h: ws.Handshake, conn: *ws.Conn, app: *App) !Handler {
         // `h` contains the initial websocket "handshake" request
         // It can be used to apply application-specific logic to verify / allow
         // the connection (e.g. valid url, query string parameters, or headers)
 
         _ = h; // we're not using this in our simple case
 
-        return Handler{
+        return .{
+            .app = app,
             .conn = conn,
-            .context = context,
         };
     }
 
-    // optional hook that, if present, will be called after initialization is complete
-    pub fn afterInit(self: *Handler) !void {}
-
-    pub fn handle(self: *Handler, message: Message) !void {
+    // You must defined a public clientMessage method
+    pub fn clientMessage(self: *Handler, data: []u8) !void {
         const data = message.data;
         try self.conn.write(data); // echo the message back
     }
-
-    // called whenever the connection is closed, can do some cleanup in here
-    pub fn close(_: *Handler) void {}
 };
 ```
 
+## Handler
+When you create a `websocket.Server(Handler)`, the specified `Handler` is your structure which will receive messages. It must have a public `init` function and `clientMessage` method. Other methods, such as `close` can optionally be defined.
+
 ### init
-The `init` method is called with a `websocket.Handshake`, a `*websocket.Conn` and whatever `context` value was passed as the 3rd parameter to `websocket.listen`. If you were building a chat application, you might have a ChannelManager that you want your handler to interact with. You would create a context with your `channel_manager`, pass that context to `listen`, and get that context back in `init`, where you can do with it what you want (e.g. store it as a field of your handler and use it in the `handle` function).
+The `init` method is called with a `websocket.Handshake`, a `*websocket.Conn` and whatever app-specific value was passed into `Server(H).init`. 
 
 The websocket specification requires the initial "handshake" to contain certain headers and values. The library validates these headers. However applications may have additional requirements before allowing the connection to be "upgraded" to a websocket connection. For example, a one-time-use token could be required in the querystring. Applications should use the provided `websocket.Handshake` to apply any application-specific verification and optionally return an error to terminate the connection.
 
@@ -90,18 +92,59 @@ const token = handshake.headers.get("authorization") orelse {
 
 Memory referenced by the `websocket.Handshake`, including headers from `handshake.headers` will be freed after the call to `init` completes. Application that need these values to exist beyond the call to `init` must make a copy.
 
-### handle
-The `handle` function takes a `message` which has a `type` and `data` field. The `type` will either be `text` or `binary`, but in 99% of cases, you can ignore it and just use `data`. This is an unfortunate part of the spec which differentiates between arbitrary byte data (binary) and valid UTF-8 (text). This library _does not_ reject text messages with invalid UTF-8. Again, in most cases, it doesn't matter and just wastes cycles. If you care about this, do like the autobahn test does and validate it in your handler.
+### clientMessage
+The `clientMessage` method is called whenever a text or binary message is received.
 
-If `handle` returns an error, the connection is closed.
+The `clientMessage` method can take one of four shapes. The simplest, shown in the first example, is:
+
+```zig
+// simple clientMessage
+clientMessage(h: *Handler, data: []const u8) !void
+```
+
+The Websocket specific has a distinct message type for text and binary. Text messages must be valid UTF-8. Websocket.zig does not do this validation (it's expensive and most apps don't care). However, if you do care about the distinction, your `clientMessage` can take another parameter:
+
+```zig
+// clientMessage that accepts a tpe to differentiate between messages
+// sent as `text` vs those sent as `binary`. Either way, Websocket.zig
+// does not validate that text data is valid UTF-8.
+clientMessage(h: *Handler, data: []const u8, tpe: ws.Message.TextType) !void
+```
+
+Finally, `clientMessage` can take an optional `std.mem.Allocator`. If you need to dynamically allocate memory within `clientMessage`, consider using this allocator. It is a fast thread-local buffer that fallsback to an arena allocator. Allocations made with this allocator are freed after `clientMessage` returns:
+
+```zig
+// clientMessage that takes an allocator
+clientMessage(h: *Handler, allocator: Allocator, data: []const u8) !void`
+
+// cilentMessage that takes an allocator AND a Message.TextType
+clientMessage(h: *Handler, allocator: Allocator, data: []const u8, tpe: ws.Message.TextType) !void`
+```
+
+If `clientMessage` returns an error, the connection is closed. You can also call `conn.close()` within the method.
 
 ### close
-Called whenever the connection terminates. By the time `close` is called, there is no guarantee about the state of the underlying TCP connection (it may or may not be closed).
+If your handler define `close(handler: *Handler)` method, the method is called whenever the connection is being closed. Guaranteed to be called exactly once, so it is safe to deinitialize the `handler` at this point. This is called no mater the reason for the closure (on shutdown, if the client closed the connection, if your code close the connection, ...)
+
+The socket may or may not still be alive.
+
+### clientClose
+If your handler define `clientClose(handler: *Handler, data: []const u8) !void` method, the function will be called whenever a `close` message is received from the client. 
+
+You almost certainly *do not* want to define this method and instead want to use `close()`. When not defined, websocket.zig follows the websocket specific and replies with its own matching close message.
+
+### clientPong
+If your handler define `clientPong(handler: *Handler) !void` method, the function will be called whenever a `pong` message is received from the client. When not defined, no action is taken.
+
+### clientPong
+If your handler define `clientPing(handler: *Handler, data: []const u8) !void` method, the function will be called whenever `ping` message is received from the client. When not defined, websocket.zig will write a corresponding `pong` reply.
 
 ## websocket.Conn
 The call to `init` includes a `*websocket.Conn`. It is expected that handlers will keep a reference to it. The main purpose of the `*Conn` is to write data via `conn.write([]const u8)` and `conn.writeBin([]const u8)`. The websocket protocol differentiates between a "text" and "binary" message, with the only difference that "text" must be valid UTF-8. This library does not enforce this. Which you use really depends on what your client expects. For browsers, text messages appear as strings, and binary messages appear as a Blob or ArrayBuffer (depending on how the client is configured).
 
-`conn.close()` can also be called to close the connection. Calling `conn.close()` **will** result in the handler's `close` callback being called.
+`conn.close()` can also be called to close the connection. Calling `conn.close()` **will** result in the handler's `close` callback being called. 
+
+You can also use `conn.closeWithCode(code: u16)` and `conn.closeWithReason(code: u16, reason: []const u8)`. Refer to [RFC6455](https://datatracker.ietf.org/doc/html/rfc6455#section-7.4.1) for valid codes. The `reason` must be <= 123 bytes.
 
 ### Writer
 It's possible to get a `std.io.Writer` from a `*Conn`. Because websocket messages are framed, the writter will buffer the message in memory and requires an explicit "flush". Buffering will use the global buffer pool (described in the Config section), but can still result in dynamic allocations if the pool is empty or the message being written is larger than the configured max size.
@@ -116,52 +159,115 @@ try std.fmt.format(wb.writer(), "it's over {d}!!!", .{9000});
 try wb.flush();
 ```
 
-### Pings, Pongs and Close
-By default, the library answers incoming `ping` messages with a corresponging `pong`. Similarly, when a `close` message is received, a `close` reply is sent (as per the spec).
-
-When configured with `handle_ping` and/or `handle_pong` and/or `handle_close`, the messages are passed to the `handle` method and no automatic handling is done. 
-
-This is an advanced feature. 
-
-```zig
-pub fn handle(self: Handler, message: Message) !void {
-    switch (message.type) {
-        .binary, .text => try self.conn.write(message.data),
-        .ping => try self.conn.writeFrame(websocket.OpCode.pong, message.data),
-        .pong => {}, 
-        .close => try self.conn.writeFrame(websocket.OpCode.close, [_]u8{3, 232});
-    }
-}
-
-```
+## Thread Safety
+Websocket.zig ensures that only 1 message per connection/handler is processed at a time. Therefore, you will never have concurrent calls to `clientMessage`, `clientPing`, `clientPong` or `clientClose`. Conversely, concurrent calls to methods of `*websocket.Conn` are allowed (i.e. `conn.write` and `conn.close`). 
 
 ## Config
-The 4th parameter to `websocket.listen` is a configuration object. 
+The 2nd parameter to `Server(H).init` is a configuration object. 
 
-* `port` - Port to listen to. Default: `9223`.
-* `max_size` - Maximum incoming message size to allow. The server will dynamically allocate up to this much space per request. Default: `65536`.
-* `buffer_size` - Size of the static buffer that's available per connection for incoming messages. While there's other overhead, the minimal memory usage of the server will be `# of active connections * buffer_size`. Default: `4096`.
-* `address` - Address to bind to. Default: `"127.0.0.1"`.
-* `unix_path` - Unix socket path to listen on (must be an absolute path). Mutually exclusive with address+port. Defaults: null
-* `handshake_pool_count` - The number of buffers to create and keep for reading the initial handshake. Default: `50`
-* `handshake_max_size` - The maximum size of the initial handshake to allow. Default: `1024`.
-* `max_headers` - The maximum size of headers to store in `handshake.headers`. Requests with more headers will still be processed, but `handshake.headers` will only contain the first `max_headers` headers. Default: `0`.
-* `handshake_timeout_ms` - The time, in milliseconds, to wait for the handshake to complete. This essentially prevents a client from opening a connection and "hanging" the thread while it waits for data. If a client slowly sends a few bytes at a time, the actual timeout might happen up to 2x longer than specified. Generally speaking, it might be better to let a proxy (e.g. nginx) handle this. Default 10_000;
- `handle_ping` - Whether ping messages should be sent to the handler. When true, the libray will not automatically answer with a pong. Default: `false`.
-* `handle_pong` - Whether pong messages should be sent to the handler. 
-* `handle_close` - Whether close messages should be sent to the handler.  When true, the library will not automatically answer with a corresponding `close` However, the readLoop will exit and the connection will be closed.
-* `large_buffer_pool_count` - The number of "large" buffers to keep pooled. Default: `32`.
-* `large_buffer_size` - The size of each large buffer. Default: `32768`
+```zig
+pub const Config = struct {
+    port: u16 = 9882,
 
-Setting `max_size == buffer_size` is valid and will ensure that no dynamic memory allocation occurs once the connection is established.
+    // Ignored if unix_path is set
+    address: []const u8 = "127.0.0.1",
 
-The server allocates and keep around `handshake_pool_size * handshake_max_size` bytes at all times. If the handshake buffer pool is empty, new buffers of `handshake_max_size` are dynamically created.
+    // Not valid on windows
+    unix_path: ?[]const u8 = null,
 
-The handshake pool/buffer is separate from the main `buffer_size` to reduce the memory cost of invalid handshakes. Unless you're expecting a very large handshake request (a large URL, querystring or headers), the initial handshake is usually < 1KB. This data is also short-lived. Once the websocket is established however, you may want a larger buffer for handling incoming requests (and this buffer is generally much longer lived). By using a small pooled buffer for the initial handshake, invalid connections don't use up [as much] memory and thus the server may be more resilient to basic DOS attacks. Keep in mind that the websocket protocol requires a number of mandatory headers, so `handshake_max_size` can't be set to a super small value. Also keep in mind that the current pool implementation does not block when empty, but rather creates dynamic buffers of `handshake_max_size`.
+    // In nonblocking mode (Linux/Mac/BSD), sets the number of
+    // listening threads. Defaults to 1.
+    // In blocking mode, this is ignored and always set to 1.
+    worker_count: ?u8 = null,
+
+    // The maximum number of connections, per worker.
+    max_conn: usize = 16_384,
+
+    // The maximium allows message size. 
+    // A websocket message can have up to 14 bytes of overhead/header
+    max_message_size: usize = 65_536,
+
+    handshake: Config.Handshake = .{},
+    thread_pool: ThreadPool = .{},
+    buffers: Config.Buffers = .{},
+
+    // In blocking mode the thread pool isn't used 
+    pub const ThreadPool = struct {
+        // Number of threads to process messages.
+        // These threads are where your `clientXYZ` method will execute.
+        // Default: 4.
+        count: ?u16 = null,
+
+        // The maximum number of pending requests that the thread pool will accept
+        // This applies back pressure to worker and ensures that, under load
+        // pending requests get precedence over processing new requests.
+        // Default: 500.
+        backlog: ?u32 = null,
+
+        // Size of the static buffer to give each thread. Memory usage will be 
+        // `count * buffer_size`.
+        // If clientMessage isn't defined with an Allocator, this defaults to 0.
+        // Else it default to 32768
+        buffer_size: ?usize = null,
+    };
+
+    const Handshake = struct {
+        // time, in seconds, to timeout the initial handshake request
+        timeout: u32 = 10,
+
+        // Max size, in bytes, allowed for the initial handshake request.
+        // If you're expected a large handshake (many headers, large cookies, etc)
+        // you'll need to set this larger.
+        // Default: 1024
+        max_size: ?u16 = null,
+
+        // Max number of headers to capture. These become available as
+        // handshake.headers.get(...).
+        // Default: 0
+        max_headers: ?u16 = null,
+
+        // Count of handshake objects to keep in a pool. More are created
+        // as needed.
+        // Default: 32
+        count: ?u16 = null,
+    };
+
+    const Buffers = struct {
+        // The number of "small" buffers to keep pooled.
+        //
+        // When `null`, the small buffer pool is disabled and each connection
+        // gets its own dedicated small buffer (of `size`). This is reasonable
+        // when you expect most clients to be sending a steady stream of data.
+        
+        // When set > 0, a pool is created (of `size` buffers) and buffers are 
+        // assigned as messages are received. This is reasonable when you expect
+        // sporadic and messages from clients.
+        //
+        // Default: `null`
+        pool: ?usize = null,
+
+        // The size of each "small" buffer. Depending on the value of `pool`
+        // this is either a per-connection buffer, or the size of pool buffers
+        // shared between all connections
+        // Default: 2048
+        size: ?usize = null,
+
+        // The number of large buffers to have in the pool.
+        // Messages larger than `buffers.size` but smaller than `max_message_size`
+        // will attempt to use a large buffer from the pool.
+        // If the pool is empty, a dynamic buffer is created.
+        // Default: 8
+        large_count: ?u16 = null,
+
+        // The size of each large buffer.
+        // Default: smallest of  `2 * buffers.size` or `max_message_size`
+        large_size: ?usize = null,
+    };
+}
+```
+The handshake pool/buffer is separate from the main `buffer` to reduce the memory cost of invalid handshakes. Unless you're expecting a very large handshake request (a large URL, querystring or headers), the initial handshake is usually < 1KB. This data is also short-lived. Once the websocket is established however, you may want a larger buffer for handling incoming requests (and this buffer is generally much longer lived). By using a small pooled buffer for the initial handshake, invalid connections don't use up [as much] memory and thus the server may be more resilient to basic DOS attacks. Keep in mind that the websocket protocol requires a number of mandatory headers, so `handshake_max_size` can't be set to a super small value. Also keep in mind that the current pool implementation does not block when empty, but rather creates dynamic buffers of `handshake_max_size`.
 
 Websockets have their own fragmentation "feature" (not the same as TCP fragmentation) which this library could handle more efficiently. However, I'm not aware of any client (e.g. browsers) which use this feature at all.
-
-The server also allocates around `large_buffer_pool_count * large_buffer_size` bytes at all time. The pool is shared by all connections and can be used for messages that exceed `buffer_size`. The large buffer pool allows the application to use a reasonable per-connection `buffer_size`, while having an efficient fallback for the occasional large message. If `max_size` is greater than `large_buffer_size` or if all pooled buffers are currently in-use, a buffer of the needed size is dynamically allocated.
 
 ## Advanced
 
@@ -183,6 +289,27 @@ pub fn handle(self: *Handler, message: Message) !void {
     }
 }
 ```
+
+### Blocking Mode
+kqueue (BSD, MacOS) or epoll (Linux) are used on supported platforms. On all other platforms (most notably Windows), a more naive thread-per-connection with blocking sockets is used.
+
+The comptime-safe, `websocket.blockingMode() bool` function can be called to determine which mode websocket is running in (when it returns `true`, then you're running the simpler blocking mode).
+
+It is possible to force blocking mode by adding the <code>websocket_blocking = true</code> build option in your build.zig (it is **not** possible to force non blocking mode)
+
+```zig
+var websocket_module =  b.dependency("websocket", dep_opts);
+const options = b.addOptions();
+options.addOption(bool, "websocket_blocking", true);
+websocket_module.addOptions("build", options);
+```
+
+### Per-Connection Buffers
+In non-blocking mode, the `buffers.pool` and `buffers.size` should be set for your particular use case. When `buffers.pool == null`, each connection gets its own buffer of `buffers.size` bytes. This is a good option if you expect most of your clients to be sending a steady stream of data. While it might take more memory (# of connections * buffers.size), its faster and minimizes multi-threading overhead.
+
+However, if you expect clients to only send messages sporadically, such as a chat application, enabling the pool can reduce memory usage at the cost of a bit of overhead.
+
+In blocking mode, these settings are ignored and each connection always gets its own buffer (though there is still a shared large buffer pool).
 
 ## Testing
 The library comes with some helpers for testing:

@@ -448,7 +448,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
             var thread_pool = try ThreadPool.init(allocator, .{
                 .count = config.thread_pool.count orelse 4,
                 .backlog = config.thread_pool.backlog orelse 500,
-                .buffer_size = config.thread_pool.buffer_size orelse 32_768,
+                .buffer_size = config.thread_pool.buffer_size orelse if (needsAllocator(H)) 32_768 else 0,
             });
             errdefer thread_pool.deinit();
 
@@ -1466,7 +1466,7 @@ fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator
         switch (message_type) {
             .text, .binary => {
                 const params = @typeInfo(@TypeOf(H.clientMessage)).Fn.params;
-                const needs_allocator = comptime params[1].type == Allocator;
+                const needs_allocator = comptime needsAllocator(H);
 
                 var arena: std.heap.ArenaAllocator = undefined;
                 var fallback_allocator: FallbackAllocator = undefined;
@@ -1566,6 +1566,11 @@ fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator
             return true;
         }
     }
+}
+
+fn needsAllocator(comptime H: type) bool {
+    const params = @typeInfo(@TypeOf(H.clientMessage)).Fn.params;
+    return comptime params[1].type == Allocator;
 }
 
 fn respondToHandshakeError(conn: *Conn, err: anyerror) void {
