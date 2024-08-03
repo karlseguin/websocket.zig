@@ -10,12 +10,12 @@ pub fn build(b: *std.Build) !void {
 
 	{
 		const options = b.addOptions();
-		options.addOption(bool, "force_blocking", false);
-		websocket_module.addOptions("ws_build", options);
+		options.addOption(bool, "websocket_blocking", false);
+		websocket_module.addOptions("build", options);
 	}
 
-  {
-		// run tests in nonblocking mode (only meaningful where epoll/kqueue is supported)
+	{
+		// run tests
 		const tests = b.addTest(.{
 			.root_source_file = b.path("src/websocket.zig"),
 			.target = target,
@@ -23,33 +23,15 @@ pub fn build(b: *std.Build) !void {
 			.test_runner = b.path("test_runner.zig"),
 		});
 		tests.linkLibC();
+		const force_blocking = b.option(bool, "force_blocking", "Force blocking mode") orelse false;
 		const options = b.addOptions();
-		options.addOption(bool, "force_blocking", false);
+		options.addOption(bool, "websocket_blocking", force_blocking);
 		tests.root_module.addOptions("build", options);
+
 		const run_test = b.addRunArtifact(tests);
 		run_test.has_side_effects = true;
 
 		const test_step = b.step("test", "Run tests");
-		test_step.dependOn(&run_test.step);
-	}
-
-	{
-		// run tests in blocking mode
-		const tests = b.addTest(.{
-			.root_source_file = b.path("src/websocket.zig"),
-			.target = target,
-			.optimize = optimize,
-			.test_runner = b.path("test_runner.zig"),
-		});
-		tests.linkLibC();
-		const options = b.addOptions();
-		options.addOption(bool, "force_blocking", true);
-		tests.root_module.addOptions("build", options);
-
-		const run_test = b.addRunArtifact(tests);
-		run_test.has_side_effects = true;
-
-		const test_step = b.step("test_blocking", "Run tests");
 		test_step.dependOn(&run_test.step);
 	}
 }

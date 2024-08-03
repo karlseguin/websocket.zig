@@ -20,7 +20,7 @@ pub fn main() !void {
 	const allocator = gpa.allocator();
 	defer _ = gpa.detectLeaks();
 
-	try std.posix.sigaction(std.posix.SIG.TERM, &.{
+	std.posix.sigaction(std.posix.SIG.TERM, &.{
 		.handler = .{.handler = shutdown},
 		.mask = std.posix.empty_sigset,
 		.flags = 0,

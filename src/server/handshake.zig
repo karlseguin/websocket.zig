@@ -56,7 +56,7 @@ pub const Handshake = struct {
 				},
 				10 => if (eql("connection", name)) {
 					// find if connection header has upgrade in it, example header:
-					//		Connection: keep-alive, Upgrade
+					// Connection: keep-alive, Upgrade
 					if (std.ascii.indexOfIgnoreCase(value, "upgrade") == null) {
 						return error.InvalidConnection;
 					}
