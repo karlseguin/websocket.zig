@@ -17,7 +17,9 @@ const Message = proto.Message;
 pub const Handshake = @import("handshake.zig").Handshake;
 const FallbackAllocator = @import("fallback_allocator.zig").FallbackAllocator;
 
+const DEFAULT_MAX_CONN = 16_384;
 const DEFAULT_BUFFER_SIZE = 2048;
+const DEFAULT_MAX_MESSAGE_SIZE = 65_536;
 
 const EMPTY_PONG = ([2]u8{ @intFromEnum(OpCode.pong), 0 })[0..];
 // CLOSE, 2 length, code
@@ -49,8 +51,8 @@ pub const Config = struct {
 
     worker_count: ?u8 = null,
 
-    max_conn: usize = 16_384,
-    max_message_size: usize = 65_536,
+    max_conn: ?usize = null,
+    max_message_size: ?usize = null,
 
     handshake: Config.Handshake = .{},
     thread_pool: ThreadPool = .{},
@@ -70,10 +72,10 @@ pub const Config = struct {
     };
 
     const Buffers = struct {
-        size: ?usize = null,
-        pool: ?usize = null,
+        small_size: ?usize = null,
+        small_pool: ?usize = null,
         large_size: ?usize = null,
-        large_count: ?u16 = null,
+        large_pool: ?u16 = null,
     };
 
     fn workerCount(self: *const Config) usize {
@@ -98,7 +100,7 @@ pub fn Server(comptime H: type) type {
 
         pub fn init(allocator: Allocator, config: Config) !Self {
             if (blockingMode()) {
-                if (config.buffers.pool) |p| {
+                if (config.buffers.small_pool) |p| {
                     if (p > 1) {
                         log.warn("blockingMode() cannot utilize a small buffer pool, using per-connection buffer instead", .{});
                     }
@@ -307,7 +309,7 @@ pub fn Blocking(comptime H: type) type {
                 .handshake_pool = state.handshake_pool,
                 .buffer_provider = &state.buffer_provider,
                 .handshake_timeout = Timeout.init(config.handshake.timeout),
-                .connection_buffer_size = config.buffers.size orelse DEFAULT_BUFFER_SIZE,
+                .connection_buffer_size = config.buffers.small_size orelse DEFAULT_BUFFER_SIZE,
             };
         }
 
@@ -426,6 +428,8 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
     return struct {
         ctx: C,
 
+        max_conn: usize,
+
         // KQueue or Epoll, depending on the platform
         loop: Loop,
         thread_pool: *ThreadPool,
@@ -459,6 +463,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
                 .thread_pool = thread_pool,
                 .handshake_pool = state.handshake_pool,
                 .handshake_timeout = state.config.handshake.timeout,
+                .max_conn = config.max_conn orelse DEFAULT_MAX_CONN,
             };
         }
 
@@ -568,7 +573,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
         }
 
         fn accept(self: *Self, listener: posix.fd_t, now: u32) !void {
-            const max_conn = self.base.max_conn;
+            const max_conn = self.max_conn;
             const conn_manager = &self.base.conn_manager;
 
             while (conn_manager.count() < max_conn) {
@@ -671,7 +676,6 @@ fn NonBlockingBase(comptime H: type, comptime MANAGE_HS: bool) type {
         small_buffer_pool: ?buffer.Pool,
         connection_buffer_size: usize,
 
-        max_conn: usize,
         conn_manager: ConnManager(H, MANAGE_HS),
 
         const Self = @This();
@@ -682,9 +686,9 @@ fn NonBlockingBase(comptime H: type, comptime MANAGE_HS: bool) type {
             var conn_manager = try ConnManager(H, MANAGE_HS).init(allocator);
             errdefer conn_manager.deinit();
 
-            const connection_buffer_size = config.buffers.size orelse DEFAULT_BUFFER_SIZE;
+            const connection_buffer_size = config.buffers.small_size orelse DEFAULT_BUFFER_SIZE;
             var small_buffer_pool: ?buffer.Pool = null;
-            if (config.buffers.pool) |pool_count| {
+            if (config.buffers.small_pool) |pool_count| {
                 small_buffer_pool = try buffer.Pool.init(allocator, pool_count, connection_buffer_size);
             }
 
@@ -694,7 +698,6 @@ fn NonBlockingBase(comptime H: type, comptime MANAGE_HS: bool) type {
 
             return .{
                 .allocator = allocator,
-                .max_conn = config.max_conn,
                 .conn_manager = conn_manager,
                 .small_buffer_pool = small_buffer_pool,
                 .buffer_provider = &state.buffer_provider,
@@ -997,14 +1000,14 @@ pub const WorkerState = struct {
         var handshake_pool = try Handshake.Pool.init(allocator, handshake_pool_count, handshake_max_size, handshake_max_headers);
         errdefer handshake_pool.deinit();
 
-        const max_message_size = config.max_message_size;
-        const large_buffer_count = config.buffers.large_count orelse 8;
-        const large_buffer_size = config.buffers.large_size orelse @min((config.buffers.size orelse DEFAULT_BUFFER_SIZE) * 2, max_message_size);
+        const max_message_size = config.max_message_size orelse DEFAULT_MAX_MESSAGE_SIZE;
+        const large_buffer_pool = config.buffers.large_pool orelse 8;
+        const large_buffer_size = config.buffers.large_size orelse @min((config.buffers.small_size orelse DEFAULT_BUFFER_SIZE) * 2, max_message_size);
 
         var buffer_provider = try buffer.Provider.init(allocator, .{
             .max = max_message_size,
             .size = large_buffer_size,
-            .count = large_buffer_count,
+            .count = large_buffer_pool,
         });
         errdefer buffer_provider.deinit();
 
@@ -1449,7 +1452,9 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
     try conn.writeFramed(&Handshake.createReply(handshake.key));
 
     if (comptime std.meta.hasFn(H, "afterInit")) {
-        handler.afterInit(ctx) catch |err| {
+        const params = @typeInfo(@TypeOf(H.afterInit)).Fn.params;
+        const res = if (params.len == 1) handler.afterInit() else handler.afterInit(ctx);
+        res catch |err| {
             log.debug("({}) " ++ @typeName(H) ++ ".afterInit error: {}", .{ conn.address, err });
             return false;
         };

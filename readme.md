@@ -192,11 +192,13 @@ pub const Config = struct {
     worker_count: ?u8 = null,
 
     // The maximum number of connections, per worker.
-    max_conn: usize = 16_384,
+    // default: 16_384
+    max_conn: ?usize = null,
 
     // The maximium allows message size. 
     // A websocket message can have up to 14 bytes of overhead/header
-    max_message_size: usize = 65_536,
+    // Default: 65_536
+    max_message_size: ?usize = null,
 
     handshake: Config.Handshake = .{},
     thread_pool: ThreadPool = .{},
@@ -255,23 +257,23 @@ pub const Config = struct {
         // sporadic and messages from clients.
         //
         // Default: `null`
-        pool: ?usize = null,
+        small_pool: ?usize = null,
 
         // The size of each "small" buffer. Depending on the value of `pool`
         // this is either a per-connection buffer, or the size of pool buffers
         // shared between all connections
         // Default: 2048
-        size: ?usize = null,
+        small_size: ?usize = null,
 
         // The number of large buffers to have in the pool.
-        // Messages larger than `buffers.size` but smaller than `max_message_size`
+        // Messages larger than `buffers.small_size` but smaller than `max_message_size`
         // will attempt to use a large buffer from the pool.
         // If the pool is empty, a dynamic buffer is created.
         // Default: 8
-        large_count: ?u16 = null,
+        large_pool: ?u16 = null,
 
         // The size of each large buffer.
-        // Default: smallest of  `2 * buffers.size` or `max_message_size`
+        // Default: min(2 * buffers.small_size, max_message_size)
         large_size: ?usize = null,
     };
 }
@@ -302,17 +304,8 @@ kqueue (BSD, MacOS) or epoll (Linux) are used on supported platforms. On all oth
 
 The comptime-safe, `websocket.blockingMode() bool` function can be called to determine which mode websocket is running in (when it returns `true`, then you're running the simpler blocking mode).
 
-It is possible to force blocking mode by adding the <code>websocket_blocking = true</code> build option in your build.zig (it is **not** possible to force non blocking mode)
-
-```zig
-var websocket_module =  b.dependency("websocket", dep_opts);
-const options = b.addOptions();
-options.addOption(bool, "websocket_blocking", true);
-websocket_module.addOptions("build", options);
-```
-
 ### Per-Connection Buffers
-In non-blocking mode, the `buffers.pool` and `buffers.size` should be set for your particular use case. When `buffers.pool == null`, each connection gets its own buffer of `buffers.size` bytes. This is a good option if you expect most of your clients to be sending a steady stream of data. While it might take more memory (# of connections * buffers.size), its faster and minimizes multi-threading overhead.
+In non-blocking mode, the `buffers.small_pool` and `buffers.small_size` should be set for your particular use case. When `buffers.small_pool == null`, each connection gets its own buffer of `buffers.small_size` bytes. This is a good option if you expect most of your clients to be sending a steady stream of data. While it might take more memory (# of connections * buffers.small_size), its faster and minimizes multi-threading overhead.
 
 However, if you expect clients to only send messages sporadically, such as a chat application, enabling the pool can reduce memory usage at the cost of a bit of overhead.
 
@@ -347,191 +340,4 @@ For testing websockets, you usually care about two things: emulating incoming me
 The `wtt.textMessage` generates a message that you can pass into your handle's `handle` function.
 
 # Client
-The websocket client implementation is currently a work in progress. Feedback on the API is welcome.
-
-## Example
-```zig
-const std = @import("std");
-const websocket = @import("websocket");
-
-const Handler = struct {
-    client: websocket.Client,
-
-    pub fn init(allocator: std.mem.Allocator, host: []const u8, port: u16) !Handler {
-        return .{
-            .client = try websocket.connect(allocator, host, port, .{}),
-        };
-    }
-
-    pub fn deinit(self: *Handler) void {
-        self.client.deinit();
-    }
-
-    pub fn connect(self: *Handler, path: []const u8) !void {
-        try self.client.handshake(path, .{
-            .timeout_ms = 5000,
-            .headers = "Host: 127.0.0.1:9223",
-        });
-        const thread = try self.client.readLoopInNewThread(self);
-        thread.detach();
-    }
-
-    pub fn handle(_: Handler, message: websocket.Message) !void {
-        const data = message.data;
-        std.debug.print("CLIENT GOT: {any}\n", .{data});
-    }
-
-    pub fn write(self: *Handler, data: []u8) !void {
-        return self.client.write(data);
-    }
-
-    pub fn close(_: Handler) void {}
-};
-
-pub fn main() !void {
-    var general_purpose_allocator = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = general_purpose_allocator.allocator();
-
-    var handler = try Handler.init(allocator, "127.0.0.1", 9223);
-    defer handler.deinit();
-
-    // spins up a thread to listen to new messages
-    try handler.connect("/");
-
-    var data = try allocator.dupe(u8, "hello world");
-    try handler.write(data);
-
-    // without this, we'll exit immediately without having time to receive a
-    // message from the server
-    std.time.sleep(std.time.ns_per_s);
-}
-```
-
-The above is an example of how you might want to use `websocket.Client`. The link between the library's `websocket.Client` and your application's `Handler` is very thin. Your handler will hold the client in order to write to the server and close the connection. But it is only the call to `client.readLoopInNewThread(HANDLER)` or `client.readLoop(HANDLER)` which connects the client to your handler.
-
-The above example could be rewritten to more cleanly separate the application's Handler and the library's Client:
-
-```zig
-var client = try websocket.connect(allocator, "localhost", 9001, .{});
-defer client.deinit();
-
-const path = "/";
-try client.handshake(path, .{
-    .timeout_ms = 5000
-    .headers = "Host: localhost:9001",
-});
-
-const handler = Handler{.client = &client};
-const thread = try client.readLoopInNewThread(handler);
-thread.detach();
-
-...
-const Handler = struct {
-    client: *websocket.Client,
-
-    pub fn handle(self: Handler, message: websocket.Message) !void {
-        const data = message.data;
-        try self.client.write(data); // echo the message back
-    }
-
-    pub fn close(_: Handler) void {
-    }
-};
-```
-
-### Client
-The main methods of `*websocket.Client` are:
-
-* `writeBin([]u8)` - To write binary data
-* `writeText([]u8)` - To write text data
-* `write([]u8)` - Alias to `writeText`
-* `close()` - Sends a close message and closes the connection
-
-As you can see, these methods take a `[]u8`, not a `[]const u8` as they **will** mutate the data (websocket payloads are always masked). If you don't want the data mutated, pass a dupe. (By not just automatically duping the data, the library allows the application to decide if whether the data can be mutated or not, and thus whether to pay the dupe performance cost or not).
-
-More advanced methods are:
-* `closeWithCode(u16)` - Sends a close message with the specified code and closes the connection
-* `writePing([]u8)` - Writes a ping frame
-* `writePong([]u8)` - Writes a pong frame
-* `writeFrame(websocket.OpCode, []u8) - Writes an arbitrary frame`. `OpCode` is an enum with possible values of: `text`, `binary`, `close`, `ping`, `pong`
-
-### Pings, Pongs and Close
-By default, the client answers incoming `ping` messages with a corresponging `pong`. By default, when the client receives a `close` message, it calls `client.close() which replies with a `close` frame and closes the underlying socket.
-
-When configured with `handle_ping` and/or `handle_pong` and/or `handle_close`, the messages are passed to the `handle` method and no automatic handling is done. 
-
-This is an advanced feature. Handlers are strongly encourages to call `client.writePong` in response to a `ping` and to call `client.close` in response to a `close`.
-
-```zig
-pub fn handle(self: Handler, message: websocket.Message) !void {
-    switch (message.type) {
-        .binary, text => try self.client.write(message.data); // echo the message back
-        .ping => try self.client.writePong(@constCast(message.data)), // @constCast is safe
-        .pong => {}, // noop
-        .close => client.close(),
-    }
-}
-```
-
-## Config
-The 3rd parameter to `connect` is a configuration object. 
-
-* `max_size` - Maximum incoming message size to allow. The library will dynamically allocate up to this much space per request. Default: `65536`.
-* `buffer_size` - Size of the static buffer that's available for the client to process incoming messages. While there's other overhead, the minimal memory usage of the server will be `# of active clients * buffer_size`. Default: `4096`.
-* `tls` - Whether or not to connect over TLS. Only TLS 1.3 is supported. Default: `false`.
-* `ca_bundle` - Provide a custom `std.crypto.Certificate.Bundle`. Only meaningful when `tls = true`. Default: `null`.
-* `handle_ping` - Whether ping messages should be sent to the handler. When true, the client will not automatically answer with a pong. Default: `false`.
-* `handle_pong` - Whether pong messages should be sent to the handler. 
-* `handle_close` - Whether close messages should be sent to the handler.  When true, the client will not automatically answer with a corresponding `close` and will not close the underlying socket. However, the readLoop will still exists. If `true`, handlers are strongly encouraged to call `client.close()` when receiving a close message.
-
-Setting `max_size == buffer_size` is valid and will ensure that no dynamic memory allocation occurs once the connection is established.
-
-Zig only supports TLS 1.3, so this library can only connect to hosts using TLS 1.3. If no `ca_bundle` is provided, the library will create a default bundle per connection.
-
-### Performance Optimization 1 - CA Bundle
-For a high number of connections, it might be beneficial to manage our own CA bundle:
-
-```zig
-// some global data
-var ca_bundle = std.crypto.Certificate.Bundle{}
-try ca_bundle.rescan(allocator);
-defer ca_bundle.deinit(allocator);
-```
-
-And then assign this `ca_bundle` into the the configuration's `ca_bundle` field. This way the library does not have to create and scan the installed CA certificates for each client connection.
-
-### Performance Optimization 2 - Buffer Provider
-For a high nummber of connections, or code that is especially sensitive to memory allocations, a large buffer pool can be created and provided to each client:
-
-```zig
-// Create a buffer pool of 10 buffers, each being 32K
-const buffer_provider = try websocket.bufferProvider(allocator, 10, 32768);
-defer buffer_provider.deinit();
-
-
-// create your client(s) using the above created buffer_provider
-var client = try websocket.connect(allocator, "localhost", 9001, .{
-    ...
-    .buffer_provider = buffer_provider,
-});
-```
-
-This allows each client to have a reasonable `buffer_size` that can accomodate most messages, while having an efficient fallback for the occasional large message. When `max_size` is greater than the large buffer pool size (32K in the above example) or when all pooled buffers are used, a dynamic buffer is created.
- 
-## Handshake
-The handshake sends the initial HTTP-like request to the server. A `timeout` in milliseconds can be specified. You can pass arbitrary headers to the backend via the `headers` option. However, the full handshake request must fit within the configured `buffer_size`. By default, the request size is about 150 bytes (plus the length of the URL).
-
-## Handler and Read Loop
-A websocket client typically listens for messages from the server, within a blocking loop. The `readLoop` function begins such a loop and will block until the connection is closed (either by the server, or by calling `close`). As an alternative, `readLoopInNewThread` can be called which will start the `readLoop` in a new thread and return a `std.thread.Thread`. Typically one would call `detach` on this thread. Both `readLoop` and `readLoopInNewThread` take an arbitrary handler which will be called with any received messages. This handler must implement the `handle` and `close` methods as shown in the above example.
-
-`close` will always be called when the read loop exits.
-
-It is safe to call `client.write`, `client.writeBin` and `client.close` from a thread other than the read loop thread.
-
-# Autobahn
-Every mandatory [Autobahn Testsuite](https://github.com/crossbario/autobahn-testsuite) case is passing. (Three fragmented UTF-8 are flagged as non-strict and as compression is not implemented, these are all flagged as "Unimplemented").
-
-You can see `support/autobahn/server/main.zig` and `support/autobahn/client/main.zig` for the handler that's used for the autobahn tests.
-
-## http.zig
-I'm also working on an HTTP 1.1 server for zig: [https://github.com/karlseguin/http.zig](https://github.com/karlseguin/http.zig).
+Changes to the client API are still in flux. Please continue using the `master` branch for client websocket code.
