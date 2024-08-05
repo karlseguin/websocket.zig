@@ -60,14 +60,6 @@ pub const Writer = struct {
         return self.frame(fin, 1, payload, 0);
     }
 
-    pub fn binaryFrame(self: *Writer, fin: bool, payload: []const u8) void {
-        return self.frame(fin, 2, payload, 0);
-    }
-
-    pub fn textFrameReserved(self: *Writer, fin: bool, payload: []const u8, reserved: u8) void {
-        return self.frame(fin, 1, payload, reserved);
-    }
-
     pub fn cont(self: *Writer, fin: bool, payload: []const u8) void {
         return self.frame(fin, 0, payload, 0);
     }
@@ -197,33 +189,6 @@ pub const SocketPair = struct {
         self.client.close();
     }
 
-    pub fn handshakeRequest(self: SocketPair) void {
-        self.client.writeAll("GET / HTTP/1.1\r\n" ++
-            "Connection: upgrade\r\n" ++
-            "Upgrade: websocket\r\n" ++
-            "Sec-websocket-version: 13\r\n" ++
-            "Sec-websocket-key: leto\r\n\r\n") catch unreachable;
-    }
-
-    pub fn handshakeReply(self: SocketPair) !void {
-        var pos: usize = 0;
-        var buf: [1024]u8 = undefined;
-        while (true) {
-            const n = try self.client.read(buf[pos..]);
-            if (n == 0) {
-                return error.Closed;
-            }
-            pos += n;
-            if (std.mem.endsWith(u8, buf[0..pos], "\r\n\r\n")) {
-                return;
-            }
-        }
-    }
-
-    pub fn ping(self: *SocketPair) void {
-        self.writer.pint();
-    }
-
     pub fn pingPayload(self: *SocketPair, payload: []const u8) void {
         self.writer.pingPayload(payload);
     }
@@ -232,99 +197,12 @@ pub const SocketPair = struct {
         self.writer.textFrame(fin, payload);
     }
 
-    pub fn binaryFrame(self: *SocketPair, fin: bool, payload: []const u8) void {
-        self.writer.binaryFrame(fin, payload);
-    }
-
-    pub fn textFrameReserved(self: *SocketPair, fin: bool, payload: []const u8, reserved: u8) void {
-        self.writer.textFrameReserved(fin, payload, reserved);
-    }
-
     pub fn cont(self: *SocketPair, fin: bool, payload: []const u8) void {
         self.writer.cont(fin, payload);
-    }
-
-    pub fn frame(self: *SocketPair, fin: bool, op_code: u8, payload: []const u8, reserved: u8) void {
-        self.writer.frame(fin, op_code, payload, reserved);
     }
 
     pub fn sendBuf(self: *SocketPair) void {
         self.client.writeAll(self.writer.bytes()) catch unreachable;
         self.writer.clear();
-    }
-
-    pub fn asReceived(self: SocketPair) Received {
-        var buf: [1024]u8 = undefined;
-        var all = std.ArrayList(u8).init(allocator);
-        errdefer all.deinit();
-
-        while (true) {
-            const n = self.client.read(&buf) catch 0;
-            if (n == 0) {
-                return Received.init(all);
-            }
-            all.appendSlice(buf[0..n]) catch unreachable;
-        }
-    }
-};
-
-pub const Received = struct {
-    raw: std.ArrayList(u8),
-    messages: []proto.Message,
-
-    fn init(raw: std.ArrayList(u8)) Received {
-        var pos: usize = 0;
-        const buf = raw.items;
-
-        var messages = std.ArrayList(Message).init(allocator);
-        defer messages.deinit();
-
-        while (pos < buf.len) {
-            const message_type = switch (buf[pos] & 15) {
-                1 => Message.Type.text,
-                2 => Message.Type.binary,
-                8 => Message.Type.close,
-                10 => Message.Type.pong,
-                else => unreachable,
-            };
-            pos += 1;
-
-            // Let's figure out if this message is all within this single frame
-            // or if it's split between this frame and the next.
-            // If it is split, then this frame will contain OP + LENGTH_PREFIX + LENGTH
-            // and the next one will be the full payload (and nothing else)
-            const length_of_length: u8 = switch (buf[pos] & 127) {
-                126 => 2,
-                127 => 8,
-                else => 0,
-            };
-
-            const payload_length = switch (length_of_length) {
-                2 => @as(u16, @intCast(buf[pos + 2])) | (@as(u16, @intCast(buf[pos + 1])) << 8),
-                8 => @as(u64, @intCast(buf[pos + 8])) | @as(u64, @intCast(buf[pos + 7])) << 8 | @as(u64, @intCast(buf[pos + 6])) << 16 | @as(u64, @intCast(buf[pos + 5])) << 24 | @as(u64, @intCast(buf[pos + 4])) << 32 | @as(u64, @intCast(buf[pos + 3])) << 40 | @as(u64, @intCast(buf[pos + 2])) << 48 | @as(u64, @intCast(buf[pos + 1])) << 56,
-                else => buf[pos],
-            };
-            pos += 1 + length_of_length;
-            const end = pos + payload_length;
-
-            messages.append(.{
-                .data = buf[pos..end],
-                .type = message_type,
-            }) catch unreachable;
-
-            pos = end;
-        }
-
-        const owned = allocator.alloc(Message, messages.items.len) catch unreachable;
-        for (messages.items, 0..) |message, i| {
-            owned[i] = message;
-        }
-
-        return .{ .raw = raw, .messages = owned };
-    }
-
-    pub fn deinit(self: Received) void {
-        self.raw.deinit();
-        allocator.free(self.messages);
     }
 };

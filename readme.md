@@ -3,38 +3,31 @@ This project follows Zig master. See available branches if you're targetting a s
 
 # Server
 ```zig
+const std = @import("std");
 const ws = @import("websocket");
-
-// Define a struct for "global" data passed into your websocket handler
-// This is whatever you want. You pass it to `listen` and the library will
-// pass it back to your handler's `init`. For simple cases, this could be empty
-const Context = struct {
-
-};
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
-    // Arbitrary (application-specific) data to pass into each handler
-    // Could be Void ({}) if you don't have any data to pass
-
-    var app = App{
-        //.db =  a pool of db connections, for example
-    };
-
-    var server = try websocket.Server(Handler).init(allocator, .{
+    var server = try ws.Server(Handler).init(allocator, .{
         .port = 9224,
         .address = "127.0.0.1",
         .handshake = .{
             .timeout = 3,
             .max_size = 1024,
-            .max_headers = 10,
+            // since we aren't using hanshake.headers
+            // we can set this to 0 to save a few bytes.
+            .max_headers = 0,
         },
     });
 
+    // Arbitrary (application-specific) data to pass into each handler
+    // Pass void ({}) into listen if you have none
+    var app = App{};
+
     // this blocks
-    server.listen();
+    try server.listen(&app);
 }
 
 // This is your application-specific wrapper around a websocket connection
@@ -57,11 +50,18 @@ const Handler = struct {
     }
 
     // You must defined a public clientMessage method
-    pub fn clientMessage(self: *Handler, data: []u8) !void {
-        const data = message.data;
+    pub fn clientMessage(self: *Handler, data: []const u8) !void {
         try self.conn.write(data); // echo the message back
     }
 };
+
+// This is application-specific you want passed into your Handler's
+// init function.
+const App = struct {
+  // maybe a db pool
+  // maybe a list of rooms
+};
+
 ```
 
 ## Handler
@@ -279,6 +279,17 @@ pub const Config = struct {
 }
 ```
 
+## Logging
+websocket.zig uses Zig's built-in scope logging. You can control the log level by having an `std_options` decleration in your program's main file:
+
+```zig
+pub const std_options = .{
+    .log_scope_levels = &[_]std.log.ScopeLevel{
+        .{ .scope = .websocket, .level = .err },
+    }
+};
+```
+
 ## Advanced
 
 ### Pre-Framed Comptime Message
@@ -315,29 +326,32 @@ In blocking mode, these settings are ignored and each connection always gets its
 `server.stop()` can be called to stop the webserver. It is safe to call this from a different thread (i.e. a `sigaction` handler).
 
 ## Testing
-The library comes with some helpers for testing:
+The library comes with some helpers for testing.
 
 ```zig
-cosnt wt = @import("websocket").testing;
+const wt = @import("websocket").testing;
 
-test "handler invalid message" {
+test "handler: echo" {
     var wtt = wt.init();
     defer wtt.deinit();
 
-    var handler = MyAppHandler{
+    // create an instance of your handler (however you want)
+    // and use &tww.conn as the *ws.Conn field
+    var handler = Handler{
         .conn = &wtt.conn,
-    }
+    };
 
-    handler.handle(wtt.textMessage("hack"));
-    try wtt.expectText("invalid message");
+    // execute the methods of your handler
+    try handler.clientMessage("hello world");
+
+    // assert what the client should have received
+    try wtt.expectMessage(.text, "hello world");
 }
 ```
 
-For testing websockets, you usually care about two things: emulating incoming messages and asserting the messages sent to the client.
+Besides `expectMessage` you can also call `expectClose()`.
 
-`wtt.conn` is an instance of a `websocket.Conn` which is usually passed to your handler's `init` function. For testing purposes, you can inject it directly into your handler. The `wtt.expectText` asserts that the expected message was sent to the conn. 
-
-The `wtt.textMessage` generates a message that you can pass into your handle's `handle` function.
+Note that this testing is heavy-handed. It opens up a pair of sockets with one side listening on `127.0.0.1` and accepting a connection from the other. `wtt.conn` is the "server" side of the connection, and assertion happens on the client side.
 
 # Client
 Changes to the client API are still in flux. Please continue using the `master` branch for client websocket code.
