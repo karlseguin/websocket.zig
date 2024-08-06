@@ -1,5 +1,6 @@
 const std = @import("std");
 const lib = @import("lib.zig");
+const builtin = @import("builtin");
 
 const buffer = lib.buffer;
 const framing = lib.framing;
@@ -92,7 +93,7 @@ pub const Reader = struct {
 		//  - a single frame (control or otherwise) that forms a full message
 		//    (this last one is the most common case)
 		outer: while (true) {
-			var data_needed: u64 = 2; // always need at least the first two bytes to start figuring things out
+			var data_needed: usize = 2; // always need at least the first two bytes to start figuring things out
 			var phase = ParsePhase.pre;
 			var header_length: usize = 0;
 			var length_of_length: usize = 0;
@@ -153,7 +154,12 @@ pub const Reader = struct {
 							8 => @as(u64, @intCast(msg[9])) | @as(u64, @intCast(msg[8])) << 8 | @as(u64, @intCast(msg[7])) << 16 | @as(u64, @intCast(msg[6])) << 24 | @as(u64, @intCast(msg[5])) << 32 | @as(u64, @intCast(msg[4])) << 40 | @as(u64, @intCast(msg[3])) << 48 | @as(u64, @intCast(msg[2])) << 56,
 							else => msg[1] & 127,
 						};
-						data_needed += payload_length;
+						if (comptime builtin.target.ptrBitWidth() < 64) {
+							if (payload_length > std.math.maxInt(usize)) {
+								return error.TooLarge;
+							}
+						}
+						data_needed += @intCast(payload_length);
 						phase = ParsePhase.payload;
 					},
 					.payload => {
