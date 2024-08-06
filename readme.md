@@ -142,9 +142,9 @@ If your handler define `clientPing(handler: *Handler, data: []const u8) !void` m
 ## websocket.Conn
 The call to `init` includes a `*websocket.Conn`. It is expected that handlers will keep a reference to it. The main purpose of the `*Conn` is to write data via `conn.write([]const u8)` and `conn.writeBin([]const u8)`. The websocket protocol differentiates between a "text" and "binary" message, with the only difference that "text" must be valid UTF-8. This library does not enforce this. Which you use really depends on what your client expects. For browsers, text messages appear as strings, and binary messages appear as a Blob or ArrayBuffer (depending on how the client is configured).
 
-`conn.close()` can also be called to close the connection. Calling `conn.close()` **will** result in the handler's `close` callback being called. 
+`conn.close(.{})` can also be called to close the connection. Calling `conn.close()` **will** result in the handler's `close` callback being called. 
 
-You can also use `conn.closeWithCode(code: u16)` and `conn.closeWithReason(code: u16, reason: []const u8)`. Refer to [RFC6455](https://datatracker.ietf.org/doc/html/rfc6455#section-7.4.1) for valid codes. The `reason` must be <= 123 bytes.
+`close` takes an optional value where you can specify the `code` and/or `reason`: `conn.close(.{.code = 4000, .reason = "bye bye"})` Refer to [RFC6455](https://datatracker.ietf.org/doc/html/rfc6455#section-7.4.1) for valid codes. The `reason` must be <= 123 bytes.
 
 ### Writer
 It's possible to get a `std.io.Writer` from a `*Conn`. Because websocket messages are framed, the writter will buffer the message in memory and requires an explicit "flush". Buffering requires an allocator. 

@@ -401,7 +401,7 @@ pub fn Blocking(comptime H: type) type {
         }
 
         fn cleanupConn(self: *Self, hc: *HandlerConn(H)) void {
-            hc.conn.close();
+            hc.conn.closeSocket();
             self.conn_manager.cleanup(hc);
         }
 
@@ -561,7 +561,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 
                 // this connection has timed out. Don't use self.cleanup since there's
                 // a bunch of stuff we can assume here..like there's no handler or reader
-                conn.close();
+                conn.closeSocket();
                 log.debug("({}) handshake timeout", .{conn.address});
                 if (hc.handshake) |h| {
                     h.release();
@@ -633,7 +633,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
             var conn = &hc.conn;
             var closed: bool = undefined;
             if (success == false) {
-                conn.close();
+                conn.closeSocket();
                 closed = true;
             } else {
                 closed = conn.isClosed();
@@ -644,7 +644,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
             } else {
                 self.loop.monitorRead(hc, true) catch |err| {
                     log.debug("({}) failed to add read event monitor: {}", .{ conn.address, err });
-                    conn.close();
+                     conn.closeSocket();
                     self.base.cleanupConn(hc);
                 };
             }
@@ -1195,12 +1195,8 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
                 }
 
                 worker.shutdownCleanup(hc);
-
                 const conn = &hc.conn;
-                if (conn.isClosed() == false) {
-                    conn.writeClose();
-                    conn.close();
-                }
+                conn.closeSocket();
                 next_node = hc.next;
             }
         }
@@ -1220,12 +1216,6 @@ pub const Conn = struct {
         // the worker thread and we don't want that potentially blocked while
         // a write is going on.
         return @atomicLoad(bool, &self._closed, .monotonic);
-    }
-
-    pub fn close(self: *Conn) void {
-        if (@atomicRmw(bool, &self._closed, .Xchg, true, .monotonic) == false) {
-            posix.close(self.stream.handle);
-        }
     }
 
     pub fn writeBin(self: *Conn, data: []const u8) !void {
@@ -1248,31 +1238,39 @@ pub const Conn = struct {
         return self.writeFrame(.pong, data);
     }
 
-    pub fn writeClose(self: *Conn) void {
-        self.writeFramed(CLOSE_NORMAL) catch {};
-    }
+    const CloseOpts = struct {
+        code: u16 = 1000,
+        reason: []const u8 = "",
+    };
 
-    pub fn writeCloseWithCode(self: *Conn, code: u16) void {
-        var buf: [2]u8 = undefined;
-        std.mem.writeInt(u16, &buf, code, .big);
-        self.writeFrame(.close, &buf) catch {};
-    }
+    pub fn close(self: *Conn, opts: CloseOpts) !void {
+        if (self.isClosed()) {
+            return;
+        }
+        defer self.closeSocket();
 
-    pub fn writeCloseWithReason(self: *Conn, code: u16, reason: []const u8) !void {
+        const reason = opts.reason;
+        if (reason.len == 0) {
+            var buf: [2]u8 = undefined;
+            std.mem.writeInt(u16, &buf, opts.code, .big);
+            return self.writeFrame(.close, &buf);
+        }
+
         if (reason.len > 123) {
             return error.ReasonTooLong;
         }
+
         var buf: [4]u8 = undefined;
         buf[0] = @intFromEnum(OpCode.close);
         buf[1] = @intCast(reason.len + 2);
-        std.mem.writeInt(u16, buf[2..], code, .big);
+        std.mem.writeInt(u16, buf[2..], opts.code, .big);
 
         var vec = [2]std.posix.iovec_const{
             .{ .len = buf.len, .base = &buf },
             .{ .len = reason.len, .base = reason.ptr },
         };
 
-        return self.writeAllIOVec(&vec);
+        try writeAllIOVec(self, &vec);
     }
 
     pub fn writeFrame(self: *Conn, op_code: OpCode, data: []const u8) !void {
@@ -1351,6 +1349,12 @@ pub const Conn = struct {
             .op_code = op_code,
             .buf = std.ArrayList(u8).init(allocator),
         };
+    }
+
+    fn closeSocket(self: *Conn) void {
+        if (@atomicRmw(bool, &self._closed, .Xchg, true, .monotonic) == false) {
+            posix.close(self.stream.handle);
+        }
     }
 
     pub const Writer = struct {
@@ -1554,15 +1558,15 @@ fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator
                 }
             },
             .close => {
-                defer conn.close();
                 const data = message.data;
                 if (comptime std.meta.hasFn(H, "clientClose")) {
-                    return handler.clientClose(data);
+                    try handler.clientClose(data);
+                    return false;
                 }
 
                 const l = data.len;
                 if (l == 0) {
-                    conn.writeClose();
+                    try conn.close(.{});
                     return false;
                 }
 
@@ -1589,7 +1593,7 @@ fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator
                     // if we have a payload, it must be UTF8 (why?!)
                     try conn.writeFramed(CLOSE_PROTOCOL_ERROR);
                 } else {
-                    conn.writeClose();
+                    try conn.close(.{});
                 }
                 return false;
             },
@@ -1877,13 +1881,13 @@ const TestHandler = struct {
             return wb.flush();
         }
         if (std.mem.eql(u8, data, "close1")) {
-            return self.conn.writeClose();
+            return self.conn.close(.{});
         }
         if (std.mem.eql(u8, data, "close2")) {
-            return self.conn.writeCloseWithCode(123);
+            return self.conn.close(.{.code = 123});
         }
         if (std.mem.eql(u8, data, "close3")) {
-            return self.conn.writeCloseWithReason(234, "bye");
+            return self.conn.close(.{.code = 234, .reason = "bye"});
         }
     }
 };
