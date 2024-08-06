@@ -92,7 +92,7 @@ pub const Reader = struct {
 		//  - a single frame (control or otherwise) that forms a full message
 		//    (this last one is the most common case)
 		outer: while (true) {
-			var data_needed: usize = 2; // always need at least the first two bytes to start figuring things out
+			var data_needed: u64 = 2; // always need at least the first two bytes to start figuring things out
 			var phase = ParsePhase.pre;
 			var header_length: usize = 0;
 			var length_of_length: usize = 0;
