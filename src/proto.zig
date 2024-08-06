@@ -1,5 +1,6 @@
 const std = @import("std");
 const buffer = @import("buffer.zig");
+const builtin = @import("builtin");
 
 pub const Message = struct {
     type: Type,
@@ -66,14 +67,14 @@ pub const Reader = struct {
 
     // Position within buf that we've read into. We might read more than one
     // message in a single read, so this could span beyond 1 message.
-    pos: u64,
+    pos: usize,
 
     // Position in buf where the current message starts
-    start: u64,
+    start: usize,
 
     // Length of the current message.
     // This is set to 0 if we don't know yet
-    message_len: u64,
+    message_len: usize,
 
     // If we're dealing with a fragmented message (websocket fragment, not tcp
     // fragment), the state of the fragmented message is maintained here.)
@@ -152,7 +153,7 @@ pub const Reader = struct {
 
                 // At this point, we're sure that we have at least enough bytes to know
                 // the total length of the message.
-                message_len = switch (length_of_len) {
+                var ml = switch (length_of_len) {
                     2 => @as(u16, @intCast(buf[3])) | @as(u16, @intCast(buf[2])) << 8,
                     8 => @as(u64, @intCast(buf[9])) | @as(u64, @intCast(buf[8])) << 8 | @as(u64, @intCast(buf[7])) << 16 | @as(u64, @intCast(buf[6])) << 24 | @as(u64, @intCast(buf[5])) << 32 | @as(u64, @intCast(buf[4])) << 40 | @as(u64, @intCast(buf[3])) << 48 | @as(u64, @intCast(buf[2])) << 56,
                     else => buf[1] & 127,
@@ -161,9 +162,16 @@ pub const Reader = struct {
                 masked = byte2 & 128 == 128;
                 if (masked) {
                     // message is masked
-                    message_len += 4;
+                    ml += 4;
                 }
 
+                if (comptime builtin.target.ptrBitWidth() < 64) {
+                    if (ml > std.math.maxInt(usize)) {
+                        return error.TooLarge;
+                    }
+                }
+
+                message_len = @intCast(ml);
                 self.message_len = message_len;
 
                 if (self.buf.data.len < message_len) {
