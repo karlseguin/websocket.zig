@@ -1276,7 +1276,7 @@ pub const Conn = struct {
     }
 
     pub fn writeFrame(self: *Conn, op_code: OpCode, data: []const u8) !void {
-        const l = data.len;
+        const l: u64 = data.len;
         const stream = self.stream;
 
         // maximum possible prefix length. op_code + length_type + 8byte length

@@ -66,14 +66,14 @@ pub const Reader = struct {
 
     // Position within buf that we've read into. We might read more than one
     // message in a single read, so this could span beyond 1 message.
-    pos: usize,
+    pos: u64,
 
     // Position in buf where the current message starts
-    start: usize,
+    start: u64,
 
     // Length of the current message.
     // This is set to 0 if we don't know yet
-    message_len: usize,
+    message_len: u64,
 
     // If we're dealing with a fragmented message (websocket fragment, not tcp
     // fragment), the state of the fragmented message is maintained here.)
