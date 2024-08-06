@@ -1,5 +1,6 @@
 const std = @import("std");
 const lib = @import("lib.zig");
+const builtin = @import("builtin");
 
 const buffer = lib.buffer;
 const framing = lib.framing;
@@ -153,7 +154,13 @@ pub const Reader = struct {
 							8 => @as(u64, @intCast(msg[9])) | @as(u64, @intCast(msg[8])) << 8 | @as(u64, @intCast(msg[7])) << 16 | @as(u64, @intCast(msg[6])) << 24 | @as(u64, @intCast(msg[5])) << 32 | @as(u64, @intCast(msg[4])) << 40 | @as(u64, @intCast(msg[3])) << 48 | @as(u64, @intCast(msg[2])) << 56,
 							else => msg[1] & 127,
 						};
-						data_needed += payload_length;
+
+						if (comptime builtin.target.ptrBitWidth() < 64) {
+							if (payload_length > std.math.maxInt(usize)) {
+								return error.TooLarge;
+							}
+						}
+						data_needed += @intCast(payload_length);
 						phase = ParsePhase.payload;
 					},
 					.payload => {
