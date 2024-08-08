@@ -177,7 +177,7 @@ pub const KeyValue = struct {
         };
     }
 
-    fn deinit(self: KeyValue, allocator: Allocator) void {
+    fn deinit(self: *const KeyValue, allocator: Allocator) void {
         allocator.free(self.keys);
         allocator.free(self.values);
     }
@@ -194,7 +194,7 @@ pub const KeyValue = struct {
         self.len = len + 1;
     }
 
-    pub fn get(self: KeyValue, needle: []const u8) ?[]const u8 {
+    pub fn get(self: *const KeyValue, needle: []const u8) ?[]const u8 {
         const keys = self.keys[0..self.len];
         loop: for (keys, 0..) |key, i| {
             // This is largely a reminder to myself that std.mem.eql isn't
@@ -214,6 +214,39 @@ pub const KeyValue = struct {
 
         return null;
     }
+
+    pub fn iterator(self: *const KeyValue) Iterator {
+        const len = self.len;
+        return .{
+            .pos = 0,
+            .keys = self.keys[0..len],
+            .values = self.values[0..len],
+        };
+    }
+
+    pub const Iterator = struct {
+        pos: usize,
+        keys: [][]const u8,
+        values: [][]const u8,
+
+        const KV = struct {
+            key: []const u8,
+            value: []const u8,
+        };
+
+        pub fn next(self: *Iterator) ?KV {
+            const pos = self.pos;
+            if (pos == self.keys.len) {
+                return null;
+            }
+
+            self.pos = pos + 1;
+            return  .{
+                .key = self.keys[pos],
+                .value = self.values[pos],
+            };
+        }
+    };
 };
 
 pub const Pool = struct {
@@ -344,12 +377,28 @@ test "handshake: parse" {
         var state = try pool.acquire();
         defer state.release();
 
-        const h = (try testHandshake("GET /test?a=1   HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nsec-websocket-version:13\r\nsec-websocket-key: 9000!\r\nCustom:  Header-Value\r\n\r\n", state)).?;
+        const h = (try testHandshake("GET /test?a=1   HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nsec-websocket-version:13\r\nsec-websocket-key: 9000!\r\nCustom:  Header-Value\r\nOver: 9000\r\n\r\n", state)).?;
         try t.expectString("9000!", h.key);
         try t.expectString("GET", h.method);
         try t.expectString("/test?a=1", h.url);
-        try t.expectString("connection: upgrade\r\nupgrade: websocket\r\nsec-websocket-version:13\r\nsec-websocket-key: 9000!\r\ncustom:  Header-Value\r\n", h.raw_header);
+        try t.expectString("connection: upgrade\r\nupgrade: websocket\r\nsec-websocket-version:13\r\nsec-websocket-key: 9000!\r\ncustom:  Header-Value\r\nover: 9000\r\n", h.raw_header);
         try t.expectString("Header-Value", h.headers.get("custom").?);
+        try t.expectString("9000", h.headers.get("over").?);
+
+        var it = h.headers.iterator();
+        {
+            const kv = it.next().?;
+            try t.expectString("custom", kv.key);
+            try t.expectString("Header-Value", kv.value);
+        }
+
+        {
+            const kv = it.next().?;
+            try t.expectString("over", kv.key);
+            try t.expectString("9000", kv.value);
+        }
+
+        try t.expectEqual(null, it.next());
     }
 }
 

@@ -90,6 +90,14 @@ const token = handshake.headers.get("authorization") orelse {
 ...
 ```
 
+You can iterate through all the headers:
+```zig
+var it = handshake.headers.iterator();
+while (it.next) |kv| {
+    std.debug.print("{s} = {s}\n", .{kv.key, kv.value});
+}
+```
+
 Memory referenced by the `websocket.Handshake`, including headers from `handshake.headers` will be freed after the call to `init` completes. Application that need these values to exist beyond the call to `init` must make a copy.
 
 ### clientMessage

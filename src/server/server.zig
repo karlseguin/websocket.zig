@@ -264,6 +264,12 @@ pub fn Server(comptime H: type) type {
             self._mut.lock();
             defer self._mut.unlock();
             for (self._signals) |s| {
+                if (blockingMode()) {
+                    // necessary to unblock accept on linux
+                    // (which might not be that necessary since, on Linux,
+                    // NonBlocking should be used)
+                    posix.shutdown(s, .recv) catch {};
+                }
                 posix.close(s);
             }
         }
@@ -323,7 +329,7 @@ pub fn Blocking(comptime H: type) type {
                 var address: net.Address = undefined;
                 var address_len: posix.socklen_t = @sizeOf(net.Address);
                 const socket = posix.accept(listener, &address.any, &address_len, posix.SOCK.CLOEXEC) catch |err| {
-                    if (err == error.ConnectionAborted) {
+                    if (err == error.ConnectionAborted or err == error.SocketNotListening) {
                         log.info("received shutdown signal", .{});
                         return;
                     }
