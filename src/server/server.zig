@@ -1848,7 +1848,8 @@ fn testStream(handshake: bool) !net.Stream {
 const TestHandler = struct {
     conn: *Conn,
 
-    pub fn init(_: Handshake, conn: *Conn, _: void) !TestHandler {
+    pub fn init(h: Handshake, conn: *Conn, _: void) !TestHandler {
+        try t.expectString("upgrade", h.headers.get("connection").?);
         return .{
             .conn = conn,
         };
