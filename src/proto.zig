@@ -439,30 +439,42 @@ fn simpleMask(m: []const u8, payload: []u8) void {
 
 pub fn frame(op_code: OpCode, comptime msg: []const u8) [calculateFrameLen(msg)]u8 {
     var framed: [calculateFrameLen(msg)]u8 = undefined;
-    framed[0] = @intFromEnum(op_code);
-
-    const len = msg.len;
-    if (len <= 125) {
-        framed[1] = @intCast(len);
-        @memcpy(framed[2..], msg);
-    } else if (len < 65536) {
-        framed[1] = 126;
-        framed[2] = @intCast((len >> 8) & 0xFF);
-        framed[3] = @intCast(len & 0xFF);
-        @memcpy(framed[4..], msg);
-    } else {
-        framed[1] = 127;
-        framed[2] = @intCast((len >> 56) & 0xFF);
-        framed[3] = @intCast((len >> 48) & 0xFF);
-        framed[4] = @intCast((len >> 40) & 0xFF);
-        framed[5] = @intCast((len >> 32) & 0xFF);
-        framed[6] = @intCast((len >> 24) & 0xFF);
-        framed[7] = @intCast((len >> 16) & 0xFF);
-        framed[8] = @intCast((len >> 8) & 0xFF);
-        framed[9] = @intCast(len & 0xFF);
-        @memcpy(framed[10..], msg);
-    }
+    const header = writeFrameHeader(&framed, op_code, msg.len);
+    @memcpy(framed[header.len..], msg);
     return framed;
+}
+
+pub fn writeFrameHeader(buf: []u8, op_code: OpCode, l: usize) []u8 {
+    buf[0] = @intFromEnum(op_code);
+
+    if (l <= 125) {
+        buf[1] = @intCast(l);
+        return buf[0..2];
+    }
+    if (l < 65536) {
+        buf[1] = 126;
+        buf[2] = @intCast((l >> 8) & 0xFF);
+        buf[3] = @intCast(l & 0xFF);
+        return buf[0..4];
+    }
+
+    buf[1] = 127;
+    if (comptime builtin.target.ptrBitWidth() >= 64) {
+        buf[2] = @intCast((l >> 56) & 0xFF);
+        buf[3] = @intCast((l >> 48) & 0xFF);
+        buf[4] = @intCast((l >> 40) & 0xFF);
+        buf[5] = @intCast((l >> 32) & 0xFF);
+    } else {
+        buf[2] = 0;
+        buf[3] = 0;
+        buf[4] = 0;
+        buf[5] = 0;
+    }
+    buf[6] = @intCast((l >> 24) & 0xFF);
+    buf[7] = @intCast((l >> 16) & 0xFF);
+    buf[8] = @intCast((l >> 8) & 0xFF);
+    buf[9] = @intCast(l & 0xFF);
+    return buf[0..10];
 }
 
 pub fn calculateFrameLen(comptime msg: []const u8) usize {

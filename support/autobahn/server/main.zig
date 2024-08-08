@@ -18,13 +18,16 @@ var nonblocking_bp_server: websocket.Server(Handler) = undefined;
 pub fn main() !void {
 	var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 	const allocator = gpa.allocator();
-	defer _ = gpa.detectLeaks();
 
-	std.posix.sigaction(std.posix.SIG.TERM, &.{
-		.handler = .{.handler = shutdown},
-		.mask = std.posix.empty_sigset,
-		.flags = 0,
-	}, null);
+	if (@import("builtin").os.tag != .windows) {
+		defer _ = gpa.detectLeaks();
+
+		std.posix.sigaction(std.posix.SIG.TERM, &.{
+			.handler = .{.handler = shutdown},
+			.mask = std.posix.empty_sigset,
+			.flags = 0,
+		}, null);
+	}
 
 	const t1 = try startNonBlocking(allocator);
 	const t2 = try startNonBlockingBufferPool(allocator);

@@ -240,41 +240,21 @@ pub const Client = struct {
     }
 
     pub fn writeFrame(self: *Client, op_code: proto.OpCode, data: []u8) !void {
-        const l = data.len;
-        const mask = self._mask_fn();
-        var stream = &self.stream;
-
         // maximum possible prefix length. op_code + length_type + 8byte length + 4 byte mask
         var buf: [14]u8 = undefined;
-        buf[0] = @intFromEnum(op_code);
+        const header = proto.writeFrameHeader(&buf, op_code, data.len);
 
-        if (l <= 125) {
-            buf[1] = @as(u8, @intCast(l)) | 128;
-            @memcpy(buf[2..6], &mask);
-            try stream.writeAll(buf[0..6]);
-        } else if (l < 65536) {
-            buf[1] = 254; // 126 | 128
-            buf[2] = @intCast((l >> 8) & 0xFF);
-            buf[3] = @intCast(l & 0xFF);
-            @memcpy(buf[4..8], &mask);
-            try stream.writeAll(buf[0..8]);
-        } else {
-            buf[1] = 255; // 127 | 128
-            buf[2] = @intCast((l >> 56) & 0xFF);
-            buf[3] = @intCast((l >> 48) & 0xFF);
-            buf[4] = @intCast((l >> 40) & 0xFF);
-            buf[5] = @intCast((l >> 32) & 0xFF);
-            buf[6] = @intCast((l >> 24) & 0xFF);
-            buf[7] = @intCast((l >> 16) & 0xFF);
-            buf[8] = @intCast((l >> 8) & 0xFF);
-            buf[9] = @intCast(l & 0xFF);
-            @memcpy(buf[10..], &mask);
-            try stream.writeAll(buf[0..]);
-        }
+        const header_len = header.len;
+        const header_end = header.len + 4; // for the mask
 
-        if (l > 0) {
+        buf[1] |= 128; // indicate that the payload is masked
+        const mask = self._mask_fn();
+        @memcpy(buf[header_len..header_end], &mask);
+
+        try self.stream.writeAll(buf[0..header_end]);
+        if (data.len > 0) {
             proto.mask(&mask, data);
-            try stream.writeAll(data);
+            try self.stream.writeAll(data);
         }
     }
 

@@ -1282,36 +1282,13 @@ pub const Conn = struct {
     }
 
     pub fn writeFrame(self: *Conn, op_code: OpCode, data: []const u8) !void {
-        const l: u64 = data.len;
-        const stream = self.stream;
-
         // maximum possible prefix length. op_code + length_type + 8byte length
         var buf: [10]u8 = undefined;
-        var header: []const u8 = undefined;
-        buf[0] = @intFromEnum(op_code);
+        const header = proto.writeFrameHeader(&buf, op_code, data.len);
 
-        if (l <= 125) {
-            buf[1] = @intCast(l);
-            header = buf[0..2];
-        } else if (l < 65536) {
-            buf[1] = 126;
-            buf[2] = @intCast((l >> 8) & 0xFF);
-            buf[3] = @intCast(l & 0xFF);
-            header = buf[0..4];
-        } else {
-            buf[1] = 127;
-            buf[2] = @intCast((l >> 56) & 0xFF);
-            buf[3] = @intCast((l >> 48) & 0xFF);
-            buf[4] = @intCast((l >> 40) & 0xFF);
-            buf[5] = @intCast((l >> 32) & 0xFF);
-            buf[6] = @intCast((l >> 24) & 0xFF);
-            buf[7] = @intCast((l >> 16) & 0xFF);
-            buf[8] = @intCast((l >> 8) & 0xFF);
-            buf[9] = @intCast(l & 0xFF);
-            header = buf[0..];
-        }
+        const stream = self.stream;
 
-        if (l == 0) {
+        if (data.len == 0) {
             // no body, just write the header
             self.lock.lock();
             defer self.lock.unlock();
@@ -1674,7 +1651,7 @@ fn preHandOffWrite(conn: *Conn, response: []const u8) void {
 }
 
 fn timestamp() u32 {
-    if (comptime @hasDecl(std.c, "CLOCK") == false) {
+    if (comptime @hasDecl(posix, "CLOCK") == false or posix.CLOCK == void) {
         return @intCast(std.time.timestamp());
     }
     var ts: posix.timespec = undefined;
