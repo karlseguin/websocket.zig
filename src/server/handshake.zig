@@ -47,6 +47,8 @@ pub const Handshake = struct {
             const name = std.mem.trim(u8, toLower(buf[0..separator]), &ascii.whitespace);
             const value = std.mem.trim(u8, buf[(separator + 1)..index], &ascii.whitespace);
 
+            headers.add(name, value);
+
             switch (name.len) {
                 7 => if (eql("upgrade", name)) {
                     if (!ascii.eqlIgnoreCase("websocket", value)) {
@@ -72,8 +74,9 @@ pub const Handshake = struct {
                     }
                     required_headers |= 2;
                 },
-                else => headers.add(name, value),
+                else => {},
             }
+
             const next = index + 2;
             request_length += next;
             buf = buf[next..];
@@ -377,25 +380,42 @@ test "handshake: parse" {
         var state = try pool.acquire();
         defer state.release();
 
-        const h = (try testHandshake("GET /test?a=1   HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nsec-websocket-version:13\r\nsec-websocket-key: 9000!\r\nCustom:  Header-Value\r\nOver: 9000\r\n\r\n", state)).?;
+        const h = (try testHandshake("GET /test?a=1   HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nsec-websocket-version:13\r\nsec-websocket-key: 9000!\r\nCustom:  Header-Value\r\n\r\n", state)).?;
         try t.expectString("9000!", h.key);
         try t.expectString("GET", h.method);
         try t.expectString("/test?a=1", h.url);
-        try t.expectString("connection: upgrade\r\nupgrade: websocket\r\nsec-websocket-version:13\r\nsec-websocket-key: 9000!\r\ncustom:  Header-Value\r\nover: 9000\r\n", h.raw_header);
+        try t.expectString("connection: upgrade\r\nupgrade: websocket\r\nsec-websocket-version:13\r\nsec-websocket-key: 9000!\r\ncustom:  Header-Value\r\n", h.raw_header);
         try t.expectString("Header-Value", h.headers.get("custom").?);
-        try t.expectString("9000", h.headers.get("over").?);
 
         var it = h.headers.iterator();
         {
             const kv = it.next().?;
-            try t.expectString("custom", kv.key);
-            try t.expectString("Header-Value", kv.value);
+            try t.expectString("connection", kv.key);
+            try t.expectString("upgrade", kv.value);
         }
 
         {
             const kv = it.next().?;
-            try t.expectString("over", kv.key);
-            try t.expectString("9000", kv.value);
+            try t.expectString("upgrade", kv.key);
+            try t.expectString("websocket", kv.value);
+        }
+
+        {
+            const kv = it.next().?;
+            try t.expectString("sec-websocket-version", kv.key);
+            try t.expectString("13", kv.value);
+        }
+
+        {
+            const kv = it.next().?;
+            try t.expectString("sec-websocket-key", kv.key);
+            try t.expectString("9000!", kv.value);
+        }
+
+        {
+            const kv = it.next().?;
+            try t.expectString("custom", kv.key);
+            try t.expectString("Header-Value", kv.value);
         }
 
         try t.expectEqual(null, it.next());

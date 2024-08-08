@@ -1421,7 +1421,7 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
         return true;
     };
 
-    state.release();
+    defer state.release();
     hc.handshake = null;
 
     // After this, the app has access to &hc.conn, so any access to the
