@@ -1,6 +1,8 @@
 const std = @import("std");
 const websocket = @import("websocket");
 
+const Allocator = std.mem.Allocator;
+
 pub fn main() !void {
 	var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 	defer _ = gpa.detectLeaks();
@@ -66,25 +68,9 @@ pub fn main() !void {
 		// if (!std.mem.eql(u8, case, "1.1.1")) continue;
 		std.debug.print("running case: {s}\n", .{case});
 
-		const path = try std.fmt.allocPrint(allocator, "/runCase?casetuple={s}&agent=websocket.zig", .{case});
-		defer allocator.free(path);
-
-		var client = try websocket.Client.init(allocator, .{
-			.port = 9001,
-			.host = "localhost",
-			.buffer_provider = &buffer_provider,
-		});
-		defer client.deinit();
-		const handler = Handler{.client = &client};
-
-		client.handshake(path, .{
-			.timeout_ms = 500,
-			.headers = "host: localhost:9001\r\n",
-		}) catch continue;
-
-		// optional, if you want to set a SO_SNDTIMEO on the socket
-		try client.stream.writeTimeout(5000);
-		client.readLoop(handler) catch |err| switch (err) {
+		var handler = try Handler.init(allocator, &buffer_provider, case);
+		defer handler.deinit();
+		handler.readLoop() catch |err| switch (err) {
 			// Each of these error cases reqiuer that we close the connection, as per
 			// the spec. You probably just want to re-connect. But, for the autobahn tests
 			// we don't want to shutdown, since autobahn is testing these invalid cases.
@@ -116,9 +102,36 @@ fn updateReport(allocator: std.mem.Allocator) !void {
 }
 
 const Handler = struct {
-	client: *websocket.Client,
+	client: websocket.Client,
 
-	pub fn handleMessage(self: Handler, data: []const u8, tpe: websocket.Message.TextType) !void {
+	fn init(allocator: Allocator, buffer_provider: *websocket.buffer.Provider, case: []const u8) !Handler {
+		const path = try std.fmt.allocPrint(allocator, "/runCase?casetuple={s}&agent=websocket.zig", .{case});
+		defer allocator.free(path);
+
+		var client = try websocket.Client.init(allocator, .{
+			.port = 9001,
+			.host = "localhost",
+			.buffer_provider = buffer_provider,
+		});
+		errdefer client.deinit();
+		try client.handshake(path, .{
+			.timeout_ms = 500,
+			.headers = "host: localhost:9001\r\n",
+		});
+		return .{
+			.client = client,
+		};
+	}
+
+	fn deinit(self: *Handler) void {
+		self.client.deinit();
+	}
+
+	fn readLoop(self: *Handler) !void {
+		return self.client.readLoop(self);
+	}
+
+	pub fn handleMessage(self: *Handler, data: []const u8, tpe: websocket.Message.TextType) !void {
 		switch (tpe) {
 			.binary => try self.client.writeBin(@constCast(data)),
 			.text => {

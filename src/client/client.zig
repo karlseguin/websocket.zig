@@ -138,77 +138,88 @@ pub const Client = struct {
 
     pub fn readLoop(self: *Client, handler: anytype) !void {
         const H = @TypeOf(handler);
+        const Handler = switch (@typeInfo(H)) {
+            .Struct => H,
+            .Pointer => |ptr| ptr.child,
+            else => @compileError("readLoop handler must be a struct, got: " ++ @tagName(@typeInfo(H))),
+        };
 
         var reader = &self._reader;
-        const stream = &self.stream;
 
         defer if (comptime std.meta.hasFn(H, "close")) {
             handler.close();
         };
 
+        // block until we have data
+        try self.readTimeout(0);
+
         while (true) {
-            // for a single fill, we might have multiple messages to process
-            while (true) {
-                const has_more, const message = reader.read() catch |err| {
-                    self.closeWithCode(1002);
-                    return err;
-                } orelse break; // orelse, we don't have enough data, so break out of the inner loop, and go get more data from the socket in the outer loop
+            const message = (try self.read()) orelse unreachable;
+            const message_type = message.type;
+            defer reader.done(message_type);
 
-                const message_type = message.type;
-                defer reader.done(message_type);
-
-                switch (message_type) {
-                    .text, .binary => {
-                        switch (comptime @typeInfo(@TypeOf(H.handleMessage)).Fn.params.len) {
-                            2 => try handler.handleMessage(message.data),
-                            3 => try handler.handleMessage(message.data, if (message_type == .text) .text else .binary),
-                            else => @compileError(@typeName(H) ++ ".handleMessage must accept 2 or 3 parameters"),
-                        }
-                    },
-                    .ping => if (comptime std.meta.hasFn(H, "handlePing")) {
-                        try handler.handlePing(message.data);
+            switch (message_type) {
+                .text, .binary => {
+                    switch (comptime @typeInfo(@TypeOf(Handler.handleMessage)).Fn.params.len) {
+                        2 => try handler.handleMessage(message.data),
+                        3 => try handler.handleMessage(message.data, if (message_type == .text) .text else .binary),
+                        else => @compileError(@typeName(Handler) ++ ".handleMessage must accept 2 or 3 parameters"),
+                    }
+                },
+                .ping => if (comptime std.meta.hasFn(Handler, "handlePing")) {
+                    try handler.handlePing(message.data);
+                } else {
+                    // @constCast is safe because we know message.data points to
+                    // reader.buffer.buf, which we own and which can be mutated
+                    try self.writeFrame(.pong, @constCast(message.data));
+                },
+                .close => {
+                    if (comptime std.meta.hasFn(Handler, "handleClose")) {
+                        try handler.handleClose(message.data);
                     } else {
-                        // @constCast is safe because we know message.data points to
-                        // reader.buffer.buf, which we own and which can be mutated
-                        try self.writeFrame(.pong, @constCast(message.data));
-                    },
-                    .close => {
-                        if (comptime std.meta.hasFn(H, "handleClose")) {
-                            try handler.handleClose(message.data);
-                        } else {
-                            self.close();
-                        }
-                        return;
-                    },
-                    .pong => if (comptime std.meta.hasFn(H, "handlePong")) {
-                        try handler.handlePong();
-                    },
-                }
-
-                if (has_more == false) {
-                    // break out of the inner loop, and back into the outer loop
-                    // to fill the buffer with more data from the socket
-                    break;
-                }
-            }
-
-            // Wondering why we don't call fill at the start of the outer loop?
-            // When we read the handshake response, we might already have a message
-            // (or part of a message) to process. So we always want to run reader.next()
-            // first, to process any initial message we might have.
-            // If we call fill first, we might block forever, despite there being
-            // an initial message waiting.
-            reader.fill(stream) catch |err| switch (err) {
-                error.Closed, error.ConnectionResetByPeer, error.BrokenPipe, error.NotOpenForReading => {
-                    _ = @cmpxchgStrong(bool, &self._closed, false, true, .monotonic, .monotonic);
+                        self.close();
+                    }
                     return;
                 },
-                else => {
-                    self.closeWithCode(1002);
-                    return err;
+                .pong => if (comptime std.meta.hasFn(Handler, "handlePong")) {
+                    try handler.handlePong();
                 },
-            };
+            }
         }
+    }
+
+    pub fn read(self: *Client) !?proto.Message {
+        var reader = &self._reader;
+        const stream = &self.stream;
+
+        while (true) {
+            // try to read a message from our buffer first, before trying to
+            // get more data from the socket.
+            const has_more, const message = reader.read() catch |err| {
+                self.closeWithCode(1002);
+                return err;
+            } orelse {
+                reader.fill(stream) catch |err| switch (err) {
+                    error.WouldBlock => return null,
+                    error.Closed, error.ConnectionResetByPeer, error.BrokenPipe, error.NotOpenForReading => {
+                        _ = @cmpxchgStrong(bool, &self._closed, false, true, .monotonic, .monotonic);
+                        return error.Closed;
+                    },
+                    else => {
+                        self.closeWithCode(1002);
+                        return err;
+                    },
+                };
+                continue;
+            };
+
+            _ = has_more;
+            return message;
+        }
+    }
+
+    pub fn done(self:* Client, message: proto.Message) void {
+        self.reader.done(message.type);
     }
 
     pub fn readLoopInNewThread(self: *Client, h: anytype) !std.Thread {
@@ -217,6 +228,14 @@ pub const Client = struct {
 
     fn readLoopOwnedThread(self: *Client, h: anytype) void {
         self.readLoop(h) catch {};
+    }
+
+     pub fn writeTimeout(self: *const Client, ms: u32) !void {
+        return self.stream.writeTimeout(ms);
+    }
+
+    pub fn readTimeout(self: *const Client, ms: u32) !void {
+        return self.stream.readTimeout(ms);
     }
 
     pub fn write(self: *Client, data: []u8) !void {
@@ -311,31 +330,27 @@ pub const Stream = struct {
 
     const zero_timeout = std.mem.toBytes(posix.timeval{ .sec = 0, .usec = 0 });
     pub fn writeTimeout(self: *const Stream, ms: u32) !void {
+        return self.setTimeout(posix.SO.SNDTIMEO, ms);
+    }
+
+    pub fn readTimeout(self: *const Stream, ms: u32) !void {
+        return self.setTimeout(posix.SO.RCVTIMEO, ms);
+    }
+
+    fn setTimeout(self: *const Stream, opt_name: u32, ms: u32) !void {
         if (ms == 0) {
-            return self.setsockopt(posix.SO.SNDTIMEO, &zero_timeout);
+            return self.setsockopt(opt_name, &zero_timeout);
         }
 
         const timeout = std.mem.toBytes(posix.timeval{
             .sec = @intCast(@divTrunc(ms, 1000)),
             .usec = @intCast(@mod(ms, 1000) * 1000),
         });
-        return self.setsockopt(posix.SO.SNDTIMEO, &timeout);
+        return self.setsockopt(opt_name, &timeout);
     }
 
-    pub fn receiveTimeout(self: *const Stream, ms: u32) !void {
-        if (ms == 0) {
-            return self.setsockopt(posix.SO.RCVTIMEO, &zero_timeout);
-        }
-
-        const timeout = std.mem.toBytes(posix.timeval{
-            .sec = @intCast(@divTrunc(ms, 1000)),
-            .usec = @intCast(@mod(ms, 1000) * 1000),
-        });
-        return self.setsockopt(posix.SO.RCVTIMEO, &timeout);
-    }
-
-    pub fn setsockopt(self: *const Stream, optname: u32, value: []const u8) !void {
-        return posix.setsockopt(self.stream.handle, posix.SOL.SOCKET, optname, value);
+    pub fn setsockopt(self: *const Stream, opt_name: u32, value: []const u8) !void {
+        return posix.setsockopt(self.stream.handle, posix.SOL.SOCKET, opt_name, value);
     }
 };
 
@@ -402,7 +417,7 @@ fn readHandshakeReply(buf: []u8, key: []const u8, opts: *const Client.HandshakeO
 
     const timeout_ms = opts.timeout_ms;
     const deadline = std.time.milliTimestamp() + timeout_ms;
-    try stream.receiveTimeout(timeout_ms);
+    try stream.readTimeout(timeout_ms);
 
     var pos: usize = 0;
     var line_start: usize = 0;
@@ -422,7 +437,7 @@ fn readHandshakeReply(buf: []u8, key: []const u8, opts: *const Client.HandshakeO
                 }
                 const over_read = pos - (line_start + 2);
                 std.mem.copyForwards(u8, buf[0..over_read], buf[line_start + 2 .. pos]);
-                try stream.receiveTimeout(0);
+                try stream.readTimeout(0);
                 return over_read;
             }
 
