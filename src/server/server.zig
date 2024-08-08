@@ -426,7 +426,9 @@ pub fn Blocking(comptime H: type) type {
         }
 
         // called for each hc when shutting down
-        fn shutdownCleanup(_: *Self, _: *HandlerConn(H)) void {}
+        fn shutdownCleanup(_: *Self, hc: *HandlerConn(H)) void {
+            posix.shutdown(hc.socket, .recv) catch {};
+        }
     };
 }
 
