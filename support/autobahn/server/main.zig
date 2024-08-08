@@ -41,8 +41,8 @@ fn startNonBlocking(allocator: Allocator) !std.Thread {
 		.port = 9224,
 		.address = "127.0.0.1",
 		.buffers = .{
-			.pool = 0,
-			.size = 8192,
+			.small_pool = 0,
+			.small_size = 8192,
 		},
 		// autobahn tests with large messages (16MB).
 		// You almost certainly want to use a small value here.
@@ -61,8 +61,8 @@ fn startNonBlockingBufferPool(allocator: Allocator) !std.Thread {
 		.port = 9225,
 		.address = "127.0.0.1",
 		.buffers = .{
-			.pool = 3,
-			.size = 8192,
+			.small_pool = 3,
+			.small_size = 8192,
 		},
 		// autobahn tests with large messages (16MB).
 		// You almost certainly want to use a small value here.
@@ -93,7 +93,7 @@ const Handler = struct {
 				if (std.unicode.utf8ValidateSlice(data)) {
 					try self.conn.writeText(data);
 				} else {
-					self.conn.close();
+					self.conn.close(.{}) catch {};
 				}
 			},
 		}
