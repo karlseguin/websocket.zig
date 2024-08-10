@@ -244,7 +244,7 @@ pub const KeyValue = struct {
             }
 
             self.pos = pos + 1;
-            return  .{
+            return .{
                 .key = self.keys[pos],
                 .value = self.values[pos],
             };

@@ -5,6 +5,8 @@ pub const buffer = @import("buffer.zig");
 pub const proto = @import("proto.zig");
 pub const OpCode = proto.OpCode;
 pub const Message = proto.Message;
+pub const MessageType = Message.Type;
+pub const MessageTextType = Message.TextType;
 
 pub const Client = @import("client/client.zig").Client;
 

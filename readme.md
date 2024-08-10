@@ -1,5 +1,7 @@
 # A zig websocket server.
-This project follows Zig master. See available branches if you're targetting a specific version.
+This project follows Zig master. See available branches if you're targeting a specific version.
+
+Skip to the [client section](#client).
 
 # Server
 ```zig
@@ -70,6 +72,8 @@ When you create a `websocket.Server(Handler)`, the specified `Handler` is your s
 ### init
 The `init` method is called with a `websocket.Handshake`, a `*websocket.Conn` and whatever app-specific value was passed into `Server(H).init`. 
 
+When `init` is called, the handshake response has not yet been sent to the client (this allows your `init` method to return an error which will cause websocket.zig to send an error response and close the connection). As such, you should not use/write to the `*websocket.Conn` at this point. Instead, use the `afterInit` method, described next.
+
 The websocket specification requires the initial "handshake" to contain certain headers and values. The library validates these headers. However applications may have additional requirements before allowing the connection to be "upgraded" to a websocket connection. For example, a one-time-use token could be required in the querystring. Applications should use the provided `websocket.Handshake` to apply any application-specific verification and optionally return an error to terminate the connection.
 
 The `websocket.Handshake` exposes the following fields:
@@ -81,13 +85,22 @@ The `websocket.Handshake` exposes the following fields:
 If you set the `max_headers` configuration value to > 0, then you can use `req.headers.get("HEADER_NAME")` to extract a header value from the given name:
 
 ```zig
-// get returns a ?[]const u8
-// the name is lowercase
-// the value is in its original case
-const token = handshake.headers.get("authorization") orelse {
-    return error.NotAuthorized;
+// the last parameter, an *App in this case, is an application-specific
+// value that you passed into server.listen()
+pub fn init(h: websocket.Handshake, conn: websocket.Conn, app: *App) !Handler {
+    // get returns a ?[]const u8
+    // the name is lowercase
+    // the value is in its original case
+    const token = handshake.headers.get("authorization") orelse {
+        return error.NotAuthorized;
+    }
+
+    return .{
+        .app = app,
+        .conn = conn,
+    };
 }
-...
+
 ```
 
 You can iterate through all the headers:
@@ -100,6 +113,18 @@ while (it.next) |kv| {
 
 Memory referenced by the `websocket.Handshake`, including headers from `handshake.headers` will be freed after the call to `init` completes. Application that need these values to exist beyond the call to `init` must make a copy.
 
+### afterInit
+If your handler defines a `afterInit(handler: *Handler) !void` method, the method is called after the handshake response has been sent. This is the first time the connection can safely be used.
+
+`afterInit` supports two overloads:
+
+```zig
+pub fn afterInit(handler: *Handler) !void
+pub fn afterInit(handler: *Handler, ctx: anytype) !void
+```
+
+The `ctx` is the same `ctx` passed into `init`. It is passed here for cases where the value is only needed once when the connection is established.
+
 ### clientMessage
 The `clientMessage` method is called whenever a text or binary message is received.
 
@@ -107,7 +132,7 @@ The `clientMessage` method can take one of four shapes. The simplest, shown in t
 
 ```zig
 // simple clientMessage
-clientMessage(h: *Handler, data: []const u8) !void
+clientMessage(h: *Handler, data: []u8) !void
 ```
 
 The Websocket specific has a distinct message type for text and binary. Text messages must be valid UTF-8. Websocket.zig does not do this validation (it's expensive and most apps don't care). However, if you do care about the distinction, your `clientMessage` can take another parameter:
@@ -116,36 +141,36 @@ The Websocket specific has a distinct message type for text and binary. Text mes
 // clientMessage that accepts a tpe to differentiate between messages
 // sent as `text` vs those sent as `binary`. Either way, Websocket.zig
 // does not validate that text data is valid UTF-8.
-clientMessage(h: *Handler, data: []const u8, tpe: ws.Message.TextType) !void
+clientMessage(h: *Handler, data: []u8, tpe: ws.MessageTextType) !void
 ```
 
 Finally, `clientMessage` can take an optional `std.mem.Allocator`. If you need to dynamically allocate memory within `clientMessage`, consider using this allocator. It is a fast thread-local buffer that fallsback to an arena allocator. Allocations made with this allocator are freed after `clientMessage` returns:
 
 ```zig
 // clientMessage that takes an allocator
-clientMessage(h: *Handler, allocator: Allocator, data: []const u8) !void
+clientMessage(h: *Handler, allocator: Allocator, data: []u8) !void
 
-// cilentMessage that takes an allocator AND a Message.TextType
-clientMessage(h: *Handler, allocator: Allocator, data: []const u8, tpe: ws.Message.TextType) !void`
+// cilentMessage that takes an allocator AND a MessageTextType
+clientMessage(h: *Handler, allocator: Allocator, data: []u8, tpe: ws.MessageTextType) !void`
 ```
 
 If `clientMessage` returns an error, the connection is closed. You can also call `conn.close()` within the method.
 
 ### close
-If your handler define `close(handler: *Handler)` method, the method is called whenever the connection is being closed. Guaranteed to be called exactly once, so it is safe to deinitialize the `handler` at this point. This is called no mater the reason for the closure (on shutdown, if the client closed the connection, if your code close the connection, ...)
+If your handler defines a `close(handler: *Handler)` method, the method is called whenever the connection is being closed. Guaranteed to be called exactly once, so it is safe to deinitialize the `handler` at this point. This is called no mater the reason for the closure (on shutdown, if the client closed the connection, if your code close the connection, ...)
 
 The socket may or may not still be alive.
 
 ### clientClose
-If your handler define `clientClose(handler: *Handler, data: []const u8) !void` method, the function will be called whenever a `close` message is received from the client. 
+If your handler defines a `clientClose(handler: *Handler, data: []u8) !void` method, the function will be called whenever a `close` message is received from the client. 
 
 You almost certainly *do not* want to define this method and instead want to use `close()`. When not defined, websocket.zig follows the websocket specific and replies with its own matching close message.
 
 ### clientPong
-If your handler define `clientPong(handler: *Handler) !void` method, the function will be called whenever a `pong` message is received from the client. When not defined, no action is taken.
+If your handler defines a `clientPong(handler: *Handler, data: []u8) !void` method, the function will be called whenever a `pong` message is received from the client. When not defined, no action is taken.
 
-### clientPong
-If your handler define `clientPing(handler: *Handler, data: []const u8) !void` method, the function will be called whenever `ping` message is received from the client. When not defined, websocket.zig will write a corresponding `pong` reply.
+### clientPing
+If your handler defines a `clientPing(handler: *Handler, data: []u8) !void` method, the function will be called whenever `ping` message is received from the client. When not defined, websocket.zig will write a corresponding `pong` reply.
 
 ## websocket.Conn
 The call to `init` includes a `*websocket.Conn`. It is expected that handlers will keep a reference to it. The main purpose of the `*Conn` is to write data via `conn.write([]const u8)` and `conn.writeBin([]const u8)`. The websocket protocol differentiates between a "text" and "binary" message, with the only difference that "text" must be valid UTF-8. This library does not enforce this. Which you use really depends on what your client expects. For browsers, text messages appear as strings, and binary messages appear as a Blob or ArrayBuffer (depending on how the client is configured).
@@ -362,4 +387,217 @@ Besides `expectMessage` you can also call `expectClose()`.
 Note that this testing is heavy-handed. It opens up a pair of sockets with one side listening on `127.0.0.1` and accepting a connection from the other. `wtt.conn` is the "server" side of the connection, and assertion happens on the client side.
 
 # Client
-Changes to the client API are still in flux. Please continue using the `master` branch for client websocket code.
+The `*websocket.Client` can be used in one of two ways. At its simplest, after creating a client and initiating a handshake, you simply use <code>write</code> to send messages and <code>read</code> to receive them. First, we create the client and initiate the handshake:
+
+```zig
+pub fn main() !void {
+  var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+  const allocator = gpa.allocator();
+
+  // create the client
+  var client = try websocket.Client.init(allocator, .{
+    .port = 9224,
+    .host = "localhost",
+  });
+  defer client.deinit();
+
+  // send the initial handshake request
+  const request_path = "/ws";
+  try client.handshake(request_path, .{
+    .timeout_ms = 1000,
+    // Raw headers to send, if any. 
+    // A lot of servers require a Host header.
+    // Separate multiple headers using \r\n
+    .headers = "Host: localhost:9224",
+  });
+}
+```
+
+We can then use `read` and `write`. By default, `read` blocks until a message is received (or an error occurs). We can make it return `null` by setting a timeout:
+
+```zig
+  // optional, read will return null after 1 second
+  try client.readTimeout(std.time.ms_per_s * 1);
+
+  // echo messages back to the server until the connection is closed
+  while (true) {
+    // since we didn't set a timeout, client.read() will either
+    // return a message or an error (i.e. it won't return null)
+    const message = (try client.read()) orelse {
+        // no message after our 1 second
+        std.debug.print(".", .{});
+        continue;
+    };
+
+    // must be called once you're done processing the request
+    defer client.done(message);
+
+    switch (message.type) {
+      .text, .binary => {
+        std.debug.print("received: {s}\n", .{message.data});
+        try client.write(message.data);
+      },
+      .ping => try client.writePong(message.data),
+      .pong => {},
+      .close => {
+        client.close();
+        break;
+      }
+    }
+  }
+}
+```
+
+### Custom Wrapper
+In more advanced cases, you'll likely want to wrap a `*ws.Client` in your own type and use a background read loop with "callback" methods. Like in the above example, you'll first want to create a client and initialize a handshake:
+
+```zig
+const ws = @import("websocket");
+
+const Handler = struct {
+  client: ws.Client,
+
+  fn init(allocator: std.mem.Allocator) !Handler {
+    var client = try ws.Client.init(allocator, .{
+      .port = 9224,
+      .host = "localhost",
+    });
+    defer client.deinit();
+
+     // send the initial handshake request
+    const request_path = "/ws";
+    try client.handshake(request_path, .{
+      .timeout_ms = 1000,
+      .headers = "host: localhost:9224\r\n",
+    });
+
+    return .{
+      .client = client,
+    };
+  }
+  ```
+
+You can then call `client.readLoopInNewThread()` to start a background listener. Your handler must define a `serverMessage` method:
+
+```zig
+  pub fn startLoop(self: *Handler) !void {
+    // use readLoop for a blocking version
+    const thread = try self.client.readLoopInNewThread(self);
+    thread.detach();
+  }
+
+  pub fn serverMessage(self: *Handler, data: []u8) !void {
+    // echo back to server
+    return self.client.write(data);
+  }
+}
+```
+
+Websockets have a number of different message types. `serverMessage` only receives text and binary messages. If you care about the distinction, you can use an overload:
+
+```zig
+pub fn serverMessage(self: *Handler, data: []u8, tpe: ws.MessageTextType) !void
+```
+
+where `tpe` will be either `.text` or `.binary`. Different callbacks are used for the other message types.
+
+#### Optional Callbacks
+In addition to the required `serverMessage`, you can define optional callbacks.
+
+```zig
+// Guaranteed to be called exactly once when the readLoop exits
+pub fn close(self: *Handler) void
+
+// If omitted, websocket.zig will automatically reply with a pong
+pub fn serverPing(self: *Handler, data: []u8) !void
+
+// If omitted, websocket.zig will ignore this  message
+pub fn serverPong(self: *Handler) !void
+
+// If omitted, websocket.zig will automatically reply with a close message
+pub fn serverClose(self: *Handler) !void
+```
+
+You almost certainly **do not** want to define a `serverClose` method, but instead what do define a `close` method. In your `close` callback, you should call `client.close(.{})` (and optionally pass a code and reason).
+
+## Client
+Whether you're calling `client.read()` explicitly or using `client.readLoopInNewThread()` (or `client.readLoop()`), the `client` API is the same. In both cases, the various `write` methods, as well as `close()` are thread-safe.
+
+### Writing
+It may come as a surprise, but every variation of `write` expects a `[]u8`, not a `[]const u8`. Websocket payloads sent from a client need to be masked, which the websocket.zig library handles. It is obviously more efficient to mutate the given payload versus creating a copy. By taking a `[]u8`, applications with mutable buffers benefit from avoiding the clone. Applications that have immutable buffers will need to create a mutable clone.
+
+```
+// write a text message
+pub fn write(self: *Client, data: []u8) !void
+
+// write a text message (same as client.write(data))
+pub fn writeText(self: *Client, data: []u8) !void
+
+// write a binary message
+pub fn writeBin(self: *Client, data: []u8) !void
+
+// write a ping message
+pub fn writePing(self: *Client, data: []u8) !void
+
+// write a pong message
+// if you don't define a handlePong message, websocket.zig
+// will automatically answer any ping with a pong
+pub fn writePong(self: *Client, data: []u8) !void
+
+// lower-level, use by all of the above
+pub fn writeFrame(self: *Client, op_code: proto.OpCode, data: []u8) !void
+```
+
+### Reading
+As seen above, most applications will either chose to call `read()` explicitly or use a `readLoop`. It is **not safe* to call `read` while the read loop is running.
+
+```zig
+// Reads 1 message. Returns null on timeout
+// Set a timeout using `client.readTimeout(ms)`
+pub fn read(self: *Client) !?ws.Message
+
+
+// Starts a readloop in the calling thread. 
+// `@TypeOf(handler)` must define the `serverMessage` callback
+// (and may define other optional callbacks)
+pub fn readLoop(self: *Client, handler: anytype) !void
+
+// Same as `readLoop` but starts the readLoop in a new thread
+pub fn readLoopInNewThread(self: *Client, h: anytype) !std.Thread
+```
+
+### Closing
+Use `try client.close(.{.code = 4000, .reason = "bye"})` to both send a close frame and close the connection. Noop if the connection is already known to be close. Thread safe.
+
+Both `code` and `reason` are optional. Refer to [RFC6455](https://datatracker.ietf.org/doc/html/rfc6455#section-7.4.1) for valid codes. The `reason` must be <= 123 bytes.
+
+
+### Performance Optimization 1 - CA Bundle
+For a high number of connections, it might be beneficial to manage our own CA bundle:
+
+```zig
+// some global data
+var ca_bundle = std.crypto.Certificate.Bundle{}
+try ca_bundle.rescan(allocator);
+defer ca_bundle.deinit(allocator);
+```
+
+And then assign this `ca_bundle` into the the configuration's `ca_bundle` field. This way the library does not have to create and scan the installed CA certificates for each client connection.
+
+### Performance Optimization 2 - Buffer Provider
+For a high nummber of connections a large buffer pool can be created and provided to each client:
+
+```zig
+// Create a buffer pool of 10 buffers, each being 32K
+const buffer_provider = try websocket.bufferProvider(allocator, 10, 32768);
+defer buffer_provider.deinit();
+
+
+// create your client(s) using the above created buffer_provider
+var client = try websocket.connect(allocator, "localhost", 9001, .{
+    ...
+    .buffer_provider = buffer_provider,
+});
+```
+
+This allows each client to have a reasonable `buffer_size` that can accomodate most messages, while having an efficient fallback for the occasional large message. When `max_size` is greater than the large buffer pool size (32K in the above example) or when all pooled buffers are used, a dynamic buffer is created.

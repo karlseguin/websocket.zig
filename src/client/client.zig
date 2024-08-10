@@ -99,7 +99,7 @@ pub const Client = struct {
     }
 
     pub fn deinit(self: *Client) void {
-        self.close();
+        self.closeStream();
 
         const larger_buffer_provider = self._reader.large_buffer_provider;
         const allocator = larger_buffer_provider.allocator;
@@ -115,12 +115,11 @@ pub const Client = struct {
 
     pub fn handshake(self: *Client, path: []const u8, opts: HandshakeOpts) !void {
         const stream = &self.stream;
-        errdefer self.closeWithCode(1002);
+        errdefer self.closeStream();
 
         // we've already setup our reader, and the reader has a static buffer
         // we might as well use it!
         const buf = self._reader.static;
-
         const key = blk: {
             const bin_key = generateKey();
             var encoded_key: [24]u8 = undefined;
@@ -146,7 +145,7 @@ pub const Client = struct {
 
         var reader = &self._reader;
 
-        defer if (comptime std.meta.hasFn(H, "close")) {
+        defer if (comptime std.meta.hasFn(Handler, "close")) {
             handler.close();
         };
 
@@ -154,35 +153,39 @@ pub const Client = struct {
         try self.readTimeout(0);
 
         while (true) {
-            const message = (try self.read()) orelse unreachable;
+            const message = self.read() catch |err| switch (err) {
+                error.Closed => return,
+                else => return err,
+            } orelse unreachable;
+
             const message_type = message.type;
             defer reader.done(message_type);
 
             switch (message_type) {
                 .text, .binary => {
-                    switch (comptime @typeInfo(@TypeOf(Handler.handleMessage)).Fn.params.len) {
-                        2 => try handler.handleMessage(message.data),
-                        3 => try handler.handleMessage(message.data, if (message_type == .text) .text else .binary),
-                        else => @compileError(@typeName(Handler) ++ ".handleMessage must accept 2 or 3 parameters"),
+                    switch (comptime @typeInfo(@TypeOf(Handler.serverMessage)).Fn.params.len) {
+                        2 => try handler.serverMessage(message.data),
+                        3 => try handler.serverMessage(message.data, if (message_type == .text) .text else .binary),
+                        else => @compileError(@typeName(Handler) ++ ".serverMessage must accept 2 or 3 parameters"),
                     }
                 },
-                .ping => if (comptime std.meta.hasFn(Handler, "handlePing")) {
-                    try handler.handlePing(message.data);
+                .ping => if (comptime std.meta.hasFn(Handler, "serverPing")) {
+                    try handler.serverPing(message.data);
                 } else {
                     // @constCast is safe because we know message.data points to
                     // reader.buffer.buf, which we own and which can be mutated
                     try self.writeFrame(.pong, @constCast(message.data));
                 },
                 .close => {
-                    if (comptime std.meta.hasFn(Handler, "handleClose")) {
-                        try handler.handleClose(message.data);
+                    if (comptime std.meta.hasFn(Handler, "serverClose")) {
+                        try handler.serverClose(message.data);
                     } else {
-                        self.close();
+                        self.close(.{}) catch unreachable;
                     }
                     return;
                 },
-                .pong => if (comptime std.meta.hasFn(Handler, "handlePong")) {
-                    try handler.handlePong();
+                .pong => if (comptime std.meta.hasFn(Handler, "serverPong")) {
+                    try handler.serverPong(message.data);
                 },
             }
         }
@@ -196,17 +199,17 @@ pub const Client = struct {
             // try to read a message from our buffer first, before trying to
             // get more data from the socket.
             const has_more, const message = reader.read() catch |err| {
-                self.closeWithCode(1002);
+                self.close(.{ .code = 1002 }) catch unreachable;
                 return err;
             } orelse {
                 reader.fill(stream) catch |err| switch (err) {
                     error.WouldBlock => return null,
                     error.Closed, error.ConnectionResetByPeer, error.BrokenPipe, error.NotOpenForReading => {
-                        _ = @cmpxchgStrong(bool, &self._closed, false, true, .monotonic, .monotonic);
+                        @atomicStore(bool, &self._closed, true, .monotonic);
                         return error.Closed;
                     },
                     else => {
-                        self.closeWithCode(1002);
+                        self.close(.{ .code = 1002 }) catch unreachable;
                         return err;
                     },
                 };
@@ -218,8 +221,8 @@ pub const Client = struct {
         }
     }
 
-    pub fn done(self:* Client, message: proto.Message) void {
-        self.reader.done(message.type);
+    pub fn done(self: *Client, message: proto.Message) void {
+        self._reader.done(message.type);
     }
 
     pub fn readLoopInNewThread(self: *Client, h: anytype) !std.Thread {
@@ -230,7 +233,7 @@ pub const Client = struct {
         self.readLoop(h) catch {};
     }
 
-     pub fn writeTimeout(self: *const Client, ms: u32) !void {
+    pub fn writeTimeout(self: *const Client, ms: u32) !void {
         return self.stream.writeTimeout(ms);
     }
 
@@ -258,6 +261,38 @@ pub const Client = struct {
         return self.writeFrame(.pong, data);
     }
 
+    const CloseOpts = struct {
+        code: ?u16 = null,
+        reason: []const u8 = "",
+    };
+
+    pub fn close(self: *Client, opts: CloseOpts) !void {
+        if (@atomicRmw(bool, &self._closed, .Xchg, true, .monotonic) == true) {
+            // already closed
+            return;
+        }
+
+        defer self.stream.close();
+
+        const code = opts.code orelse {
+            self.writeFrame(.close, "") catch {};
+            return;
+        };
+
+        const reason = opts.reason;
+        if (reason.len > 123) {
+            return error.ReasonTooLong;
+        }
+
+        var buf: [125]u8 = undefined;
+        buf[0] = @intCast((code >> 8) & 0xFF);
+        buf[1] = @intCast(code & 0xFF);
+
+        const end = 2 + reason.len;
+        @memcpy(buf[2..end], reason);
+        self.writeFrame(.close, buf[0..end]) catch {};
+    }
+
     pub fn writeFrame(self: *Client, op_code: proto.OpCode, data: []u8) !void {
         // maximum possible prefix length. op_code + length_type + 8byte length + 4 byte mask
         var buf: [14]u8 = undefined;
@@ -267,29 +302,19 @@ pub const Client = struct {
         const header_end = header.len + 4; // for the mask
 
         buf[1] |= 128; // indicate that the payload is masked
+
         const mask = self._mask_fn();
         @memcpy(buf[header_len..header_end], &mask);
-
         try self.stream.writeAll(buf[0..header_end]);
+
         if (data.len > 0) {
             proto.mask(&mask, data);
             try self.stream.writeAll(data);
         }
     }
 
-    pub fn close(self: *Client) void {
-        if (@cmpxchgStrong(bool, &self._closed, false, true, .monotonic, .monotonic) == null) {
-            self.writeFrame(.close, "") catch {};
-            self.stream.close();
-        }
-    }
-
-    pub fn closeWithCode(self: *Client, code: u16) void {
-        if (@cmpxchgStrong(bool, &self._closed, false, true, .monotonic, .monotonic) == null) {
-            var buf: [2]u8 = undefined;
-            buf[0] = @intCast((code >> 8) & 0xFF);
-            buf[1] = @intCast(code & 0xFF);
-            self.writeFrame(.close, &buf) catch {};
+    fn closeStream(self: *Client) void {
+        if (@atomicRmw(bool, &self._closed, .Xchg, true, .monotonic) == false) {
             self.stream.close();
         }
     }
@@ -311,7 +336,24 @@ pub const Stream = struct {
         if (self.tls_client) |*tls_client| {
             _ = tls_client.writeEnd(self.stream, "", true) catch {};
         }
-        self.stream.close();
+
+        // std.posix.close panics on EBADF
+        // This is a general issue in Zig:
+        // https://github.com/ziglang/zig/issues/6389
+        //
+        // we don't want to crash on double close
+
+        const fd = self.stream.handle;
+        const builtin = @import("builtin");
+        const native_os = builtin.os.tag;
+        if (native_os == .windows) {
+            return std.os.windows.CloseHandle(fd);
+        }
+        if (native_os == .wasi and !builtin.link_libc) {
+            _ = std.os.wasi.fd_close(fd);
+            return;
+        }
+        _ = std.posix.system.close(fd);
     }
 
     pub fn read(self: *Stream, buf: []u8) !usize {
@@ -424,7 +466,10 @@ fn readHandshakeReply(buf: []u8, key: []const u8, opts: *const Client.HandshakeO
     var complete_response: u8 = 0;
 
     while (true) {
-        const n = try stream.read(buf[pos..]);
+        const n = stream.read(buf[pos..]) catch |err| switch (err) {
+            error.WouldBlock => return error.Timeout,
+            else => return err,
+        };
         if (n == 0) {
             return error.ConnectionClosed;
         }
@@ -467,19 +512,19 @@ fn readHandshakeReply(buf: []u8, key: []const u8, opts: *const Client.HandshakeO
                 }
 
                 switch (i) {
-                    7 => if (eql(line[0..i], "upgrade")) {
+                    7 => if (std.mem.eql(u8, line[0..i], "upgrade")) {
                         if (!ascii.eqlIgnoreCase(std.mem.trim(u8, line[i + 1 ..], &ascii.whitespace), "websocket")) {
                             return error.InvalidUpgradeHeader;
                         }
                         complete_response |= 2;
                     },
-                    10 => if (eql(line[0..i], "connection")) {
+                    10 => if (std.mem.eql(u8, line[0..i], "connection")) {
                         if (!ascii.eqlIgnoreCase(std.mem.trim(u8, line[i + 1 ..], &ascii.whitespace), "upgrade")) {
                             return error.InvalidConnectionHeader;
                         }
                         complete_response |= 4;
                     },
-                    20 => if (eql(line[0..i], "sec-websocket-accept")) {
+                    20 => if (std.mem.eql(u8, line[0..i], "sec-websocket-accept")) {
                         var h: [20]u8 = undefined;
                         {
                             var hasher = std.crypto.hash.Sha1.init(.{});
@@ -510,17 +555,6 @@ fn readHandshakeReply(buf: []u8, key: []const u8, opts: *const Client.HandshakeO
             return error.ResponseTooLarge;
         }
     }
-}
-
-// avoids the len check and pointer check of std.mem.eql
-// we can skip the length check because this is only called when a.len == b.len
-fn eql(a: []const u8, b: []const u8) bool {
-    for (a, b) |aa, bb| {
-        if (aa != bb) {
-            return false;
-        }
-    }
-    return true;
 }
 
 const t = @import("../t.zig");
@@ -638,6 +672,89 @@ test "Client: handshake" {
     }
 }
 
+test "Client: write/read" {
+    var client = try Client.init(t.allocator, .{
+        .port = 9292,
+        .host = "127.0.0.1",
+    });
+    defer client.deinit();
+
+    try client.handshake("/", .{
+        .timeout_ms = 1000,
+    });
+
+    var buf = [_]u8{ 'o', 'v', 'e', 'r' };
+    try client.write(&buf);
+    try client.readTimeout(1000);
+
+    const message = (try client.read()) orelse unreachable;
+    try t.expectEqual(.text, message.type);
+    try t.expectString("9000", message.data);
+
+    client.close(.{}) catch unreachable;
+}
+
+test "Client: close with code" {
+    var client = try Client.init(t.allocator, .{
+        .port = 9292,
+        .host = "127.0.0.1",
+    });
+    defer client.deinit();
+
+    try client.handshake("/", .{
+        .timeout_ms = 1000,
+    });
+
+    client.close(.{ .code = 4002 }) catch unreachable;
+}
+
+test "Client: with code and reason" {
+    var client = try Client.init(t.allocator, .{
+        .port = 9292,
+        .host = "127.0.0.1",
+    });
+    defer client.deinit();
+
+    try client.handshake("/", .{
+        .timeout_ms = 1000,
+    });
+
+    client.close(.{ .code = 4002, .reason = "goodbye" }) catch unreachable;
+}
+
+test "Client: Handler" {
+    var h = try ClientHandler.init(t.allocator);
+    defer h.deinit();
+
+    var buf: [6]u8 = undefined;
+    {
+        @memcpy(buf[0..3], "dyn");
+        try h.client.write(buf[0..3]);
+    }
+
+    {
+        @memcpy(buf[0..4], "ping");
+        try h.client.write(buf[0..4]);
+    }
+
+    {
+        @memcpy(buf[0..4], "pong");
+        try h.client.write(buf[0..4]);
+    }
+
+    {
+        @memcpy(buf[0..6], "close1");
+        try h.client.write(buf[0..6]);
+    }
+
+    try h.client.readLoop(&h);
+
+    // if pong is true then ping and message have to be true
+    // because each asserts the previous
+    try t.expectEqual(true, h.pong);
+    try t.expectEqual(true, h.closed);
+}
+
 fn testClient(stream: net.Stream) Client {
     const bp = t.allocator.create(buffer.Provider) catch unreachable;
     bp.* = buffer.Provider.init(t.allocator, .{ .count = 0, .size = 0, .max = 4096 }) catch unreachable;
@@ -652,3 +769,55 @@ fn testClient(stream: net.Stream) Client {
         ._reader = Reader.init(reader_buf, bp),
     };
 }
+
+const ClientHandler = struct {
+    ping: bool = false,
+    pong: bool = false,
+    closed: bool = false,
+    message: bool = false,
+    client: Client,
+
+    fn init(allocator: Allocator) !ClientHandler {
+        var client = try Client.init(allocator, .{
+            .port = 9292,
+            .host = "127.0.0.1",
+        });
+        errdefer client.deinit();
+
+        try client.handshake("/", .{
+            .timeout_ms = 1000,
+        });
+
+        return .{
+            .client = client,
+        };
+    }
+
+    fn deinit(self: *ClientHandler) void {
+        std.debug.print("h-deinit\n", .{});
+        self.client.deinit();
+    }
+
+    pub fn serverMessage(self: *ClientHandler, data: []u8, tpe: proto.Message.TextType) !void {
+        try t.expectEqual(.text, tpe);
+        try t.expectString("over 9000!", data);
+        self.message = true;
+    }
+
+    pub fn serverPing(self: *ClientHandler, data: []u8) !void {
+        try t.expectEqual(true, self.message);
+        try t.expectString("a-ping", data);
+        self.ping = true;
+    }
+
+    pub fn serverPong(self: *ClientHandler, data: []u8) !void {
+        try t.expectEqual(true, self.ping);
+        try t.expectString("a-pong", data);
+        self.pong = true;
+    }
+
+    pub fn close(self: *ClientHandler) void {
+        self.client.close(.{}) catch unreachable;
+        self.closed = true;
+    }
+};

@@ -652,7 +652,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
             } else {
                 self.loop.monitorRead(hc, true) catch |err| {
                     log.debug("({}) failed to add read event monitor: {}", .{ conn.address, err });
-                     conn.closeSocket();
+                    conn.closeSocket();
                     self.base.cleanupConn(hc);
                 };
             }
@@ -1355,7 +1355,7 @@ pub const Conn = struct {
         }
 
         pub fn writer(self: *Writer) IOWriter {
-            return .{.context = self};
+            return .{ .context = self };
         }
 
         pub fn write(self: *Writer, data: []const u8) Allocator.Error!usize {
@@ -1442,7 +1442,7 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
 
     if (comptime std.meta.hasFn(H, "afterInit")) {
         const params = @typeInfo(@TypeOf(H.afterInit)).Fn.params;
-        const res = if (params.len == 1) handler.afterInit() else handler.afterInit(ctx);
+        const res = if (params.len == 1) hc.handler.?.afterInit() else hc.handler.?.afterInit(ctx);
         res catch |err| {
             log.debug("({}) " ++ @typeName(H) ++ ".afterInit error: {}", .{ conn.address, err });
             return false;
@@ -1530,7 +1530,7 @@ fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator
                 }
             },
             .pong => if (comptime std.meta.hasFn(H, "clientPong")) {
-                try handler.clientPong();
+                try handler.clientPong(message.data);
             },
             .ping => {
                 const data = message.data;
@@ -1854,7 +1854,11 @@ const TestHandler = struct {
             .conn = conn,
         };
     }
-    pub fn clientMessage(self: *TestHandler, allocator: Allocator, data: []const u8,) !void {
+    pub fn clientMessage(
+        self: *TestHandler,
+        allocator: Allocator,
+        data: []const u8,
+    ) !void {
         if (std.mem.eql(u8, data, "over")) {
             return self.conn.writeText("9000");
         }
@@ -1866,14 +1870,22 @@ const TestHandler = struct {
             try std.fmt.format(wb.writer(), "{d}!!!", .{9000});
             return wb.flush();
         }
+        if (std.mem.eql(u8, data, "ping")) {
+            var buf = [_]u8{ 'a', '-', 'p', 'i', 'n', 'g' };
+            return self.conn.writePing(&buf);
+        }
+        if (std.mem.eql(u8, data, "pong")) {
+            var buf = [_]u8{ 'a', '-', 'p', 'o', 'n', 'g' };
+            return self.conn.writePong(&buf);
+        }
         if (std.mem.eql(u8, data, "close1")) {
             return self.conn.close(.{});
         }
         if (std.mem.eql(u8, data, "close2")) {
-            return self.conn.close(.{.code = 123});
+            return self.conn.close(.{ .code = 123 });
         }
         if (std.mem.eql(u8, data, "close3")) {
-            return self.conn.close(.{.code = 234, .reason = "bye"});
+            return self.conn.close(.{ .code = 234, .reason = "bye" });
         }
     }
 };

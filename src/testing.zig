@@ -23,7 +23,6 @@ pub const Testing = struct {
         arena.* = std.heap.ArenaAllocator.init(t.allocator);
         errdefer arena.deinit();
 
-
         const pair = t.SocketPair.init();
         const timeout = std.mem.toBytes(std.posix.timeval{
             .sec = 0,

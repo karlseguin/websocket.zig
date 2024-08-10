@@ -4,7 +4,7 @@ const builtin = @import("builtin");
 
 pub const Message = struct {
     type: Type,
-    data: []const u8,
+    data: []u8,
 
     pub const Type = enum {
         text,
