@@ -1,0 +1,8 @@
+.{
+	.name = "autobahn_test_server",
+	.paths = .{""},
+	.version = "0.0.0",
+	.dependencies = .{
+		.websocket = .{.path = "../../../"},
+	},
+}
