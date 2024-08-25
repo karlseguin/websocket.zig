@@ -1139,7 +1139,7 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
         }
 
         pub fn inactive(self: *Self, hc: *HandlerConn(H)) void {
-            std.debug.assert(MANAGE_HS == false);
+            std.debug.assert(MANAGE_HS == true);
 
             // this should only be called when we need more data to complete the handshake
             // which should only happen on an active connection
