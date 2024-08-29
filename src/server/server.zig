@@ -1441,7 +1441,7 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
     try conn.writeFramed(&Handshake.createReply(handshake.key));
 
     if (comptime std.meta.hasFn(H, "afterInit")) {
-        const params = @typeInfo(@TypeOf(H.afterInit)).Fn.params;
+        const params = @typeInfo(@TypeOf(H.afterInit)).@"fn".params;
         const res = if (params.len == 1) hc.handler.?.afterInit() else hc.handler.?.afterInit(ctx);
         res catch |err| {
             log.debug("({}) " ++ @typeName(H) ++ ".afterInit error: {}", .{ conn.address, err });
@@ -1493,7 +1493,7 @@ fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator
         log.debug("({}) received {s} message", .{ hc.conn.address, @tagName(message_type) });
         switch (message_type) {
             .text, .binary => {
-                const params = @typeInfo(@TypeOf(H.clientMessage)).Fn.params;
+                const params = @typeInfo(@TypeOf(H.clientMessage)).@"fn".params;
                 const needs_allocator = comptime needsAllocator(H);
 
                 var arena: std.heap.ArenaAllocator = undefined;
@@ -1597,7 +1597,7 @@ fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator
 }
 
 fn needsAllocator(comptime H: type) bool {
-    const params = @typeInfo(@TypeOf(H.clientMessage)).Fn.params;
+    const params = @typeInfo(@TypeOf(H.clientMessage)).@"fn".params;
     return comptime params[1].type == Allocator;
 }
 

@@ -138,8 +138,8 @@ pub const Client = struct {
     pub fn readLoop(self: *Client, handler: anytype) !void {
         const H = @TypeOf(handler);
         const Handler = switch (@typeInfo(H)) {
-            .Struct => H,
-            .Pointer => |ptr| ptr.child,
+            .@"struct" => H,
+            .pointer => |ptr| ptr.child,
             else => @compileError("readLoop handler must be a struct, got: " ++ @tagName(@typeInfo(H))),
         };
 
@@ -163,7 +163,7 @@ pub const Client = struct {
 
             switch (message_type) {
                 .text, .binary => {
-                    switch (comptime @typeInfo(@TypeOf(Handler.serverMessage)).Fn.params.len) {
+                    switch (comptime @typeInfo(@TypeOf(Handler.serverMessage)).@"fn".params.len) {
                         2 => try handler.serverMessage(message.data),
                         3 => try handler.serverMessage(message.data, if (message_type == .text) .text else .binary),
                         else => @compileError(@typeName(Handler) ++ ".serverMessage must accept 2 or 3 parameters"),
@@ -794,7 +794,6 @@ const ClientHandler = struct {
     }
 
     fn deinit(self: *ClientHandler) void {
-        std.debug.print("h-deinit\n", .{});
         self.client.deinit();
     }
 
