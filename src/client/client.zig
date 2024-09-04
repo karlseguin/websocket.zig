@@ -10,6 +10,26 @@ const Reader = proto.Reader;
 const Allocator = std.mem.Allocator;
 const Bundle = std.crypto.Certificate.Bundle;
 
+fn ReadLoopHandler(comptime T: type) type {
+    const info = @typeInfo(T);
+
+    switch (info) {
+        .@"struct" => |struct_info| {
+            if (struct_info.is_tuple)
+                @compileError("readLoop: handler does not support tuples.");
+
+            return T;
+        },
+        .pointer => |ptr_info| {
+            switch (ptr_info.size) {
+                .One => return ReadLoopHandler(ptr_info.child),
+                else => @compileError("readLoop: handler does not support Slice, C and Many pointers."),
+            }
+        },
+        else => @compileError("readLoop: expected handler to be a struct or pointer to a struct but found '" ++ @tagName(info) ++ "'"),
+    }
+}
+
 pub const Client = struct {
     stream: Stream,
     _reader: Reader,
@@ -136,13 +156,7 @@ pub const Client = struct {
     }
 
     pub fn readLoop(self: *Client, handler: anytype) !void {
-        const H = @TypeOf(handler);
-        const Handler = switch (@typeInfo(H)) {
-            .@"struct" => H,
-            .pointer => |ptr| ptr.child,
-            else => @compileError("readLoop handler must be a struct, got: " ++ @tagName(@typeInfo(H))),
-        };
-
+        const Handler = ReadLoopHandler(@TypeOf(handler));
         var reader = &self._reader;
 
         defer if (comptime std.meta.hasFn(Handler, "close")) {
