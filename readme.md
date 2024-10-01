@@ -548,7 +548,7 @@ Whether you're calling `client.read()` explicitly or using `client.readLoopInNew
 ### Writing
 It may come as a surprise, but every variation of `write` expects a `[]u8`, not a `[]const u8`. Websocket payloads sent from a client need to be masked, which the websocket.zig library handles. It is obviously more efficient to mutate the given payload versus creating a copy. By taking a `[]u8`, applications with mutable buffers benefit from avoiding the clone. Applications that have immutable buffers will need to create a mutable clone.
 
-```
+```zig
 // write a text message
 pub fn write(self: *Client, data: []u8) !void
 
