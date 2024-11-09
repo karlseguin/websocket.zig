@@ -78,7 +78,10 @@ pub const Client = struct {
             defer if (own_bundle) {
                 bundle.deinit(allocator);
             };
-            tls_client = try tls.Client.init(net_stream, bundle, config.host);
+            tls_client = try tls.Client.init(net_stream, .{
+                .host = .{ .explicit = config.host },
+                .ca = .{ .bundle = bundle },
+            });
         }
         const stream = Stream.init(net_stream, tls_client);
 
