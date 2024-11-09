@@ -318,7 +318,7 @@ pub const Config = struct {
 websocket.zig uses Zig's built-in scope logging. You can control the log level by having an `std_options` decleration in your program's main file:
 
 ```zig
-pub const std_options = .{
+pub const std_options = std.Options{
     .log_scope_levels = &[_]std.log.ScopeLevel{
         .{ .scope = .websocket, .level = .err },
     }
