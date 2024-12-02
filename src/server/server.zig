@@ -1413,6 +1413,10 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
 
     state.len = len + n;
     const handshake = Handshake.parse(state) catch |err| {
+        if (err == error.JSONVersion) {
+            try printJSONVersion(worker.allocator, conn, ctx.ws_host, ctx.ws_port);
+            return false;
+        }
         log.debug("({}) error parsing handshake: {}", .{ conn.address, err });
         respondToHandshakeError(conn, err);
         return false;
@@ -1616,6 +1620,17 @@ fn respondToHandshakeError(conn: *Conn, err: anyerror) void {
         error.Empty => buildError(400, "invalid request"),
         else => buildError(400, "unknown"),
     };
+    preHandOffWrite(conn, response);
+}
+
+fn printJSONVersion(alloc: Allocator, conn: *Conn, host: []const u8, port: u16) !void {
+    const json = "{{\"webSocketDebuggerUrl\": \"ws://{s}:{d}/\"}}\r\n";
+    const content = try std.fmt.allocPrint(alloc, json, .{ host, port });
+    defer alloc.free(content);
+
+    const resp = "HTTP/1.1 200 OK\r\nContent-Length:{d}\r\nContent-Type:application/json; charset=UTF-8\r\n\r\n{s}";
+    const response = try std.fmt.allocPrint(alloc, resp, .{ content.len, content });
+    defer alloc.free(response);
     preHandOffWrite(conn, response);
 }
 
