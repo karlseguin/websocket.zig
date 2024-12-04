@@ -27,6 +27,11 @@ pub const Handshake = struct {
         const request_line_end = std.mem.indexOfScalar(u8, buf, '\r') orelse unreachable;
         var request_line = buf[0..request_line_end];
 
+        // Horrible hack to handle HTTP /json/version route
+        if (std.mem.eql(u8, request_line, "GET /json/version HTTP/1.1")) {
+            return error.JSONVersion;
+        }
+
         if (!ascii.endsWithIgnoreCase(request_line, "http/1.1")) {
             return error.InvalidProtocol;
         }
