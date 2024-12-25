@@ -2,6 +2,11 @@ const std = @import("std");
 const buffer = @import("buffer.zig");
 const builtin = @import("builtin");
 
+const backend_supports_vectors = switch (builtin.zig_backend) {
+    .stage2_llvm, .stage2_c => true,
+    else => false,
+};
+
 pub const Message = struct {
     type: Type,
     data: []u8,
@@ -417,6 +422,9 @@ const Fragmented = struct {
 
 pub fn mask(m: []const u8, payload: []u8) void {
     var data = payload;
+
+    if (!comptime backend_supports_vectors) return simpleMask(m, data);
+
     const vector_size = std.simd.suggestVectorLength(u8) orelse @sizeOf(usize);
     if (data.len >= vector_size) {
         const mask_vector = std.simd.repeat(vector_size, @as(@Vector(4, u8), m[0..4].*));
