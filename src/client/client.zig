@@ -22,7 +22,7 @@ fn ReadLoopHandler(comptime T: type) type {
         },
         .pointer => |ptr_info| {
             switch (ptr_info.size) {
-                .One => return ReadLoopHandler(ptr_info.child),
+                .one => return ReadLoopHandler(ptr_info.child),
                 else => @compileError("readLoop: handler does not support Slice, C and Many pointers."),
             }
         },
