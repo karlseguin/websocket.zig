@@ -20,7 +20,7 @@ pub fn build(b: *std.Build) !void {
             .root_source_file = b.path("src/websocket.zig"),
             .target = target,
             .optimize = optimize,
-            .test_runner = b.path("test_runner.zig"),
+            .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
         });
         tests.linkLibC();
         const force_blocking = b.option(bool, "force_blocking", "Force blocking mode") orelse false;
