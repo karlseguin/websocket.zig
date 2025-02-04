@@ -8,8 +8,6 @@ pub const Message = proto.Message;
 pub const MessageType = Message.Type;
 pub const MessageTextType = Message.TextType;
 
-pub const Client = @import("client/client.zig").Client;
-
 pub const server = @import("server/server.zig");
 pub const testing = @import("testing.zig");
 

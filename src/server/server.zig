@@ -26,22 +26,8 @@ const EMPTY_PONG = ([2]u8{ @intFromEnum(OpCode.pong), 0 })[0..];
 const CLOSE_NORMAL = ([_]u8{ @intFromEnum(OpCode.close), 2, 3, 232 })[0..]; // code: 1000
 const CLOSE_PROTOCOL_ERROR = ([_]u8{ @intFromEnum(OpCode.close), 2, 3, 234 })[0..]; //code: 1002
 
-const force_blocking: bool = blk: {
-    const root = @import("root");
-    if (@hasDecl(root, "websocket_blocking")) {
-        break :blk root.websocket_blocking;
-    }
-    break :blk false;
-};
-
 pub fn blockingMode() bool {
-    if (force_blocking) {
-        return true;
-    }
-    return switch (builtin.os.tag) {
-        .linux, .macos, .ios, .tvos, .watchos, .freebsd, .netbsd, .dragonfly, .openbsd => false,
-        else => true,
-    };
+    return true;
 }
 
 pub const Config = struct {
@@ -1445,7 +1431,7 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
     try conn.writeFramed(&Handshake.createReply(handshake.key));
 
     if (comptime std.meta.hasFn(H, "afterInit")) {
-        const params = @typeInfo(@TypeOf(H.afterInit)).@"fn".params;
+        const params = @typeInfo(@TypeOf(H.afterInit)).Fn.params;
         const res = if (params.len == 1) hc.handler.?.afterInit() else hc.handler.?.afterInit(ctx);
         res catch |err| {
             log.debug("({}) " ++ @typeName(H) ++ ".afterInit error: {}", .{ conn.address, err });
@@ -1726,7 +1712,7 @@ test "tests:beforeAll" {
         .port = 9292,
         .address = "127.0.0.1",
     });
-    test_thread = try test_server.listenInNewThread({});
+    test_thread = try test_server.listenInNewThread(.{.ws_host = "127.0.0.1", .ws_port = 9292});
 }
 
 test "tests:afterAll" {
@@ -1830,7 +1816,7 @@ test "Conn: close" {
 }
 
 fn testStream(handshake: bool) !net.Stream {
-    const timeout = std.mem.toBytes(std.posix.timeval{ .sec = 0, .usec = 20_000 });
+    const timeout = std.mem.toBytes(std.posix.timeval{ .tv_sec = 0, .tv_usec = 20_000 });
     const address = try std.net.Address.parseIp("127.0.0.1", 9292);
     const stream = try std.net.tcpConnectToAddress(address);
     try std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &timeout);
@@ -1863,7 +1849,7 @@ fn testStream(handshake: bool) !net.Stream {
 const TestHandler = struct {
     conn: *Conn,
 
-    pub fn init(h: Handshake, conn: *Conn, _: void) !TestHandler {
+    pub fn init(h: Handshake, conn: *Conn, _: anytype) !TestHandler {
         try t.expectString("upgrade", h.headers.get("connection").?);
         return .{
             .conn = conn,
