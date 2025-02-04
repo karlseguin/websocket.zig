@@ -94,7 +94,7 @@ const Handler = struct {
                 if (std.unicode.utf8ValidateSlice(data)) {
                     try self.conn.writeText(data);
                 } else {
-                    self.conn.close(.{.code = 1007}) catch {};
+                    self.conn.close(.{ .code = 1007 }) catch {};
                 }
             },
         }

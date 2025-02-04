@@ -1,11 +1,11 @@
 .{
-	.name = "websocket",
-	.version = "0.1.0",
-	.dependencies = .{},
-	.paths = .{
-		"readme.md",
-		"build.zig",
-		"build.zig.zon",
-		"src",
-	},
+    .name = "websocket",
+    .version = "0.1.0",
+    .dependencies = .{},
+    .paths = .{
+        "readme.md",
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
 }

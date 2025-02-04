@@ -1712,7 +1712,7 @@ test "tests:beforeAll" {
         .port = 9292,
         .address = "127.0.0.1",
     });
-    test_thread = try test_server.listenInNewThread(.{.ws_host = "127.0.0.1", .ws_port = 9292});
+    test_thread = try test_server.listenInNewThread(.{ .ws_host = "127.0.0.1", .ws_port = 9292 });
 }
 
 test "tests:afterAll" {
