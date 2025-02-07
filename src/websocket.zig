@@ -38,6 +38,11 @@ comptime {
 const t = @import("t.zig");
 test "frameText" {
     {
+        const framed = frameText("");
+        try t.expectString(&[_]u8{ 129, 0}, &framed);
+    }
+
+    {
         // short
         const framed = frameText("hello");
         try t.expectString(&[_]u8{ 129, 5, 'h', 'e', 'l', 'l', 'o' }, &framed);

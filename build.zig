@@ -29,7 +29,6 @@ pub fn build(b: *std.Build) !void {
         tests.root_module.addOptions("build", options);
 
         const run_test = b.addRunArtifact(tests);
-        run_test.has_side_effects = true;
 
         const test_step = b.step("test", "Run tests");
         test_step.dependOn(&run_test.step);

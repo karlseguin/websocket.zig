@@ -149,7 +149,7 @@ pub const Reader = struct {
             if (message_len == 0) {
                 masked, length_of_len = payloadMeta(byte2);
 
-                // + 1 for the first byte
+                // + 2 for the first 2 bytes
                 if (buf.len < length_of_len + 2) {
                     // at this point, we don't have enough bytes to know the length of
                     // the message. We need more data
