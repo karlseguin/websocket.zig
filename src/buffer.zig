@@ -13,6 +13,63 @@ pub const Buffer = struct {
     };
 };
 
+pub const Writer = struct {
+    buf: []u8,
+    pos: usize = 0,
+    pooled: bool,
+    provider: *Provider,
+
+    pub fn deinit(self: *Writer) void {
+        if (self.pooled) {
+            self.provider.pool.release(self.buf);
+        } else {
+            self.provider.allocator.free(self.buf);
+        }
+    }
+
+    pub fn writeAll(self: *Writer, data: []const u8) !void {
+        const pos = self.pos;
+        const total_len = pos + data.len;
+        if (total_len > self.provider.max_buffer_size) {
+            return error.TooLarge;
+        }
+        try self.ensureTotalCapacity(total_len);
+
+        @memcpy(self.buf[pos..total_len], data);
+        self.pos = total_len;
+    }
+
+    fn ensureTotalCapacity(self: *Writer, required_capacity: usize) !void {
+        const buf = self.buf;
+        if (required_capacity <= buf.len) {
+            return;
+        }
+
+        // from std.ArrayList
+        var new_capacity = buf.len;
+        while (true) {
+            new_capacity +|= new_capacity / 2 + 8;
+            if (new_capacity >= required_capacity) break;
+        }
+
+        const allocator = self.provider.allocator;
+        if (self.pooled or !allocator.resize(buf, new_capacity)) {
+            const new_buffer = try allocator.alloc(u8, new_capacity);
+            @memcpy(new_buffer[0..buf.len], buf);
+
+            if (self.pooled) {
+                self.provider.pool.release(buf);
+            }
+
+            self.buf = new_buffer;
+            self.pooled = false;
+        } else {
+            const new_buffer = buf.ptr[0..new_capacity];
+            self.buf = new_buffer;
+        }
+    }
+};
+
 pub const Config = struct {
     count: u16 = 1,
     size: usize = 65536,

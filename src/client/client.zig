@@ -117,7 +117,7 @@ pub const Client = struct {
             ._closed = false,
             ._own_bp = own_bp,
             ._mask_fn = config.mask_fn,
-            ._reader = Reader.init(reader_buf, buffer_provider),
+            ._reader = Reader.init(reader_buf, buffer_provider, null),
         };
     }
 
@@ -313,7 +313,7 @@ pub const Client = struct {
     pub fn writeFrame(self: *Client, op_code: proto.OpCode, data: []u8) !void {
         // maximum possible prefix length. op_code + length_type + 8byte length + 4 byte mask
         var buf: [14]u8 = undefined;
-        const header = proto.writeFrameHeader(&buf, op_code, data.len);
+        const header = proto.writeFrameHeader(&buf, op_code, data.len, false);
 
         const header_len = header.len;
         const header_end = header.len + 4; // for the mask
@@ -783,7 +783,7 @@ fn testClient(stream: net.Stream) Client {
         ._own_bp = true,
         ._mask_fn = generateMask,
         .stream = .{ .stream = stream },
-        ._reader = Reader.init(reader_buf, bp),
+        ._reader = Reader.init(reader_buf, bp, null),
     };
 }
 

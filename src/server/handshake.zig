@@ -3,8 +3,18 @@ const std = @import("std");
 const posix = std.posix;
 const ascii = std.ascii;
 const Allocator = std.mem.Allocator;
+const websocket = @import("../websocket.zig");
 
 const M = @This();
+
+const SpecialHeader = enum {
+    none,
+    upgrade,
+    connection,
+    @"sec-websocket-key",
+    @"sec-websocket-version",
+    @"sec-websocket-extensions",
+};
 
 pub const Handshake = struct {
     url: []const u8,
@@ -12,8 +22,16 @@ pub const Handshake = struct {
     method: []const u8,
     headers: *KeyValue,
     raw_header: []const u8,
+    compression: Compression,
 
     pub const Pool = M.Pool;
+
+    const Compression = struct {
+        enabled: bool,
+        server_max_bits: u8,
+        client_no_context_takeover: bool,
+        server_no_context_takeover: bool,
+    };
 
     // returns null if the request isn't full
     pub fn parse(state: *State) !?Handshake {
@@ -36,6 +54,11 @@ pub const Handshake = struct {
         var key: []const u8 = "";
         var required_headers: u8 = 0;
 
+        var deflate = false;
+        var server_max_bits: u8 = 15;
+        var client_no_context_takeover = false;
+        var server_no_context_takeover = false;
+
         var request_length = request_line_end;
 
         buf = buf[request_line_end + 2 ..];
@@ -48,15 +71,14 @@ pub const Handshake = struct {
             const value = std.mem.trim(u8, buf[(separator + 1)..index], &ascii.whitespace);
 
             headers.add(name, value);
-
-            switch (name.len) {
-                7 => if (eql("upgrade", name)) {
-                    if (!ascii.eqlIgnoreCase("websocket", value)) {
+            switch (std.meta.stringToEnum(SpecialHeader, name) orelse .none) {
+                .upgrade => {
+                  if (!ascii.eqlIgnoreCase("websocket", value)) {
                         return error.InvalidUpgrade;
                     }
                     required_headers |= 1;
                 },
-                10 => if (eql("connection", name)) {
+                .connection => {
                     // find if connection header has upgrade in it, example header:
                     // Connection: keep-alive, Upgrade
                     if (std.ascii.indexOfIgnoreCase(value, "upgrade") == null) {
@@ -64,17 +86,41 @@ pub const Handshake = struct {
                     }
                     required_headers |= 4;
                 },
-                17 => if (eql("sec-websocket-key", name)) {
+                .@"sec-websocket-key" => {
                     key = value;
                     required_headers |= 8;
                 },
-                21 => if (eql("sec-websocket-version", name)) {
+                .@"sec-websocket-version" => {
                     if (value.len != 2 or value[0] != '1' or value[1] != '3') {
                         return error.InvalidVersion;
                     }
                     required_headers |= 2;
                 },
-                else => {},
+                .@"sec-websocket-extensions" => {
+                    var it = std.mem.splitScalar(u8, value, ';');
+                    while (it.next()) |param_| {
+                        const param = std.mem.trim(u8, param_, &ascii.whitespace);
+                        if (std.mem.eql(u8, param, "permessage-deflate")) {
+                            deflate = true;
+                            continue;
+                        }
+                        if (std.mem.eql(u8, param, "client_no_context_takeover")) {
+                            client_no_context_takeover = true;
+                            continue;
+                        }
+                        if (std.mem.eql(u8, param, "server_no_context_takeover")) {
+                            server_no_context_takeover = true;
+                            continue;
+                        }
+                        const server_max_window_bits = "server_max_window_bits=";
+                        if (std.mem.startsWith(u8, param, server_max_window_bits)) {
+                            server_max_bits = std.fmt.parseInt(u8, param[server_max_window_bits.len..], 10) catch {
+                                return error.InvalidCompressionServerMaxBits;
+                            };
+                        }
+                    }
+                },
+                .none => {},
             }
 
             const next = index + 2;
@@ -98,32 +144,63 @@ pub const Handshake = struct {
             .method = method,
             .headers = headers,
             .raw_header = request[request_line_end + 2 .. request_length + 2],
+            .compression = .{
+                .enabled = deflate,
+                .server_max_bits = server_max_bits,
+                .client_no_context_takeover = client_no_context_takeover,
+                .server_no_context_takeover = server_no_context_takeover,
+            },
         };
     }
 
-    pub fn createReply(key: []const u8) [129]u8 {
-        // HTTP/1.1 101 Switching Protocols\r\n
-        // Upgrade: websocket\r\n
-        // Connection: upgrade\r\n
-        // Sec-Websocket-Accept: BASE64_ENCODED_KEY_HASH_PLACEHOLDER_000\r\n\r\n
-        var buf = [_]u8{
-            'H', 'T', 'T', 'P', '/', '1', '.', '1', ' ', '1', '0', '1', ' ', 'S', 'w', 'i', 't', 'c', 'h', 'i', 'n', 'g', ' ', 'P', 'r', 'o', 't', 'o', 'c', 'o', 'l', 's', '\r', '\n',
-            'U', 'p', 'g', 'r', 'a', 'd', 'e', ':', ' ', 'w', 'e', 'b', 's', 'o', 'c', 'k', 'e', 't', '\r', '\n',
-            'C', 'o', 'n', 'n', 'e', 'c', 't', 'i', 'o', 'n', ':', ' ', 'u', 'p', 'g', 'r', 'a', 'd', 'e', '\r', '\n',
-            'S', 'e', 'c', '-', 'W', 'e', 'b', 's', 'o', 'c', 'k', 'e', 't', '-', 'A', 'c', 'c', 'e', 'p', 't', ':', ' ', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            '\r', '\n', '\r', '\n'
-        };
-        const key_pos = buf.len - 32;
+    pub fn createReply(key: []const u8, compression: ?websocket.Compression, buf: []u8) []const u8 {
+        const HEADER =
+            "HTTP/1.1 101 Switching Protocols\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: upgrade\r\n" ++
+            "Sec-Websocket-Accept: "
+        ;
 
-        var h: [20]u8 = undefined;
-        var hasher = std.crypto.hash.Sha1.init(.{});
-        hasher.update(key);
-        // websocket spec always used this value
-        hasher.update("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-        hasher.final(&h);
+        @memcpy(buf[0..HEADER.len], HEADER);
+        var pos = HEADER.len;
 
-        _ = std.base64.standard.Encoder.encode(buf[key_pos .. key_pos + 28], h[0..]);
-        return buf;
+        {
+            var h: [20]u8 = undefined;
+            var hasher = std.crypto.hash.Sha1.init(.{});
+            hasher.update(key);
+            // websocket spec always used this value
+            hasher.update("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+            hasher.final(&h);
+
+            const end = pos + 28;
+            _ = std.base64.standard.Encoder.encode(buf[pos..end], h[0..]);
+            pos = end;
+        }
+
+        if (compression) |c| {
+            {
+                const permessage_deflate = "\r\nSec-WebSocket-Extensions: permessage-deflate";
+                const end = pos + permessage_deflate.len;
+                @memcpy(buf[pos..end], permessage_deflate);
+                pos = end;
+            }
+            if (c.server_no_context_takeover) {
+                const server_no_context_takeover = "; server_no_context_takeover";
+                const end = pos + server_no_context_takeover.len;
+                @memcpy(buf[pos..end], server_no_context_takeover);
+                pos = end;
+            }
+            if (c.client_no_context_takeover) {
+                const client_no_context_takeover = "; client_no_context_takeover";
+                const end = pos + client_no_context_takeover.len;
+                @memcpy(buf[pos..end], client_no_context_takeover);
+                pos = end;
+            }
+        }
+
+        const end = pos + 4;
+        @memcpy(buf[pos..end], "\r\n\r\n");
+        return buf[0..end];
     }
 
     // This is what we're pooling
@@ -350,18 +427,6 @@ fn toLower(str: []u8) []u8 {
     return str;
 }
 
-// avoids the len check and pointer check of std.mem.eql
-// we can skip the length check because this is only called when a.len == b.len
-fn eql(a: []const u8, b: []const u8) bool {
-    for (a, b) |aa, bb| {
-        if (aa != bb) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
 const t = @import("../t.zig");
 test "handshake: parse" {
     var pool = try Pool.init(t.allocator, 1, 512, 10);
@@ -430,8 +495,44 @@ test "handshake: parse" {
 }
 
 test "handshake: reply" {
-    const expected = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: upgrade\r\nSec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n\r\n";
-    try t.expectString(expected, &Handshake.createReply("this is my key"));
+    var buf: [512]u8 = undefined;
+    {
+        // no compression
+        const expected =
+            "HTTP/1.1 101 Switching Protocols\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: upgrade\r\n" ++
+            "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n\r\n"
+        ;
+        try t.expectString(expected, Handshake.createReply("this is my key", null, &buf));
+    }
+
+    {
+        // compression
+        const expected =
+            "HTTP/1.1 101 Switching Protocols\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: upgrade\r\n" ++
+            "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n" ++
+            "Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n"
+        ;
+        try t.expectString(expected, Handshake.createReply("this is my key", .{}, &buf));
+    }
+
+    {
+        // compression
+        const expected =
+            "HTTP/1.1 101 Switching Protocols\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: upgrade\r\n" ++
+            "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n" ++
+            "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n\r\n"
+        ;
+        try t.expectString(expected, Handshake.createReply("this is my key", .{
+            .client_no_context_takeover = true,
+            .server_no_context_takeover = true,
+        }, &buf));
+    }
 }
 
 test "KeyValue: get" {

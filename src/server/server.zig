@@ -15,6 +15,7 @@ const OpCode = proto.OpCode;
 const Reader = proto.Reader;
 const Message = proto.Message;
 pub const Handshake = @import("handshake.zig").Handshake;
+const Compression = @import("../websocket.zig").Compression;
 const FallbackAllocator = @import("fallback_allocator.zig").FallbackAllocator;
 
 const DEFAULT_MAX_CONN = 16_384;
@@ -57,6 +58,7 @@ pub const Config = struct {
     handshake: Config.Handshake = .{},
     thread_pool: ThreadPool = .{},
     buffers: Config.Buffers = .{},
+    compression: ?Compression = null,
 
     pub const ThreadPool = struct {
         count: ?u16 = null,
@@ -64,14 +66,14 @@ pub const Config = struct {
         buffer_size: ?usize = null,
     };
 
-    const Handshake = struct {
+    pub const Handshake = struct {
         timeout: u32 = 10,
         max_size: ?u16 = null,
         max_headers: ?u16 = null,
         count: ?u16 = null,
     };
 
-    const Buffers = struct {
+    pub const Buffers = struct {
         small_size: ?usize = null,
         small_pool: ?usize = null,
         large_size: ?usize = null,
@@ -285,6 +287,7 @@ pub fn Blocking(comptime H: type) type {
         conn_manager: ConnManager(H, false),
         handshake_pool: *Handshake.Pool,
         buffer_provider: *buffer.Provider,
+        compression: ?Compression,
 
         const Timeout = struct {
             sec: u32,
@@ -312,6 +315,7 @@ pub fn Blocking(comptime H: type) type {
             return .{
                 .conn_manager = conn_manager,
                 .allocator = allocator,
+                .compression = config.compression,
                 .handshake_pool = state.handshake_pool,
                 .buffer_provider = &state.buffer_provider,
                 .handshake_timeout = Timeout.init(config.handshake.timeout),
@@ -389,7 +393,14 @@ pub fn Blocking(comptime H: type) type {
         // directly when integrating with an http server
         pub fn readLoop(self: *Self, hc: *HandlerConn(H)) !void {
             defer self.cleanupConn(hc);
-
+            if (hc.compression) |*c| {
+                // if we have compression
+                if (c.write_threshold != null) {
+                    // and we have a write threshold, we need to setup our
+                    // connection's compression
+                    hc.conn.compression = try setupCompression(self.allocator, &self.conn_manager.compression_pool, c);
+                }
+            }
             try posix.setsockopt(hc.socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &Timeout.none);
 
             // In BlockingMode, we always assign a reader for the duration of the connection
@@ -398,7 +409,7 @@ pub fn Blocking(comptime H: type) type {
             const reader_buf = try self.allocator.alloc(u8, self.connection_buffer_size);
             defer self.allocator.free(reader_buf);
 
-            hc.reader = Reader.init(reader_buf, self.buffer_provider);
+            hc.reader = Reader.init(reader_buf, self.buffer_provider, hc.compression);
             while (true) {
                 if (handleClientData(H, hc, self.allocator, undefined) == false) {
                     break;
@@ -445,6 +456,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
         handshake_timeout: u32,
         handshake_pool: *Handshake.Pool,
         base: NonBlockingBase(H, true),
+        compression: ?Compression,
 
         const Self = @This();
         const ThreadPool = @import("thread_pool.zig").ThreadPool(Self.dataAvailable);
@@ -469,6 +481,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
                 .loop = loop,
                 .base = base,
                 .thread_pool = thread_pool,
+                .compression = config.compression,
                 .handshake_pool = state.handshake_pool,
                 .handshake_timeout = state.config.handshake.timeout,
                 .max_conn = config.max_conn orelse DEFAULT_MAX_CONN,
@@ -668,6 +681,15 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
                 self.base.conn_manager.inactive(hc);
             }
 
+            if (hc.compression) |*c| {
+                // if we have compression
+                if (c.write_threshold != null) {
+                    // and we have a write threshold, we need to setup our
+                    // connection's compression
+                    hc.conn.compression = try setupCompression(self.base.allocator, &self.base.conn_manager.compression_pool, c);
+                }
+            }
+
             return true;
         }
     };
@@ -734,7 +756,7 @@ fn NonBlockingBase(comptime H: type, comptime MANAGE_HS: bool) type {
         fn _dataAvailable(self: *Self, hc: *HandlerConn(H), thread_buf: []u8) !bool {
             if (hc.reader == null) {
                 const reader_buf = if (self.small_buffer_pool) |*sbp| try sbp.acquireOrCreate() else try self.allocator.alloc(u8, self.connection_buffer_size);
-                hc.reader = Reader.init(reader_buf, self.buffer_provider);
+                hc.reader = Reader.init(reader_buf, self.buffer_provider, hc.compression);
             }
             const reader = &hc.reader.?;
 
@@ -1051,6 +1073,7 @@ pub fn HandlerConn(comptime H: type) type {
         reader: ?Reader,
         socket: posix.socket_t, // denormalization from conn.stream.handle
         handshake: ?*Handshake.State,
+        compression: ?Compression = null,
         next: ?*HandlerConn(H) = null,
         prev: ?*HandlerConn(H) = null,
 
@@ -1067,6 +1090,7 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
         active: List(HandlerConn(H)),
         pending: List(HandlerConn(H)),
         pool: std.heap.MemoryPool(HandlerConn(H)),
+        compression_pool: std.heap.MemoryPool(Conn.Compression),
 
         const Self = @This();
 
@@ -1074,16 +1098,21 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
             var pool = std.heap.MemoryPool(HandlerConn(H)).init(allocator);
             errdefer pool.deinit();
 
+            var compression_pool = std.heap.MemoryPool(Conn.Compression).init(allocator);
+            errdefer compression_pool.deinit();
+
             return .{
                 .lock = .{},
                 .pool = pool,
                 .active = .{},
                 .pending = .{},
+                .compression_pool = compression_pool,
             };
         }
 
         pub fn deinit(self: *Self) void {
             self.pool.deinit();
+            self.compression_pool.deinit();
         }
 
         pub fn count(self: *Self) usize {
@@ -1113,6 +1142,7 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
                     .started = now,
                     .address = address,
                     .stream = .{ .handle = socket },
+                    .compression = null,
                 },
             };
 
@@ -1168,11 +1198,19 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
                 hc.handler = null;
             }
 
+            if (hc.conn.compression) |c| {
+                c.writer.deinit();
+            }
+
             self.lock.lock();
             if (hc.state == .active) {
                 self.active.remove(hc);
             } else {
                 self.pending.remove(hc);
+            }
+
+            if (hc.conn.compression) |c| {
+                self.compression_pool.destroy(c);
             }
 
             self.pool.destroy(hc);
@@ -1211,6 +1249,21 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
     };
 }
 
+fn setupCompression(allocator: Allocator, pool: *std.heap.MemoryPool(Conn.Compression), c: *const Compression) !*Conn.Compression {
+    var compression = try pool.create();
+    errdefer pool.destroy(compression);
+
+    compression.* = .{
+        .compressor = undefined,
+        .write_treshold = c.write_threshold.?,
+        .reset = c.server_no_context_takeover,
+        .retain_writer = c.retain_write_buffer,
+        .writer = std.ArrayList(u8).init(allocator),
+    };
+    compression.compressor = try Conn.Compression.Type.init(compression.writer.writer(), .{});
+    return compression;
+}
+
 // This is what actually gets exposed to the app
 pub const Conn = struct {
     _closed: bool,
@@ -1218,6 +1271,17 @@ pub const Conn = struct {
     stream: net.Stream,
     address: net.Address,
     lock: Thread.Mutex = .{},
+    compression: ?*Conn.Compression = null,
+
+    const Compression = struct {
+        reset: bool,
+        retain_writer: bool,
+        write_treshold: usize,
+        compressor: Type,
+        writer: std.ArrayList(u8),
+
+        const Type = std.compress.flate.Compressor(std.ArrayList(u8).Writer);
+    };
 
     pub fn isClosed(self: *Conn) bool {
         // don't use lock to protect _closed. `isClosed` is called from
@@ -1282,13 +1346,40 @@ pub const Conn = struct {
     }
 
     pub fn writeFrame(self: *Conn, op_code: OpCode, data: []const u8) !void {
+        var payload = data;
+        var compressed = false;
+        if (self.compression) |c| {
+            if (data.len >= c.write_treshold) {
+                compressed = true;
+
+                var writer = &c.writer;
+                var compressor = &c.compressor;
+                var fbs = std.io.fixedBufferStream(data);
+                _ = try compressor.compress(fbs.reader());
+                try compressor.flush();
+                payload = writer.items[0..writer.items.len - 4];
+
+                if (c.reset) {
+                    c.compressor = try Conn.Compression.Type.init(writer.writer(), .{});
+                }
+            }
+        }
+        defer if (compressed) {
+            const c = self.compression.?;
+            if (c.retain_writer) {
+                c.compressor.wrt.context.clearRetainingCapacity();
+            } else {
+                c.compressor.wrt.context.clearAndFree();
+            }
+        };
+
         // maximum possible prefix length. op_code + length_type + 8byte length
         var buf: [10]u8 = undefined;
-        const header = proto.writeFrameHeader(&buf, op_code, data.len);
+        const header = proto.writeFrameHeader(&buf, op_code, payload.len, compressed);
 
         const stream = self.stream;
 
-        if (data.len == 0) {
+        if (payload.len == 0) {
             // no body, just write the header
             self.lock.lock();
             defer self.lock.unlock();
@@ -1297,7 +1388,7 @@ pub const Conn = struct {
 
         var vec = [2]std.posix.iovec_const{
             .{ .len = header.len, .base = header.ptr },
-            .{ .len = data.len, .base = data.ptr },
+            .{ .len = payload.len, .base = payload.ptr },
         };
 
         return self.writeAllIOVec(&vec);
@@ -1421,8 +1512,22 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
         return true;
     };
 
+    var compression: ?Compression = null;
+
+    if (worker.compression) |configured_compression| {
+        const client_compression = handshake.compression;
+        if (client_compression.enabled) {
+            compression = .{
+                .client_no_context_takeover = configured_compression.client_no_context_takeover or client_compression.client_no_context_takeover,
+                .server_no_context_takeover = configured_compression.server_no_context_takeover or client_compression.server_no_context_takeover,
+            };
+        }
+    }
+
+
     defer state.release();
     hc.handshake = null;
+    hc.compression = compression;
 
     // After this, the app has access to &hc.conn, so any access to the
     // conn has to be synchronized (which the conn does internally).
@@ -1438,7 +1543,9 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
     };
 
     hc.handler = handler;
-    try conn.writeFramed(&Handshake.createReply(handshake.key));
+
+    var reply_buf: [512]u8 = undefined;
+    try conn.writeFramed(Handshake.createReply(handshake.key, compression, &reply_buf));
 
     if (comptime std.meta.hasFn(H, "afterInit")) {
         const params = @typeInfo(@TypeOf(H.afterInit)).@"fn".params;
@@ -1478,6 +1585,8 @@ fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator
             switch (err) {
                 error.LargeControl => conn.writeFramed(CLOSE_PROTOCOL_ERROR) catch {},
                 error.ReservedFlags => conn.writeFramed(CLOSE_PROTOCOL_ERROR) catch {},
+                error.CompressionDisabled => conn.writeFramed(CLOSE_PROTOCOL_ERROR) catch {},
+                error.CompressionError => conn.writeFramed(CLOSE_PROTOCOL_ERROR) catch {},
                 else => {},
             }
             log.debug("({}) invalid websocket packet: {}", .{ conn.address, err });

@@ -45,7 +45,7 @@ pub fn main() !void {
             var handler = try Handler.init(allocator, &buffer_provider, case);
             defer handler.deinit();
             handler.readLoop() catch |err| switch (err) {
-                // Each of these error cases reqiuer that we close the connection, as per
+                // Each of these error cases require that we close the connection, as per
                 // the spec. You probably just want to re-connect. But, for the autobahn tests
                 // we don't want to shutdown, since autobahn is testing these invalid cases.
                 error.LargeControl => {},

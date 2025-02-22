@@ -1,6 +1,8 @@
 const std = @import("std");
-const buffer = @import("buffer.zig");
 const builtin = @import("builtin");
+
+const buffer = @import("buffer.zig");
+const Compression = @import("websocket.zig").Compression;
 
 const backend_supports_vectors = switch (builtin.zig_backend) {
     .stage2_llvm, .stage2_c => true,
@@ -85,7 +87,26 @@ pub const Reader = struct {
     // fragment), the state of the fragmented message is maintained here.)
     fragment: ?Fragmented,
 
-    pub fn init(static: []u8, large_buffer_provider: *buffer.Provider) Reader {
+    decompressor: ?DecompressorType,
+
+    // if we returned a decompressed message, it's stored here so that we can
+    // cleanup when the user is done with the message
+    decompress_writer: ?buffer.Writer,
+
+    // when client_no_context_takeover, we reset the decompressor after every
+    // message
+    decompressor_reset: bool,
+
+    const DecompressorType = std.compress.flate.Decompressor(std.io.FixedBufferStream([]const u8).Reader);
+
+    pub fn init(static: []u8, large_buffer_provider: *buffer.Provider, compression: ?Compression) Reader {
+        var decompressor_reset = false;
+        var decompressor: ?DecompressorType = null;
+        if (compression) |c| {
+            decompressor = .{};
+            decompressor_reset = c.client_no_context_takeover;
+        }
+
         return .{
             .pos = 0,
             .start = 0,
@@ -93,6 +114,9 @@ pub const Reader = struct {
             .static = static,
             .message_len = 0,
             .fragment = null,
+            .decompress_writer = null,
+            .decompressor = decompressor,
+            .decompressor_reset = decompressor_reset,
             .large_buffer_provider = large_buffer_provider,
         };
     }
@@ -100,6 +124,9 @@ pub const Reader = struct {
     pub fn deinit(self: *Reader) void {
         if (self.fragment) |f| {
             f.deinit();
+        }
+        if (self.decompress_writer) |*dw| {
+            dw.deinit();
         }
 
         // not our job to manage the static buffer, its buf was given to us an init and we
@@ -236,9 +263,18 @@ pub const Reader = struct {
             }
 
             // FIN, RSV1, RSV2, RSV3, OP,OP,OP,OP
-            // none of the RSV bits should be set
-            if (byte1 & 112 != 0) {
+            // RSV2 and RSV3 should never be set, and RSV1 should not be set
+            // when compression is disabled
+            const rsv_bits: u8 = if (self.decompressor == null or is_continuation) 112 else 48;
+            if (byte1 & rsv_bits != 0) {
                 return error.ReservedFlags;
+            }
+
+            const compressed = byte1 & 64 == 64;
+            if (compressed) {
+                if (self.decompressor == null) {
+                    return error.CompressionDisabled;
+                }
             }
 
             if (!is_continuation and length_of_len != 0 and (message_type == .ping or message_type == .close or message_type == .pong)) {
@@ -280,6 +316,9 @@ pub const Reader = struct {
             if (fin) {
                 if (is_continuation) {
                     if (self.fragment) |*f| {
+                        if (f.compressed) {
+                            return . {more, .{.data = try self.decompress(try f.last(payload)), .type = f.type}};
+                        }
                         return .{ more, .{ .type = f.type, .data = try f.last(payload) } };
                     }
 
@@ -288,6 +327,10 @@ pub const Reader = struct {
 
                 if (self.fragment != null and (message_type == .text or message_type == .binary)) {
                     return error.NestedFragment;
+                }
+
+                if (compressed) {
+                    return . {more, .{.data = try self.decompress(payload), .type = message_type}};
                 }
 
                 // just a normal single-fragment message (most common case)
@@ -313,7 +356,7 @@ pub const Reader = struct {
                 return error.NestedFragment;
             }
 
-            self.fragment = try Fragmented.init(self.large_buffer_provider, message_type, payload);
+            self.fragment = try Fragmented.init(self.large_buffer_provider, compressed, message_type, payload);
             self.restoreStatic();
 
             if (more) {
@@ -332,7 +375,16 @@ pub const Reader = struct {
                 f.deinit();
                 self.fragment = null;
             }
+            if (self.decompress_writer) |*dw| {
+                dw.deinit();
+                self.decompress_writer = null;
+
+                if (self.decompressor_reset) {
+                    self.decompressor = .{};
+                }
+            }
         }
+
         self.restoreStatic();
     }
 
@@ -365,6 +417,49 @@ pub const Reader = struct {
         }
     }
 
+    fn decompress(self: *Reader, compressed: []const u8) ![]u8 {
+        const provider = self.large_buffer_provider;
+
+        var writer: buffer.Writer = undefined;
+        if (compressed.len < provider.pool_buffer_size) {
+            writer = .{
+                .pooled = true,
+                .provider = provider,
+                .buf = try provider.pool.acquireOrCreate(),
+            };
+        } else {
+           writer = .{
+                .pooled = false,
+                .provider = provider,
+                .buf = try provider.allocator.alloc(u8, @intFromFloat(@as(f64, @floatFromInt(compressed.len)) * 1.25)),
+            };
+        }
+
+        errdefer writer.deinit();
+
+        var decompressor = &self.decompressor.?;
+        {
+            var reader = std.io.fixedBufferStream(compressed);
+            decompressor.setReader(reader.reader());
+            decompressor.decompress(&writer) catch |err| switch (err) {
+                error.EndOfStream => {},
+                else => return error.CompressionError,
+            };
+        }
+
+        {
+            var reader = std.io.fixedBufferStream(&[_]u8{ 0x00, 0x00, 0xff, 0xff });
+            decompressor.setReader(reader.reader());
+            decompressor.decompress(&writer) catch |err| switch (err) {
+                error.EndOfStream => {},
+                else => return error.CompressionError,
+            };
+        }
+
+        self.decompress_writer = writer;
+        return writer.buf[0..writer.pos];
+    }
+
     inline fn usingLargeBuffer(self: *const Reader) bool {
         return self.buf.type != .static;
     }
@@ -382,10 +477,11 @@ fn payloadMeta(byte2: u8) struct { bool, usize } {
 
 const Fragmented = struct {
     max: usize,
+    compressed: bool,
     type: Message.Type,
     buf: std.ArrayList(u8),
 
-    pub fn init(bp: *buffer.Provider, message_type: Message.Type, value: []const u8) !Fragmented {
+    pub fn init(bp: *buffer.Provider, compressed: bool, message_type: Message.Type, value: []const u8) !Fragmented {
         var buf = std.ArrayList(u8).init(bp.allocator);
         try buf.ensureTotalCapacity(value.len * 2);
         buf.appendSliceAssumeCapacity(value);
@@ -393,6 +489,7 @@ const Fragmented = struct {
         return .{
             .buf = buf,
             .type = message_type,
+            .compressed = compressed,
             .max = bp.max_buffer_size,
         };
     }
@@ -447,13 +544,16 @@ fn simpleMask(m: []const u8, payload: []u8) void {
 
 pub fn frame(op_code: OpCode, comptime msg: []const u8) [calculateFrameLen(msg)]u8 {
     var framed: [calculateFrameLen(msg)]u8 = undefined;
-    const header = writeFrameHeader(&framed, op_code, msg.len);
+    const header = writeFrameHeader(&framed, op_code, msg.len, false);
     @memcpy(framed[header.len..], msg);
     return framed;
 }
 
-pub fn writeFrameHeader(buf: []u8, op_code: OpCode, l: usize) []u8 {
+pub fn writeFrameHeader(buf: []u8, op_code: OpCode, l: usize, compressed: bool) []u8 {
     buf[0] = @intFromEnum(op_code);
+    if (compressed) {
+        buf[0] |= 64;
+    }
 
     if (l <= 125) {
         buf[1] = @intCast(l);
@@ -683,7 +783,7 @@ test "Reader: fuzz" {
 test "Fragmented" {
     {
         var bp = try buffer.Provider.init(t.allocator, .{ .count = 0, .size = 0, .max = 500 });
-        var f = try Fragmented.init(&bp, .text, "hello");
+        var f = try Fragmented.init(&bp, false, .text, "hello");
         defer f.deinit();
 
         try t.expectString("hello", f.buf.items);
@@ -697,7 +797,7 @@ test "Fragmented" {
 
     {
         var bp = try buffer.Provider.init(t.allocator, .{ .count = 0, .size = 0, .max = 10 });
-        var f = try Fragmented.init(&bp, .text, "hello");
+        var f = try Fragmented.init(&bp, false, .text, "hello");
         defer f.deinit();
         try f.add(" ");
         try t.expectError(error.TooLarge, f.add("world"));
@@ -715,7 +815,7 @@ test "Fragmented" {
             var payload = buf[0 .. random.uintAtMost(usize, 99) + 1];
             random.bytes(payload);
 
-            var f = try Fragmented.init(&bp, .binary, payload);
+            var f = try Fragmented.init(&bp, false, .binary, payload);
             defer f.deinit();
 
             var expected = std.ArrayList(u8).init(t.allocator);
@@ -752,7 +852,7 @@ fn testReader(opts: anytype) Reader {
 
     const static_size = if (@hasField(T, "static")) opts.static else 16;
     const reader_buf = aa.alloc(u8, static_size) catch unreachable;
-    return Reader.init(reader_buf, bp);
+    return Reader.init(reader_buf, bp, null);
 }
 
 fn testRead(reader: *Reader, pair: t.SocketPair) !Message {
