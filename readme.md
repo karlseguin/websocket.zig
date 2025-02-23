@@ -239,6 +239,9 @@ pub const Config = struct {
     thread_pool: ThreadPool = .{},
     buffers: Config.Buffers = .{},
 
+    // compression is disabled by default
+    compression: ?Compression = null,
+
     // In blocking mode the thread pool isn't used 
     pub const ThreadPool = struct {
         // Number of threads to process messages.
