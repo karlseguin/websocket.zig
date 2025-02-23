@@ -1516,7 +1516,7 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
 
     if (worker.compression) |configured_compression| {
         const client_compression = handshake.compression;
-        if (client_compression.enabled) {
+        if (client_compression.enabled and client_compression.server_max_bits == 15) {
             compression = .{
                 .client_no_context_takeover = configured_compression.client_no_context_takeover or client_compression.client_no_context_takeover,
                 .server_no_context_takeover = configured_compression.server_no_context_takeover or client_compression.server_no_context_takeover,
