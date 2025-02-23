@@ -314,6 +314,29 @@ pub const Config = struct {
         // Default: min(2 * buffers.small_size, max_message_size)
         large_size: ?usize = null,
     };
+
+    // Compression is disabled by default, to enable it and accept the default
+    // values, set it to a defautl struct: .{}
+    const Compression = struct {
+        // The mimimum size of data before messages will be compressed
+        // null = message are never compressed when writing messages to the client
+        // If you want to enable compression, 512 is a reasonable default
+        write_threshold: ?usize = null,
+
+        // When compression is enable, and write_treshold != null, every connection
+        // gets an std.ArrayList(u8) to write the compressed message to. When this
+        // is true, the memory allocated to the ArrayList is kept for subsequent
+        // messages (i.e. it calls `clearRetainingCapacity`). When false, the memory
+        // is freed after each message. 
+        // true = more memory, but fewer allocations
+        retain_write_buffer: bool = true,
+
+        // Advanced options that are part of the permessage-deflate specification.
+        // You can set these to true to try and save a bit of memory. But if you
+        // want to save memory, don't use compression at all.
+        client_no_context_takeover: bool = false,
+        server_no_context_takeover: bool = false,
+    };
 }
 ```
 
