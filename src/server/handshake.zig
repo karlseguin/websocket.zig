@@ -22,13 +22,11 @@ pub const Handshake = struct {
     method: []const u8,
     headers: *KeyValue,
     raw_header: []const u8,
-    compression: Compression,
+    compression: ?Compression,
 
     pub const Pool = M.Pool;
 
-    const Compression = struct {
-        enabled: bool,
-        server_max_bits: u8,
+    pub const Compression = struct {
         client_no_context_takeover: bool,
         server_no_context_takeover: bool,
     };
@@ -54,10 +52,7 @@ pub const Handshake = struct {
         var key: []const u8 = "";
         var required_headers: u8 = 0;
 
-        var deflate = false;
-        var server_max_bits: u8 = 15;
-        var client_no_context_takeover = false;
-        var server_no_context_takeover = false;
+        var compression: ?Handshake.Compression = null;
 
         var request_length = request_line_end;
 
@@ -96,30 +91,7 @@ pub const Handshake = struct {
                     }
                     required_headers |= 2;
                 },
-                .@"sec-websocket-extensions" => {
-                    var it = std.mem.splitScalar(u8, value, ';');
-                    while (it.next()) |param_| {
-                        const param = std.mem.trim(u8, param_, &ascii.whitespace);
-                        if (std.mem.eql(u8, param, "permessage-deflate")) {
-                            deflate = true;
-                            continue;
-                        }
-                        if (std.mem.eql(u8, param, "client_no_context_takeover")) {
-                            client_no_context_takeover = true;
-                            continue;
-                        }
-                        if (std.mem.eql(u8, param, "server_no_context_takeover")) {
-                            server_no_context_takeover = true;
-                            continue;
-                        }
-                        const server_max_window_bits = "server_max_window_bits=";
-                        if (std.mem.startsWith(u8, param, server_max_window_bits)) {
-                            server_max_bits = std.fmt.parseInt(u8, param[server_max_window_bits.len..], 10) catch {
-                                return error.InvalidCompressionServerMaxBits;
-                            };
-                        }
-                    }
-                },
+                .@"sec-websocket-extensions" => compression = try parseExtension(value),
                 .none => {},
             }
 
@@ -143,13 +115,8 @@ pub const Handshake = struct {
             .url = url,
             .method = method,
             .headers = headers,
+            .compression = compression,
             .raw_header = request[request_line_end + 2 .. request_length + 2],
-            .compression = .{
-                .enabled = deflate,
-                .server_max_bits = server_max_bits,
-                .client_no_context_takeover = client_no_context_takeover,
-                .server_no_context_takeover = server_no_context_takeover,
-            },
         };
     }
 
@@ -201,6 +168,52 @@ pub const Handshake = struct {
         const end = pos + 4;
         @memcpy(buf[pos..end], "\r\n\r\n");
         return buf[0..end];
+    }
+
+    pub fn parseExtension(value: []const u8) !?Handshake.Compression {
+        var deflate = false;
+        var server_max_bits: u8 = 15;
+        var client_no_context_takeover = false;
+        var server_no_context_takeover = false;
+
+        var it = std.mem.splitScalar(u8, value, ';');
+        while (it.next()) |param_| {
+            const param = std.mem.trim(u8, param_, &ascii.whitespace);
+            if (std.mem.eql(u8, param, "permessage-deflate")) {
+                deflate = true;
+                continue;
+            }
+            if (std.mem.eql(u8, param, "client_no_context_takeover")) {
+                client_no_context_takeover = true;
+                continue;
+            }
+            if (std.mem.eql(u8, param, "server_no_context_takeover")) {
+                server_no_context_takeover = true;
+                continue;
+            }
+            const server_max_window_bits = "server_max_window_bits=";
+            if (std.mem.startsWith(u8, param, server_max_window_bits)) {
+                server_max_bits = std.fmt.parseInt(u8, param[server_max_window_bits.len..], 10) catch {
+                    return error.InvalidCompressionServerMaxBits;
+                };
+            }
+        }
+        if (deflate == false) {
+            return null;
+        }
+
+        if (server_max_bits != 15) {
+            // Zig doesn't support a sliding deflate window. If the client asks
+            // for a sliding window < 15, we can't accomodate it. This logic
+            // should be pushed into the worker, but putting it here makes it
+            // easier for any integration to also use this (i..e httz)
+            return null;
+        }
+
+        return .{
+            .client_no_context_takeover = client_no_context_takeover,
+            .server_no_context_takeover = server_no_context_takeover,
+        };
     }
 
     // This is what we're pooling

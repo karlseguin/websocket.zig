@@ -309,7 +309,7 @@ pub fn Blocking(comptime H: type) type {
         pub fn init(allocator: Allocator, state: *WorkerState) !Self {
             const config = &state.config;
 
-            var conn_manager = try ConnManager(H, false).init(allocator);
+            var conn_manager = try ConnManager(H, false).init(allocator, config.compression);
             errdefer conn_manager.deinit();
 
             return .{
@@ -371,12 +371,14 @@ pub fn Blocking(comptime H: type) type {
                 try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &timeout.timeval);
 
                 while (true) {
-                    if (handleHandshake(H, self, hc, ctx) == false) {
+                    const compression, const ok = handleHandshake(H, self, hc, ctx);
+                    if (ok == false) {
                         self.cleanupConn(hc);
                         return;
                     }
                     if (hc.handler != null) {
                         // if we have a handler, the our handshake completed
+                    try conn_manager.setupCompression(hc, compression);
                         break;
                     }
                     if (timestamp() > deadline) {
@@ -393,14 +395,6 @@ pub fn Blocking(comptime H: type) type {
         // directly when integrating with an http server
         pub fn readLoop(self: *Self, hc: *HandlerConn(H)) !void {
             defer self.cleanupConn(hc);
-            if (hc.compression) |*c| {
-                // if we have compression
-                if (c.write_threshold != null) {
-                    // and we have a write threshold, we need to setup our
-                    // connection's compression
-                    hc.conn.compression = try setupCompression(self.allocator, &self.conn_manager.compression_pool, c);
-                }
-            }
             try posix.setsockopt(hc.socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &Timeout.none);
 
             // In BlockingMode, we always assign a reader for the duration of the connection
@@ -672,24 +666,18 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
         }
 
         fn dataForHandshake(self: *Self, hc: *HandlerConn(H)) !bool {
-            if (handleHandshake(H, self, hc, self.ctx) == false) {
+            var conn_manager = &self.base.conn_manager;
+            const compression, const ok = handleHandshake(H, self, hc, self.ctx);
+            if (ok == false) {
                 return false;
             }
 
             if (hc.handler == null) {
                 // still don't have a handshake
-                self.base.conn_manager.inactive(hc);
+                conn_manager.inactive(hc);
             }
 
-            if (hc.compression) |*c| {
-                // if we have compression
-                if (c.write_threshold != null) {
-                    // and we have a write threshold, we need to setup our
-                    // connection's compression
-                    hc.conn.compression = try setupCompression(self.base.allocator, &self.base.conn_manager.compression_pool, c);
-                }
-            }
-
+        try conn_manager.setupCompression(hc, compression);
             return true;
         }
     };
@@ -713,7 +701,7 @@ fn NonBlockingBase(comptime H: type, comptime MANAGE_HS: bool) type {
         fn init(allocator: Allocator, state: *WorkerState) !Self {
             const config = &state.config;
 
-            var conn_manager = try ConnManager(H, MANAGE_HS).init(allocator);
+            var conn_manager = try ConnManager(H, MANAGE_HS).init(allocator, config.compression);
             errdefer conn_manager.deinit();
 
             const connection_buffer_size = config.buffers.small_size orelse DEFAULT_BUFFER_SIZE;
@@ -1006,6 +994,14 @@ pub fn Worker(comptime H: type) type {
             self.worker.cleanupConn(hc);
         }
 
+        pub fn canCompress(self: *const Self) bool {
+            return self.worker.conn_manager.compression != null;
+        }
+
+        pub fn setupConnection(self: *Self, hc: *HandlerConn(H), agreed: ?Compression) !void {
+            return self.worker.conn_manager.setupCompression(hc, agreed);
+        }
+
         pub fn shutdown(self: *Self) void {
             self.worker.shutdown();
         }
@@ -1087,14 +1083,16 @@ pub fn HandlerConn(comptime H: type) type {
 pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
     return struct {
         lock: Thread.Mutex,
+        allocator: Allocator,
         active: List(HandlerConn(H)),
         pending: List(HandlerConn(H)),
         pool: std.heap.MemoryPool(HandlerConn(H)),
+        compression: ?Compression,
         compression_pool: std.heap.MemoryPool(Conn.Compression),
 
         const Self = @This();
 
-        pub fn init(allocator: Allocator) !Self {
+        pub fn init(allocator: Allocator, compression: ?Compression) !Self {
             var pool = std.heap.MemoryPool(HandlerConn(H)).init(allocator);
             errdefer pool.deinit();
 
@@ -1106,6 +1104,8 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
                 .pool = pool,
                 .active = .{},
                 .pending = .{},
+                .allocator = allocator,
+                .compression = compression,
                 .compression_pool = compression_pool,
             };
         }
@@ -1137,6 +1137,7 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
                 .handler = null,
                 .handshake = null,
                 .reader = null,
+                .compression = null,
                 .conn = .{
                     ._closed = false,
                     .started = now,
@@ -1217,6 +1218,40 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
             self.lock.unlock();
         }
 
+        fn setupCompression(self: *Self, hc: *HandlerConn(H), agreed_: ?Compression) !void {
+            const agreed = agreed_ orelse {
+                return;
+            };
+
+            const configured = self.compression.?;
+            const merged = Compression{
+                .write_threshold = configured.write_threshold,
+                .retain_write_buffer = configured.retain_write_buffer,
+                .client_no_context_takeover = agreed.client_no_context_takeover,
+                .server_no_context_takeover = agreed.server_no_context_takeover,
+            };
+            hc.compression = merged;
+
+            if (merged.write_threshold == null) {
+                // and we have a write threshold, we need to setup our
+                // connection's compression (read compression is configured in our reader)
+                return;
+            }
+
+            var compression = try self.compression_pool.create();
+            errdefer self.compression_pool.destroy(compression);
+
+            compression.* = .{
+                .compressor = undefined,
+                .write_treshold = merged.write_threshold.?,
+                .reset = merged.server_no_context_takeover,
+                .retain_writer = merged.retain_write_buffer,
+                .writer = std.ArrayList(u8).init(self.allocator),
+            };
+            compression.compressor = try Conn.Compression.Type.init(compression.writer.writer(), .{});
+            hc.conn.compression = compression;
+        }
+
         pub fn shutdown(self: *Self, worker: anytype) void {
             self.lock.lock();
             defer self.lock.unlock();
@@ -1247,21 +1282,6 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
             }
         }
     };
-}
-
-fn setupCompression(allocator: Allocator, pool: *std.heap.MemoryPool(Conn.Compression), c: *const Compression) !*Conn.Compression {
-    var compression = try pool.create();
-    errdefer pool.destroy(compression);
-
-    compression.* = .{
-        .compressor = undefined,
-        .write_treshold = c.write_threshold.?,
-        .reset = c.server_no_context_takeover,
-        .retain_writer = c.retain_write_buffer,
-        .writer = std.ArrayList(u8).init(allocator),
-    };
-    compression.compressor = try Conn.Compression.Type.init(compression.writer.writer(), .{});
-    return compression;
 }
 
 // This is what actually gets exposed to the app
@@ -1460,14 +1480,14 @@ pub const Conn = struct {
     };
 };
 
-fn handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx: anytype) bool {
+fn handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx: anytype) struct{?Compression, bool} {
     return _handleHandshake(H, worker, hc, ctx) catch |err| {
         log.warn("({}) uncaugh error processing handshake: {}", .{ hc.conn.address, err });
-        return false;
+        return .{null, false};
     };
 }
 
-fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx: anytype) !bool {
+fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx: anytype) !struct{?Compression, bool} {
     std.debug.assert(hc.handler == null);
 
     var state = hc.handshake orelse blk: {
@@ -1482,7 +1502,7 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
 
     if (len == buf.len) {
         log.warn("({}) handshake request exceeded maximum configured size ({d})", .{ conn.address, buf.len });
-        return false;
+        return .{null, false};
     }
 
     const n = posix.read(hc.socket, buf[len..]) catch |err| {
@@ -1494,40 +1514,37 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
             },
             else => log.warn("({}) handshake error reading from socket: {}", .{ conn.address, err }),
         }
-        return false;
+        return .{null, false};
     };
 
     if (n == 0) {
         log.debug("({}) handshake connection closed", .{conn.address});
-        return false;
+        return .{null, false};
     }
 
     state.len = len + n;
     const handshake = Handshake.parse(state) catch |err| {
         log.debug("({}) error parsing handshake: {}", .{ conn.address, err });
         respondToHandshakeError(conn, err);
-        return false;
+        return .{null, false};
     } orelse {
         // we need more data
-        return true;
+        return .{null, true};
     };
 
-    var compression: ?Compression = null;
-
+    var agreed_compression: ?Compression = null;
     if (worker.compression) |configured_compression| {
-        const client_compression = handshake.compression;
-        if (client_compression.enabled and client_compression.server_max_bits == 15) {
-            compression = .{
-                .client_no_context_takeover = configured_compression.client_no_context_takeover or client_compression.client_no_context_takeover,
-                .server_no_context_takeover = configured_compression.server_no_context_takeover or client_compression.server_no_context_takeover,
+        if (handshake.compression) |request_compression| {
+            agreed_compression = .{
+                .client_no_context_takeover = configured_compression.client_no_context_takeover or request_compression.client_no_context_takeover,
+                .server_no_context_takeover = configured_compression.server_no_context_takeover or request_compression.server_no_context_takeover,
             };
         }
     }
 
-
     defer state.release();
     hc.handshake = null;
-    hc.compression = compression;
+
 
     // After this, the app has access to &hc.conn, so any access to the
     // conn has to be synchronized (which the conn does internally).
@@ -1539,25 +1556,25 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
             respondToHandshakeError(conn, err);
         }
         log.debug("({}) " ++ @typeName(H) ++ ".init rejected request {}", .{ conn.address, err });
-        return false;
+        return .{null, false};
     };
 
     hc.handler = handler;
 
     var reply_buf: [512]u8 = undefined;
-    try conn.writeFramed(Handshake.createReply(handshake.key, compression, &reply_buf));
+    try conn.writeFramed(Handshake.createReply(handshake.key, agreed_compression, &reply_buf));
 
     if (comptime std.meta.hasFn(H, "afterInit")) {
         const params = @typeInfo(@TypeOf(H.afterInit)).@"fn".params;
         const res = if (params.len == 1) hc.handler.?.afterInit() else hc.handler.?.afterInit(ctx);
         res catch |err| {
             log.debug("({}) " ++ @typeName(H) ++ ".afterInit error: {}", .{ conn.address, err });
-            return false;
+            return .{null, false};
         };
     }
 
     log.debug("({}) connection successfully upgraded", .{conn.address});
-    return true;
+    return .{agreed_compression, true};
 }
 
 fn handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator, fba: *FixedBufferAllocator) bool {
