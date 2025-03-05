@@ -65,7 +65,6 @@ const App = struct {
   // maybe a db pool
   // maybe a list of rooms
 };
-
 ```
 
 ## Handler
