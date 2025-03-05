@@ -1,7 +1,8 @@
 .{
-	.name = "autobahn_test_server",
+	.name = .autobahn_test_server,
 	.paths = .{""},
 	.version = "0.0.0",
+	.fingerprint = 0x923c8c98ca4d09ab,
 	.dependencies = .{
 		.websocket = .{.path = "../../../"},
 	},
