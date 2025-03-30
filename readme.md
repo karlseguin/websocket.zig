@@ -185,7 +185,7 @@ It's possible to get a `std.io.Writer` from a `*Conn`. Because websocket message
 
 ```zig
 // .text or .binary
-var wb = conn.writeBuffer(.text, allocator);
+var wb = conn.writeBuffer(allocator, .text);
 defer wb.deinit();
 try std.fmt.format(wb.writer(), "it's over {d}!!!", .{9000});
 try wb.flush();
@@ -198,7 +198,7 @@ pub fn clientMessage(h: *Handler, allocator: Allocator, data: []const u8) !void 
     // Use the provided allocator.
     // It's faster and doesn't require `deinit` to be called
 
-    var wb = conn.writeBuffer(.text, allocator);
+    var wb = conn.writeBuffer(allocator, .text);
     try std.fmt.format(wb.writer(), "it's over {d}!!!", .{9000});
     try wb.flush();
 }
