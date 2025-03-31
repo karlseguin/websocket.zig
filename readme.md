@@ -467,7 +467,7 @@ We can then use `read` and `write`. By default, `read` blocks until a message is
       .ping => try client.writePong(message.data),
       .pong => {},
       .close => {
-        client.close();
+        try client.close(.{});
         break;
       }
     }
