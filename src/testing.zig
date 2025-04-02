@@ -39,7 +39,7 @@ pub const Testing = struct {
         }) catch unreachable;
 
         const reader_buf = aa.alloc(u8, 1024) catch unreachable;
-        const reader = ws.proto.Reader.init(reader_buf, buffer_provider);
+        const reader = ws.proto.Reader.init(reader_buf, buffer_provider, null);
 
         return .{
             .closed = false,
