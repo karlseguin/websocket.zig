@@ -70,6 +70,7 @@ pub const Config = struct {
         timeout: u32 = 10,
         max_size: ?u16 = null,
         max_headers: ?u16 = null,
+        max_res_headers: ?u16 = null,
         count: ?u16 = null,
     };
 
@@ -1022,8 +1023,9 @@ pub const WorkerState = struct {
         const handshake_pool_count = config.handshake.count orelse 32;
         const handshake_max_size = config.handshake.max_size orelse 1024;
         const handshake_max_headers = config.handshake.max_headers orelse 10;
+        const handshake_max_res_headers = config.handshake.max_res_headers orelse 2;
 
-        var handshake_pool = try Handshake.Pool.init(allocator, handshake_pool_count, handshake_max_size, handshake_max_headers);
+        var handshake_pool = try Handshake.Pool.init(allocator, handshake_pool_count, handshake_max_size, handshake_max_headers, handshake_max_res_headers);
         errdefer handshake_pool.deinit();
 
         const max_message_size = config.max_message_size orelse DEFAULT_MAX_MESSAGE_SIZE;
@@ -1549,7 +1551,7 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
     // After this, the app has access to &hc.conn, so any access to the
     // conn has to be synchronized (which the conn does internally).
 
-    const handler = H.init(handshake, conn, ctx) catch |err| {
+    const handler = H.init(&handshake, conn, ctx) catch |err| {
         if (comptime std.meta.hasFn(H, "handshakeErrorResponse")) {
             preHandOffWrite(H.handshakeErrorResponse(err));
         } else {
@@ -1561,8 +1563,9 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
 
     hc.handler = handler;
 
-    var reply_buf: [512]u8 = undefined;
-    try conn.writeFramed(Handshake.createReply(handshake.key, agreed_compression, &reply_buf));
+    var reply_buf: [2048]u8 = undefined;
+    const handshake_reply = try Handshake.createReply(handshake.key, &handshake.res_headers, agreed_compression, &reply_buf);
+    try conn.writeFramed(handshake_reply);
 
     if (comptime std.meta.hasFn(H, "afterInit")) {
         const params = @typeInfo(@TypeOf(H.afterInit)).@"fn".params;
@@ -1973,7 +1976,7 @@ fn testStream(handshake: bool) !net.Stream {
 const TestHandler = struct {
     conn: *Conn,
 
-    pub fn init(h: Handshake, conn: *Conn, _: void) !TestHandler {
+    pub fn init(h: *const Handshake, conn: *Conn, _: void) !TestHandler {
         try t.expectString("upgrade", h.headers.get("connection").?);
         return .{
             .conn = conn,

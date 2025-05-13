@@ -40,7 +40,7 @@ const Handler = struct {
     conn: *ws.Conn,
 
     // You must define a public init function which takes
-    pub fn init(h: ws.Handshake, conn: *ws.Conn, app: *App) !Handler {
+    pub fn init(h: *ws.Handshake, conn: *ws.Conn, app: *App) !Handler {
         // `h` contains the initial websocket "handshake" request
         // It can be used to apply application-specific logic to verify / allow
         // the connection (e.g. valid url, query string parameters, or headers)
@@ -71,13 +71,13 @@ const App = struct {
 When you create a `websocket.Server(Handler)`, the specified `Handler` is your structure which will receive messages. It must have a public `init` function and `clientMessage` method. Other methods, such as `close` can optionally be defined.
 
 ### init
-The `init` method is called with a `websocket.Handshake`, a `*websocket.Conn` and whatever app-specific value was passed into `Server(H).init`. 
+The `init` method is called with a `*websocket.Handshake`, a `*websocket.Conn` and whatever app-specific value was passed into `Server(H).init`. 
 
 When `init` is called, the handshake response has not yet been sent to the client (this allows your `init` method to return an error which will cause websocket.zig to send an error response and close the connection). As such, you should not use/write to the `*websocket.Conn` at this point. Instead, use the `afterInit` method, described next.
 
 The websocket specification requires the initial "handshake" to contain certain headers and values. The library validates these headers. However applications may have additional requirements before allowing the connection to be "upgraded" to a websocket connection. For example, a one-time-use token could be required in the querystring. Applications should use the provided `websocket.Handshake` to apply any application-specific verification and optionally return an error to terminate the connection.
 
-The `websocket.Handshake` exposes the following fields:
+The `*websocket.Handshake` exposes the following fields:
 
 * `url: []const u8` - URL of the request in its original casing
 * `method: []const u8` - Method of the request in its original casing
@@ -85,10 +85,21 @@ The `websocket.Handshake` exposes the following fields:
 
 If you set the `max_headers` configuration value to > 0, then you can use `req.headers.get("HEADER_NAME")` to extract a header value from the given name:
 
+If you set the `max_res_headers` configuration value to > 0, then you can set headers to be sent in the handshake response:
+
+```zig
+pub fn init(h: *ws.Handshake, conn: *ws.Conn, app: *App) !Handler {
+    h.res_headers.add("set-cookie", "delicious")
+    //...
+}
+```
+
+Note that, currently, the total length of the headers added to `res_headers` should not exceed 1024 characters, else you will exeperience an out of bounds segfault.
+
 ```zig
 // the last parameter, an *App in this case, is an application-specific
 // value that you passed into server.listen()
-pub fn init(h: websocket.Handshake, conn: websocket.Conn, app: *App) !Handler {
+pub fn init(h: *websocket.Handshake, conn: websocket.Conn, app: *App) !Handler {
     // get returns a ?[]const u8
     // the name is lowercase
     // the value is in its original case

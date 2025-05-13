@@ -88,7 +88,7 @@ const Context = struct {};
 const Handler = struct {
     conn: *Conn,
 
-    pub fn init(_: Handshake, conn: *Conn, ctx: void) !Handler {
+    pub fn init(_: *const Handshake, conn: *Conn, ctx: void) !Handler {
         _ = ctx;
         return .{ .conn = conn };
     }

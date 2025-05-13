@@ -21,6 +21,7 @@ pub const Handshake = struct {
     key: []const u8,
     method: []const u8,
     headers: *KeyValue,
+    res_headers: KeyValue,
     raw_header: []const u8,
     compression: ?Compression,
 
@@ -47,7 +48,7 @@ pub const Handshake = struct {
             return error.InvalidProtocol;
         }
 
-        var headers = &state.headers;
+        var headers = &state.req_headers;
 
         var key: []const u8 = "";
         var required_headers: u8 = 0;
@@ -116,11 +117,12 @@ pub const Handshake = struct {
             .method = method,
             .headers = headers,
             .compression = compression,
+            .res_headers = state.res_headers,
             .raw_header = request[request_line_end + 2 .. request_length + 2],
         };
     }
 
-    pub fn createReply(key: []const u8, compression: ?websocket.Compression, buf: []u8) []const u8 {
+    pub fn createReply(key: []const u8, headers: *const KeyValue, compression: ?websocket.Compression, buf: []u8) ![]const u8 {
         const HEADER =
             "HTTP/1.1 101 Switching Protocols\r\n" ++
             "Upgrade: websocket\r\n" ++
@@ -163,6 +165,10 @@ pub const Handshake = struct {
                 @memcpy(buf[pos..end], client_no_context_takeover);
                 pos = end;
             }
+        }
+
+        for (headers.keys[0..headers.len], headers.values[0..headers.len]) |k, v| {
+            pos += (try std.fmt.bufPrint(buf[pos..], "\r\n{s}: {s}", .{k, v})).len;
         }
 
         const end = pos + 4;
@@ -224,8 +230,11 @@ pub const Handshake = struct {
         // a buffer to read data into
         buf: []u8,
 
-        // Headers
-        headers: KeyValue,
+        // Headers from the request
+        req_headers: KeyValue,
+
+        // Headers that we want to send in the response
+        res_headers: KeyValue,
 
         pool: *M.Pool,
 
@@ -234,25 +243,31 @@ pub const Handshake = struct {
             const buf = try allocator.alloc(u8, pool.buffer_size);
             errdefer allocator.free(buf);
 
-            const headers = try KeyValue.init(allocator, pool.max_headers);
-            errdefer headers.deinit(allocator);
+            const req_headers = try KeyValue.init(allocator, pool.max_req_headers);
+            errdefer req_headers.deinit(allocator);
+
+            const res_headers = try KeyValue.init(allocator, pool.max_res_headers);
+            errdefer res_headers.deinit(allocator);
 
             return .{
                 .buf = buf,
                 .pool = pool,
-                .headers = headers,
+                .req_headers = req_headers,
+                .res_headers = res_headers,
             };
         }
 
         fn deinit(self: *State) void {
             const allocator = self.pool.allocator;
             allocator.free(self.buf);
-            self.headers.deinit(allocator);
+            self.req_headers.deinit(allocator);
+            self.res_headers.deinit(allocator);
         }
 
         pub fn release(self: *State) void {
             self.len = 0;
-            self.headers.len = 0;
+            self.req_headers.len = 0;
+            self.res_headers.len = 0;
             self.pool.release(self);
         }
     };
@@ -282,7 +297,7 @@ pub const KeyValue = struct {
         allocator.free(self.values);
     }
 
-    fn add(self: *KeyValue, key: []const u8, value: []const u8) void {
+    pub fn add(self: *KeyValue, key: []const u8, value: []const u8) void {
         const len = self.len;
         var keys = self.keys;
         if (len == keys.len) {
@@ -354,10 +369,11 @@ pub const Pool = struct {
     available: usize,
     allocator: Allocator,
     buffer_size: usize,
-    max_headers: usize,
+    max_req_headers: usize,
+    max_res_headers: usize,
     states: []*Handshake.State,
 
-    pub fn init(allocator: Allocator, count: usize, buffer_size: usize, max_headers: usize) !*Pool {
+    pub fn init(allocator: Allocator, count: usize, buffer_size: usize, max_req_headers: usize,  max_res_headers: usize) !*Pool {
         const states = try allocator.alloc(*Handshake.State, count);
         errdefer allocator.free(states);
 
@@ -369,8 +385,9 @@ pub const Pool = struct {
             .states = states,
             .allocator = allocator,
             .available = count,
-            .max_headers = max_headers,
             .buffer_size = buffer_size,
+            .max_req_headers = max_req_headers,
+            .max_res_headers = max_res_headers,
         };
 
         for (0..count) |i| {
@@ -442,7 +459,7 @@ fn toLower(str: []u8) []u8 {
 
 const t = @import("../t.zig");
 test "handshake: parse" {
-    var pool = try Pool.init(t.allocator, 1, 512, 10);
+    var pool = try Pool.init(t.allocator, 1, 512, 10, 1);
     defer pool.deinit();
 
     {
@@ -509,6 +526,9 @@ test "handshake: parse" {
 
 test "handshake: reply" {
     var buf: [512]u8 = undefined;
+    var res_headers = try KeyValue.init(t.allocator, 2);
+    defer res_headers.deinit(t.allocator);
+
     {
         // no compression
         const expected =
@@ -517,7 +537,7 @@ test "handshake: reply" {
             "Connection: upgrade\r\n" ++
             "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n\r\n"
         ;
-        try t.expectString(expected, Handshake.createReply("this is my key", null, &buf));
+        try t.expectString(expected, try Handshake.createReply("this is my key", &res_headers, null, &buf));
     }
 
     {
@@ -529,7 +549,7 @@ test "handshake: reply" {
             "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n" ++
             "Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n"
         ;
-        try t.expectString(expected, Handshake.createReply("this is my key", .{}, &buf));
+        try t.expectString(expected, try Handshake.createReply("this is my key", &res_headers, .{}, &buf));
     }
 
     {
@@ -541,7 +561,50 @@ test "handshake: reply" {
             "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n" ++
             "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n\r\n"
         ;
-        try t.expectString(expected, Handshake.createReply("this is my key", .{
+        try t.expectString(expected, try Handshake.createReply("this is my key", &res_headers, .{
+            .client_no_context_takeover = true,
+            .server_no_context_takeover = true,
+        }, &buf));
+    }
+
+    // With custom headers
+    res_headers.add("Set-Cookie", "Yummy!");
+    {
+        // no compression
+        const expected =
+            "HTTP/1.1 101 Switching Protocols\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: upgrade\r\n" ++
+            "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n" ++
+            "Set-Cookie: Yummy!\r\n\r\n"
+        ;
+        try t.expectString(expected, try Handshake.createReply("this is my key", &res_headers, null, &buf));
+    }
+
+    {
+        // compression
+        const expected =
+            "HTTP/1.1 101 Switching Protocols\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: upgrade\r\n" ++
+            "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n" ++
+            "Sec-WebSocket-Extensions: permessage-deflate\r\n" ++
+            "Set-Cookie: Yummy!\r\n\r\n"
+        ;
+        try t.expectString(expected, try Handshake.createReply("this is my key", &res_headers, .{}, &buf));
+    }
+
+    {
+        // compression
+        const expected =
+            "HTTP/1.1 101 Switching Protocols\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: upgrade\r\n" ++
+            "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n" ++
+            "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n" ++
+            "Set-Cookie: Yummy!\r\n\r\n"
+        ;
+        try t.expectString(expected, try Handshake.createReply("this is my key", &res_headers, .{
             .client_no_context_takeover = true,
             .server_no_context_takeover = true,
         }, &buf));
@@ -584,7 +647,7 @@ test "KeyValue: ignores beyond max" {
 
 test "pool: acquire and release" {
     // not 100% sure this is testing exactly what I want, but it's ....something ?
-    var p = try Pool.init(t.allocator, 2, 10, 3);
+    var p = try Pool.init(t.allocator, 2, 10, 3, 1);
     defer p.deinit();
 
     var hs1a = p.acquire() catch unreachable;
@@ -596,12 +659,12 @@ test "pool: acquire and release" {
     try t.expectEqual(10, hs1a.buf.len);
     try t.expectEqual(10, hs2a.buf.len);
     try t.expectEqual(10, hs3a.buf.len);
-    try t.expectEqual(0, hs1a.headers.len);
-    try t.expectEqual(0, hs2a.headers.len);
-    try t.expectEqual(0, hs3a.headers.len);
-    try t.expectEqual(3, hs1a.headers.keys.len);
-    try t.expectEqual(3, hs2a.headers.keys.len);
-    try t.expectEqual(3, hs3a.headers.keys.len);
+    try t.expectEqual(0, hs1a.req_headers.len);
+    try t.expectEqual(0, hs2a.req_headers.len);
+    try t.expectEqual(0, hs3a.req_headers.len);
+    try t.expectEqual(3, hs1a.req_headers.keys.len);
+    try t.expectEqual(3, hs2a.req_headers.keys.len);
+    try t.expectEqual(3, hs3a.req_headers.keys.len);
 
     p.release(hs1a);
 
@@ -614,7 +677,7 @@ test "pool: acquire and release" {
 }
 
 test "Handshake.Pool: threadsafety" {
-    var p = try Pool.init(t.allocator, 4, 10, 2);
+    var p = try Pool.init(t.allocator, 4, 10, 2, 2);
     defer p.deinit();
 
     for (p.states) |hs| {
