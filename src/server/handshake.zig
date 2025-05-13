@@ -21,7 +21,7 @@ pub const Handshake = struct {
     key: []const u8,
     method: []const u8,
     headers: *KeyValue,
-    res_headers: KeyValue,
+    res_headers: *KeyValue,
     raw_header: []const u8,
     compression: ?Compression,
 
@@ -117,7 +117,7 @@ pub const Handshake = struct {
             .method = method,
             .headers = headers,
             .compression = compression,
-            .res_headers = state.res_headers,
+            .res_headers = &state.res_headers,
             .raw_header = request[request_line_end + 2 .. request_length + 2],
         };
     }
