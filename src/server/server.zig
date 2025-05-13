@@ -1564,7 +1564,7 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
     hc.handler = handler;
 
     var reply_buf: [2048]u8 = undefined;
-    const handshake_reply = try Handshake.createReply(handshake.key, &handshake.res_headers, agreed_compression, &reply_buf);
+    const handshake_reply = try Handshake.createReply(handshake.key, handshake.res_headers, agreed_compression, &reply_buf);
     try conn.writeFramed(handshake_reply);
 
     if (comptime std.meta.hasFn(H, "afterInit")) {
