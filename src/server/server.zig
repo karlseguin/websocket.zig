@@ -143,7 +143,10 @@ pub fn Server(comptime H: type) type {
 
         pub fn listen(self: *Self, ctx: anytype) !void {
             self._mut.lock();
-            errdefer self._mut.unlock();
+            errdefer {
+                self._cond.signal();
+                self._mut.unlock();
+            }
 
             const config = &self.config;
 
