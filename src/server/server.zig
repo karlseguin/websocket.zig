@@ -1528,7 +1528,7 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
     }
 
     state.len = len + n;
-    const handshake = Handshake.parse(state) catch |err| {
+    var handshake = Handshake.parse(state) catch |err| {
         log.debug("({}) error parsing handshake: {}", .{ conn.address, err });
         respondToHandshakeError(conn, err);
         return .{null, false};
