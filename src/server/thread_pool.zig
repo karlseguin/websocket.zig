@@ -195,7 +195,7 @@ test "ThreadPool: small fuzz" {
         tp.spawn(.{1});
     }
     while (tp.empty() == false) {
-        std.time.sleep(std.time.ns_per_ms);
+        std.Thread.sleep(std.time.ns_per_ms);
     }
     tp.deinit();
     try t.expectEqual(50_000, testSum);
@@ -209,7 +209,7 @@ test "ThreadPool: large fuzz" {
         tp.spawn(.{1});
     }
     while (tp.empty() == false) {
-        std.time.sleep(std.time.ns_per_ms);
+        std.Thread.sleep(std.time.ns_per_ms);
     }
     tp.deinit();
     try t.expectEqual(50_000, testSum);
@@ -220,5 +220,5 @@ fn testIncr(c: u64, buf: []u8) void {
     std.debug.assert(buf.len == 512);
     _ = @atomicRmw(u64, &testSum, .Add, c, .monotonic);
     // let the threadpool queue get backed up
-    std.time.sleep(std.time.ns_per_us * 100);
+    std.Thread.sleep(std.time.ns_per_us * 100);
 }

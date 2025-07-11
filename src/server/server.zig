@@ -382,7 +382,7 @@ pub fn Blocking(comptime H: type) type {
                     }
                     if (hc.handler != null) {
                         // if we have a handler, the our handshake completed
-                    try conn_manager.setupCompression(hc, compression);
+                        try conn_manager.setupCompression(hc, compression);
                         break;
                     }
                     if (timestamp() > deadline) {
@@ -430,7 +430,7 @@ pub fn Blocking(comptime H: type) type {
                 if (conn_manager.count() == 0) {
                     return;
                 }
-                std.time.sleep(std.time.ns_per_ms * 100);
+                std.Thread.sleep(std.time.ns_per_ms * 100);
             }
         }
 
@@ -520,7 +520,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 
                 var it = self.loop.wait(timeout) catch |err| {
                     log.err("failed to wait on events: {}", .{err});
-                    std.time.sleep(std.time.ns_per_s);
+                    std.Thread.sleep(std.time.ns_per_s);
                     continue;
                 };
 
@@ -530,7 +530,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
                     if (data == 0) {
                         self.accept(listener, now) catch |err| {
                             log.err("accept error: {}", .{err});
-                            std.time.sleep(std.time.ns_per_ms);
+                            std.Thread.sleep(std.time.ns_per_ms);
                         };
                         continue;
                     }
@@ -642,7 +642,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
             var success = false;
             if (hc.handler == null) {
                 success = self.dataForHandshake(hc) catch |err| blk: {
-                    log.err("({}) error processing handshake: {}", .{ hc.conn.address, err });
+                    log.err("({f}) error processing handshake: {}", .{ hc.conn.address, err });
                     break :blk false;
                 };
             } else {
@@ -681,7 +681,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
                 conn_manager.inactive(hc);
             }
 
-        try conn_manager.setupCompression(hc, compression);
+            try conn_manager.setupCompression(hc, compression);
             return true;
         }
     };
@@ -740,7 +740,7 @@ fn NonBlockingBase(comptime H: type, comptime MANAGE_HS: bool) type {
 
         pub fn dataAvailable(self: *Self, hc: *HandlerConn(H), thread_buf: []u8) bool {
             return self._dataAvailable(hc, thread_buf) catch |err| {
-                log.err("({}) error processing client message: {}", .{ hc.conn.address, err });
+                log.err("({f}) error processing client message: {}", .{ hc.conn.address, err });
                 return false;
             };
         }
@@ -1382,7 +1382,7 @@ pub const Conn = struct {
                 var fbs = std.io.fixedBufferStream(data);
                 _ = try compressor.compress(fbs.reader());
                 try compressor.flush();
-                payload = writer.items[0..writer.items.len - 4];
+                payload = writer.items[0 .. writer.items.len - 4];
 
                 if (c.reset) {
                     c.compressor = try Conn.Compression.Type.init(writer.writer(), .{});
@@ -1464,7 +1464,7 @@ pub const Conn = struct {
         buf: std.ArrayList(u8),
 
         pub const Error = Allocator.Error;
-        pub const IOWriter = std.io.Writer(*Writer, error{OutOfMemory}, Writer.write);
+        pub const IOWriter = std.io.GenericWriter(*Writer, error{OutOfMemory}, Writer.write);
 
         pub fn deinit(self: *Writer) void {
             self.buf.deinit();
@@ -1485,14 +1485,14 @@ pub const Conn = struct {
     };
 };
 
-fn handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx: anytype) struct{?Compression, bool} {
+fn handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx: anytype) struct { ?Compression, bool } {
     return _handleHandshake(H, worker, hc, ctx) catch |err| {
-        log.warn("({}) uncaugh error processing handshake: {}", .{ hc.conn.address, err });
-        return .{null, false};
+        log.warn("({f}) uncaugh error processing handshake: {}", .{ hc.conn.address, err });
+        return .{ null, false };
     };
 }
 
-fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx: anytype) !struct{?Compression, bool} {
+fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx: anytype) !struct { ?Compression, bool } {
     std.debug.assert(hc.handler == null);
 
     var state = hc.handshake orelse blk: {
@@ -1506,8 +1506,8 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
     const len = state.len;
 
     if (len == buf.len) {
-        log.warn("({}) handshake request exceeded maximum configured size ({d})", .{ conn.address, buf.len });
-        return .{null, false};
+        log.warn("({f}) handshake request exceeded maximum configured size ({d})", .{ conn.address, buf.len });
+        return .{ null, false };
     }
 
     const n = posix.read(hc.socket, buf[len..]) catch |err| {
@@ -1515,26 +1515,26 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
             error.BrokenPipe, error.ConnectionResetByPeer => log.debug("({}) handshake connection closed: {}", .{ conn.address, err }),
             error.WouldBlock => {
                 std.debug.assert(blockingMode());
-                log.debug("({}) handshake timeout", .{conn.address});
+                log.debug("({f}) handshake timeout", .{conn.address});
             },
-            else => log.warn("({}) handshake error reading from socket: {}", .{ conn.address, err }),
+            else => log.warn("({f}) handshake error reading from socket: {}", .{ conn.address, err }),
         }
-        return .{null, false};
+        return .{ null, false };
     };
 
     if (n == 0) {
-        log.debug("({}) handshake connection closed", .{conn.address});
-        return .{null, false};
+        log.debug("({f}) handshake connection closed", .{conn.address});
+        return .{ null, false };
     }
 
     state.len = len + n;
     var handshake = Handshake.parse(state) catch |err| {
-        log.debug("({}) error parsing handshake: {}", .{ conn.address, err });
+        log.debug("({f}) error parsing handshake: {}", .{ conn.address, err });
         respondToHandshakeError(conn, err);
-        return .{null, false};
+        return .{ null, false };
     } orelse {
         // we need more data
-        return .{null, true};
+        return .{ null, true };
     };
 
     var agreed_compression: ?Compression = null;
@@ -1550,7 +1550,6 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
     defer state.release();
     hc.handshake = null;
 
-
     // After this, the app has access to &hc.conn, so any access to the
     // conn has to be synchronized (which the conn does internally).
 
@@ -1560,8 +1559,8 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
         } else {
             respondToHandshakeError(conn, err);
         }
-        log.debug("({}) " ++ @typeName(H) ++ ".init rejected request {}", .{ conn.address, err });
-        return .{null, false};
+        log.debug("({f}) " ++ @typeName(H) ++ ".init rejected request {}", .{ conn.address, err });
+        return .{ null, false };
     };
 
     hc.handler = handler;
@@ -1574,19 +1573,19 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
         const params = @typeInfo(@TypeOf(H.afterInit)).@"fn".params;
         const res = if (params.len == 1) hc.handler.?.afterInit() else hc.handler.?.afterInit(ctx);
         res catch |err| {
-            log.debug("({}) " ++ @typeName(H) ++ ".afterInit error: {}", .{ conn.address, err });
-            return .{null, false};
+            log.debug("({f}) " ++ @typeName(H) ++ ".afterInit error: {}", .{ conn.address, err });
+            return .{ null, false };
         };
     }
 
-    log.debug("({}) connection successfully upgraded", .{conn.address});
-    return .{agreed_compression, true};
+    log.debug("({f}) connection successfully upgraded", .{conn.address});
+    return .{ agreed_compression, true };
 }
 
 fn handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator, fba: *FixedBufferAllocator) bool {
     std.debug.assert(hc.handshake == null);
     return _handleClientData(H, hc, allocator, fba) catch |err| {
-        log.warn("({}) uncaugh error handling incoming data: {}", .{ hc.conn.address, err });
+        log.warn("({f}) uncaugh error handling incoming data: {}", .{ hc.conn.address, err });
         return false;
     };
 }
@@ -1596,8 +1595,8 @@ fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator
     var reader = &hc.reader.?;
     reader.fill(conn.stream) catch |err| {
         switch (err) {
-            error.BrokenPipe, error.Closed, error.ConnectionResetByPeer => log.debug("({}) connection closed: {}", .{ conn.address, err }),
-            else => log.warn("({}) error reading from connection: {}", .{ conn.address, err }),
+            error.BrokenPipe, error.Closed, error.ConnectionResetByPeer => log.debug("({f}) connection closed: {}", .{ conn.address, err }),
+            else => log.warn("({f}) error reading from connection: {}", .{ conn.address, err }),
         }
         return false;
     };
@@ -1612,7 +1611,7 @@ fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator
                 error.CompressionError => conn.writeFramed(CLOSE_PROTOCOL_ERROR) catch {},
                 else => {},
             }
-            log.debug("({}) invalid websocket packet: {}", .{ conn.address, err });
+            log.debug("({f}) invalid websocket packet: {}", .{ conn.address, err });
             return false;
         } orelse {
             // everything is fine, we just need more data
@@ -1622,7 +1621,7 @@ fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator
         const message_type = message.type;
         defer reader.done(message_type);
 
-        log.debug("({}) received {s} message", .{ hc.conn.address, @tagName(message_type) });
+        log.debug("({f}) received {s} message", .{ hc.conn.address, @tagName(message_type) });
         switch (message_type) {
             .text, .binary => {
                 const params = @typeInfo(@TypeOf(H.clientMessage)).@"fn".params;
