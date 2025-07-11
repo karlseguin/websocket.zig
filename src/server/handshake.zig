@@ -277,7 +277,7 @@ pub const KeyValue = struct {
     keys: [][]const u8,
     values: [][]const u8,
 
-    fn init(allocator: Allocator, max: usize) !KeyValue {
+    pub fn init(allocator: Allocator, max: usize) !KeyValue {
         const keys = try allocator.alloc([]const u8, max);
         errdefer allocator.free(keys);
 
@@ -291,7 +291,7 @@ pub const KeyValue = struct {
         };
     }
 
-    fn deinit(self: *const KeyValue, allocator: Allocator) void {
+    pub fn deinit(self: *const KeyValue, allocator: Allocator) void {
         allocator.free(self.keys);
         allocator.free(self.values);
     }
