@@ -18,6 +18,7 @@ pub const Config = server.Config;
 pub const Server = server.Server;
 pub const blockingMode = server.blockingMode;
 pub const Handshake = @import("server/handshake.zig").Handshake;
+pub const KeyValue = @import("server/handshake.zig").KeyValue;
 
 pub const Compression = struct {
     write_threshold: ?usize = null,
@@ -46,7 +47,7 @@ const t = @import("t.zig");
 test "frameText" {
     {
         const framed = frameText("");
-        try t.expectString(&[_]u8{ 129, 0}, &framed);
+        try t.expectString(&[_]u8{ 129, 0 }, &framed);
     }
 
     {
