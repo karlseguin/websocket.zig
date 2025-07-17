@@ -69,7 +69,7 @@ pub const Handshake = struct {
             headers.add(name, value);
             switch (std.meta.stringToEnum(SpecialHeader, name) orelse .none) {
                 .upgrade => {
-                  if (!ascii.eqlIgnoreCase("websocket", value)) {
+                    if (!ascii.eqlIgnoreCase("websocket", value)) {
                         return error.InvalidUpgrade;
                     }
                     required_headers |= 1;
@@ -127,8 +127,7 @@ pub const Handshake = struct {
             "HTTP/1.1 101 Switching Protocols\r\n" ++
             "Upgrade: websocket\r\n" ++
             "Connection: upgrade\r\n" ++
-            "Sec-Websocket-Accept: "
-        ;
+            "Sec-Websocket-Accept: ";
 
         @memcpy(buf[0..HEADER.len], HEADER);
         var pos = HEADER.len;
@@ -168,7 +167,7 @@ pub const Handshake = struct {
         }
 
         for (headers.keys[0..headers.len], headers.values[0..headers.len]) |k, v| {
-            pos += (try std.fmt.bufPrint(buf[pos..], "\r\n{s}: {s}", .{k, v})).len;
+            pos += (try std.fmt.bufPrint(buf[pos..], "\r\n{s}: {s}", .{ k, v })).len;
         }
 
         const end = pos + 4;
@@ -373,7 +372,7 @@ pub const Pool = struct {
     max_res_headers: usize,
     states: []*Handshake.State,
 
-    pub fn init(allocator: Allocator, count: usize, buffer_size: usize, max_req_headers: usize,  max_res_headers: usize) !*Pool {
+    pub fn init(allocator: Allocator, count: usize, buffer_size: usize, max_req_headers: usize, max_res_headers: usize) !*Pool {
         const states = try allocator.alloc(*Handshake.State, count);
         errdefer allocator.free(states);
 
@@ -535,8 +534,7 @@ test "handshake: reply" {
             "HTTP/1.1 101 Switching Protocols\r\n" ++
             "Upgrade: websocket\r\n" ++
             "Connection: upgrade\r\n" ++
-            "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n\r\n"
-        ;
+            "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n\r\n";
         try t.expectString(expected, try Handshake.createReply("this is my key", &res_headers, null, &buf));
     }
 
@@ -547,8 +545,7 @@ test "handshake: reply" {
             "Upgrade: websocket\r\n" ++
             "Connection: upgrade\r\n" ++
             "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n" ++
-            "Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n"
-        ;
+            "Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n";
         try t.expectString(expected, try Handshake.createReply("this is my key", &res_headers, .{}, &buf));
     }
 
@@ -559,8 +556,7 @@ test "handshake: reply" {
             "Upgrade: websocket\r\n" ++
             "Connection: upgrade\r\n" ++
             "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n" ++
-            "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n\r\n"
-        ;
+            "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n\r\n";
         try t.expectString(expected, try Handshake.createReply("this is my key", &res_headers, .{
             .client_no_context_takeover = true,
             .server_no_context_takeover = true,
@@ -576,8 +572,7 @@ test "handshake: reply" {
             "Upgrade: websocket\r\n" ++
             "Connection: upgrade\r\n" ++
             "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n" ++
-            "Set-Cookie: Yummy!\r\n\r\n"
-        ;
+            "Set-Cookie: Yummy!\r\n\r\n";
         try t.expectString(expected, try Handshake.createReply("this is my key", &res_headers, null, &buf));
     }
 
@@ -589,8 +584,7 @@ test "handshake: reply" {
             "Connection: upgrade\r\n" ++
             "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n" ++
             "Sec-WebSocket-Extensions: permessage-deflate\r\n" ++
-            "Set-Cookie: Yummy!\r\n\r\n"
-        ;
+            "Set-Cookie: Yummy!\r\n\r\n";
         try t.expectString(expected, try Handshake.createReply("this is my key", &res_headers, .{}, &buf));
     }
 
@@ -602,8 +596,7 @@ test "handshake: reply" {
             "Connection: upgrade\r\n" ++
             "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n" ++
             "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n" ++
-            "Set-Cookie: Yummy!\r\n\r\n"
-        ;
+            "Set-Cookie: Yummy!\r\n\r\n";
         try t.expectString(expected, try Handshake.createReply("this is my key", &res_headers, .{
             .client_no_context_takeover = true,
             .server_no_context_takeover = true,
@@ -703,7 +696,7 @@ fn testPool(p: *Pool) void {
         var hs = p.acquire() catch unreachable;
         std.debug.assert(hs.buf[0] == 0);
         hs.buf[0] = 255;
-        std.time.sleep(random.uintAtMost(u32, 100000));
+        std.Thread.sleep(random.uintAtMost(u32, 100000));
         hs.buf[0] = 0;
         p.release(hs);
     }

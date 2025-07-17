@@ -46,7 +46,7 @@ const t = @import("t.zig");
 test "frameText" {
     {
         const framed = frameText("");
-        try t.expectString(&[_]u8{ 129, 0}, &framed);
+        try t.expectString(&[_]u8{ 129, 0 }, &framed);
     }
 
     {

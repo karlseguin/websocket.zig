@@ -32,7 +32,7 @@ pub fn main() !void {
     };
 
     // wait 5 seconds for autobanh server to be up
-    std.time.sleep(std.time.ns_per_s * 5);
+    std.Thread.sleep(std.time.ns_per_s * 5);
 
     var buffer_provider = try websocket.bufferProvider(allocator, .{ .count = 10, .size = 32768, .max = 20_000_000 });
     defer buffer_provider.deinit();
