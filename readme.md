@@ -403,7 +403,7 @@ The library comes with some helpers for testing.
 const wt = @import("websocket").testing;
 
 test "handler: echo" {
-    var wtt = wt.init();
+    var wtt = wt.init(.{});
     defer wtt.deinit();
 
     // create an instance of your handler (however you want)

@@ -16,7 +16,10 @@ pub const Testing = struct {
     received: std.ArrayList(ws.Message),
     received_index: usize,
 
-    fn init() Testing {
+    const Opts = struct {
+        port: ?u16 = null,
+    };
+    fn init(opts: Opts) Testing {
         const arena = t.allocator.create(std.heap.ArenaAllocator) catch unreachable;
         errdefer t.allocator.destroy(arena);
 
@@ -49,7 +52,7 @@ pub const Testing = struct {
                 ._closed = false,
                 .started = 0,
                 .stream = pair.server,
-                .address = std.net.Address.parseIp("127.0.0.1", 0) catch unreachable,
+                .address = std.net.Address.parseIp("127.0.0.1", opts.port orelse 0) catch unreachable,
             },
             .reader = reader,
             .received = std.ArrayList(ws.Message).init(aa),
