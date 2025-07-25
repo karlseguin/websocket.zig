@@ -26,7 +26,8 @@ pub const Testing = struct {
         arena.* = std.heap.ArenaAllocator.init(t.allocator);
         errdefer arena.deinit();
 
-        const pair = t.SocketPair.init();
+        const port = opts.port orelse 0;
+        const pair = t.SocketPair.init(.{.port = port});
         const timeout = std.mem.toBytes(std.posix.timeval{
             .sec = 0,
             .usec = 50_000,
@@ -52,7 +53,7 @@ pub const Testing = struct {
                 ._closed = false,
                 .started = 0,
                 .stream = pair.server,
-                .address = std.net.Address.parseIp("127.0.0.1", opts.port orelse 0) catch unreachable,
+                .address = std.net.Address.parseIp("127.0.0.1", port) catch unreachable,
             },
             .reader = reader,
             .received = std.ArrayList(ws.Message).init(aa),
@@ -97,7 +98,7 @@ pub const Testing = struct {
 
     // we have a 50ms timeout on this socket. It's all localhost. We expect
     // to be able to read messages in that time.
-    fn ensureMessage(self: *Testing) !void {
+    pub fn ensureMessage(self: *Testing) !void {
         if (self.received_index < self.received.items.len) {
             return;
         }

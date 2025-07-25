@@ -578,7 +578,7 @@ const t = @import("../t.zig");
 test "Client: handshake" {
     {
         // empty response
-        var pair = t.SocketPair.init();
+        var pair = t.SocketPair.init(.{});
         defer pair.deinit();
         try pair.client.writeAll("\r\n\r\n");
 
@@ -589,7 +589,7 @@ test "Client: handshake" {
 
     {
         // invalid websocket response
-        var pair = t.SocketPair.init();
+        var pair = t.SocketPair.init(.{});
         defer pair.deinit();
         try pair.client.writeAll("HTTP/1.1 200 OK\r\n\r\n");
 
@@ -600,7 +600,7 @@ test "Client: handshake" {
 
     {
         // missing upgrade header
-        var pair = t.SocketPair.init();
+        var pair = t.SocketPair.init(.{});
         defer pair.deinit();
         try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\n\r\n");
 
@@ -611,7 +611,7 @@ test "Client: handshake" {
 
     {
         // wrong upgrade header
-        var pair = t.SocketPair.init();
+        var pair = t.SocketPair.init(.{});
         defer pair.deinit();
         try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: nope\r\n\r\n");
 
@@ -622,7 +622,7 @@ test "Client: handshake" {
 
     {
         // missing connection header
-        var pair = t.SocketPair.init();
+        var pair = t.SocketPair.init(.{});
         defer pair.deinit();
         try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: websocket\r\n\r\n");
 
@@ -633,7 +633,7 @@ test "Client: handshake" {
 
     {
         // wrong connection header
-        var pair = t.SocketPair.init();
+        var pair = t.SocketPair.init(.{});
         defer pair.deinit();
         try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: something\r\n\r\n");
 
@@ -644,7 +644,7 @@ test "Client: handshake" {
 
     {
         // missing Sec-Websocket-Accept header
-        var pair = t.SocketPair.init();
+        var pair = t.SocketPair.init(.{});
         defer pair.deinit();
         try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n");
 
@@ -655,7 +655,7 @@ test "Client: handshake" {
 
     {
         // wrong Sec-Websocket-Accept header
-        var pair = t.SocketPair.init();
+        var pair = t.SocketPair.init(.{});
         defer pair.deinit();
         try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: hack\r\n\r\n");
 
@@ -666,7 +666,7 @@ test "Client: handshake" {
 
     {
         // ok for successful
-        var pair = t.SocketPair.init();
+        var pair = t.SocketPair.init(.{});
         defer pair.deinit();
         try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: C/0nmHhBztSRGR1CwL6Tf4ZjwpY=\r\n\r\n");
 
@@ -678,7 +678,7 @@ test "Client: handshake" {
 
     {
         // ok for successful, with overread
-        var pair = t.SocketPair.init();
+        var pair = t.SocketPair.init(.{});
         defer pair.deinit();
         try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: C/0nmHhBztSRGR1CwL6Tf4ZjwpY=\r\n\r\nSome Random Data Which is Part Of the Next Message");
 

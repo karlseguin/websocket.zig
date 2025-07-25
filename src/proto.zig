@@ -620,7 +620,7 @@ test "mask" {
 test "Reader: read too large" {
     defer t.reset();
 
-    var pair = t.SocketPair.init();
+    var pair = t.SocketPair.init(.{});
     defer pair.deinit();
     pair.textFrame(true, "hello world");
     pair.sendBuf();
@@ -633,7 +633,7 @@ test "Reader: read too large" {
 test "Reader: read too large over multiple fragments" {
     defer t.reset();
 
-    var pair = t.SocketPair.init();
+    var pair = t.SocketPair.init(.{});
     defer pair.deinit();
     pair.textFrame(false, "hello world");
     pair.cont(false, " !!!_!!! ");
@@ -648,7 +648,7 @@ test "Reader: read too large over multiple fragments" {
 test "Reader: exact read into static with no overflow" {
     defer t.reset();
 
-    var pair = t.SocketPair.init();
+    var pair = t.SocketPair.init(.{});
     defer pair.deinit();
     pair.textFrame(true, "hello!");
     pair.sendBuf();
