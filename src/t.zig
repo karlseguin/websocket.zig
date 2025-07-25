@@ -148,8 +148,12 @@ pub const SocketPair = struct {
     client: std.net.Stream,
     server: std.net.Stream,
 
-    pub fn init() SocketPair {
-        var address = std.net.Address.parseIp("127.0.0.1", 0) catch unreachable;
+    const Opts = struct {
+        port: ?u16 = null,
+    };
+
+    pub fn init(opts: Opts) SocketPair {
+        var address = std.net.Address.parseIp("127.0.0.1", opts.port orelse 0) catch unreachable;
         var address_len = address.getOsSockLen();
 
         const listener = posix.socket(address.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch unreachable;
