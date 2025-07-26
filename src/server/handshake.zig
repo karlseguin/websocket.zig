@@ -122,7 +122,7 @@ pub const Handshake = struct {
         };
     }
 
-    pub fn createReply(key: []const u8, headers: *const KeyValue, compression: ?websocket.Compression, buf: []u8) ![]const u8 {
+    pub fn createReply(key: []const u8, headers_: ?*KeyValue, compression: ?websocket.Compression, buf: []u8) ![]const u8 {
         const HEADER =
             "HTTP/1.1 101 Switching Protocols\r\n" ++
             "Upgrade: websocket\r\n" ++
@@ -166,8 +166,10 @@ pub const Handshake = struct {
             }
         }
 
-        for (headers.keys[0..headers.len], headers.values[0..headers.len]) |k, v| {
-            pos += (try std.fmt.bufPrint(buf[pos..], "\r\n{s}: {s}", .{ k, v })).len;
+        if (headers_) |headers| {
+            for (headers.keys[0..headers.len], headers.values[0..headers.len]) |k, v| {
+                pos += (try std.fmt.bufPrint(buf[pos..], "\r\n{s}: {s}", .{ k, v })).len;
+            }
         }
 
         const end = pos + 4;
@@ -242,10 +244,10 @@ pub const Handshake = struct {
             const buf = try allocator.alloc(u8, pool.buffer_size);
             errdefer allocator.free(buf);
 
-            const req_headers = try KeyValue.init(allocator, pool.max_req_headers);
+            const req_headers = try Handshake.KeyValue.init(allocator, pool.max_req_headers);
             errdefer req_headers.deinit(allocator);
 
-            const res_headers = try KeyValue.init(allocator, pool.max_res_headers);
+            const res_headers = try Handshake.KeyValue.init(allocator, pool.max_res_headers);
             errdefer res_headers.deinit(allocator);
 
             return .{
@@ -270,96 +272,96 @@ pub const Handshake = struct {
             self.pool.release(self);
         }
     };
-};
 
-pub const KeyValue = struct {
-    len: usize,
-    keys: [][]const u8,
-    values: [][]const u8,
-
-    fn init(allocator: Allocator, max: usize) !KeyValue {
-        const keys = try allocator.alloc([]const u8, max);
-        errdefer allocator.free(keys);
-
-        const values = try allocator.alloc([]const u8, max);
-        errdefer allocator.free(values);
-
-        return .{
-            .len = 0,
-            .keys = keys,
-            .values = values,
-        };
-    }
-
-    fn deinit(self: *const KeyValue, allocator: Allocator) void {
-        allocator.free(self.keys);
-        allocator.free(self.values);
-    }
-
-    pub fn add(self: *KeyValue, key: []const u8, value: []const u8) void {
-        const len = self.len;
-        var keys = self.keys;
-        if (len == keys.len) {
-            return;
-        }
-
-        keys[len] = key;
-        self.values[len] = value;
-        self.len = len + 1;
-    }
-
-    pub fn get(self: *const KeyValue, needle: []const u8) ?[]const u8 {
-        const keys = self.keys[0..self.len];
-        loop: for (keys, 0..) |key, i| {
-            // This is largely a reminder to myself that std.mem.eql isn't
-            // particularly fast. Here we at least avoid the 1 extra ptr
-            // equality check that std.mem.eql does, but we could do better
-            // TODO: monitor https://github.com/ziglang/zig/issues/8689
-            if (needle.len != key.len) {
-                continue;
-            }
-            for (needle, key) |n, k| {
-                if (n != k) {
-                    continue :loop;
-                }
-            }
-            return self.values[i];
-        }
-
-        return null;
-    }
-
-    pub fn iterator(self: *const KeyValue) Iterator {
-        const len = self.len;
-        return .{
-            .pos = 0,
-            .keys = self.keys[0..len],
-            .values = self.values[0..len],
-        };
-    }
-
-    pub const Iterator = struct {
-        pos: usize,
+    pub const KeyValue = struct {
+        len: usize,
         keys: [][]const u8,
         values: [][]const u8,
 
-        const KV = struct {
-            key: []const u8,
-            value: []const u8,
-        };
+        fn init(allocator: Allocator, max: usize) !KeyValue {
+            const keys = try allocator.alloc([]const u8, max);
+            errdefer allocator.free(keys);
 
-        pub fn next(self: *Iterator) ?KV {
-            const pos = self.pos;
-            if (pos == self.keys.len) {
-                return null;
-            }
+            const values = try allocator.alloc([]const u8, max);
+            errdefer allocator.free(values);
 
-            self.pos = pos + 1;
             return .{
-                .key = self.keys[pos],
-                .value = self.values[pos],
+                .len = 0,
+                .keys = keys,
+                .values = values,
             };
         }
+
+        fn deinit(self: *const KeyValue, allocator: Allocator) void {
+            allocator.free(self.keys);
+            allocator.free(self.values);
+        }
+
+        pub fn add(self: *KeyValue, key: []const u8, value: []const u8) void {
+            const len = self.len;
+            var keys = self.keys;
+            if (len == keys.len) {
+                return;
+            }
+
+            keys[len] = key;
+            self.values[len] = value;
+            self.len = len + 1;
+        }
+
+        pub fn get(self: *const KeyValue, needle: []const u8) ?[]const u8 {
+            const keys = self.keys[0..self.len];
+            loop: for (keys, 0..) |key, i| {
+                // This is largely a reminder to myself that std.mem.eql isn't
+                // particularly fast. Here we at least avoid the 1 extra ptr
+                // equality check that std.mem.eql does, but we could do better
+                // TODO: monitor https://github.com/ziglang/zig/issues/8689
+                if (needle.len != key.len) {
+                    continue;
+                }
+                for (needle, key) |n, k| {
+                    if (n != k) {
+                        continue :loop;
+                    }
+                }
+                return self.values[i];
+            }
+
+            return null;
+        }
+
+        pub fn iterator(self: *const KeyValue) Iterator {
+            const len = self.len;
+            return .{
+                .pos = 0,
+                .keys = self.keys[0..len],
+                .values = self.values[0..len],
+            };
+        }
+
+        pub const Iterator = struct {
+            pos: usize,
+            keys: [][]const u8,
+            values: [][]const u8,
+
+            const KV = struct {
+                key: []const u8,
+                value: []const u8,
+            };
+
+            pub fn next(self: *Iterator) ?KV {
+                const pos = self.pos;
+                if (pos == self.keys.len) {
+                    return null;
+                }
+
+                self.pos = pos + 1;
+                return .{
+                    .key = self.keys[pos],
+                    .value = self.values[pos],
+                };
+            }
+        };
     };
 };
 
@@ -525,8 +527,6 @@ test "handshake: parse" {
 
 test "handshake: reply" {
     var buf: [512]u8 = undefined;
-    var res_headers = try KeyValue.init(t.allocator, 2);
-    defer res_headers.deinit(t.allocator);
 
     {
         // no compression
@@ -535,6 +535,47 @@ test "handshake: reply" {
             "Upgrade: websocket\r\n" ++
             "Connection: upgrade\r\n" ++
             "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n\r\n";
+        try t.expectString(expected, try Handshake.createReply("this is my key", null, null, &buf));
+    }
+
+    {
+        // compression
+        const expected =
+            "HTTP/1.1 101 Switching Protocols\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: upgrade\r\n" ++
+            "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n" ++
+            "Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n";
+        try t.expectString(expected, try Handshake.createReply("this is my key", null, .{}, &buf));
+    }
+
+    {
+        // compression
+        const expected =
+            "HTTP/1.1 101 Switching Protocols\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: upgrade\r\n" ++
+            "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n" ++
+            "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n\r\n";
+        try t.expectString(expected, try Handshake.createReply("this is my key", null, .{
+            .client_no_context_takeover = true,
+            .server_no_context_takeover = true,
+        }, &buf));
+    }
+
+    // With custom headers
+    var res_headers = try Handshake.KeyValue.init(t.allocator, 2);
+    defer res_headers.deinit(t.allocator);
+    res_headers.add("Set-Cookie", "Yummy!");
+
+    {
+        // no compression
+        const expected =
+            "HTTP/1.1 101 Switching Protocols\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: upgrade\r\n" ++
+            "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n" ++
+            "Set-Cookie: Yummy!\r\n\r\n";
         try t.expectString(expected, try Handshake.createReply("this is my key", &res_headers, null, &buf));
     }
 
@@ -546,7 +587,7 @@ test "handshake: reply" {
             "Connection: upgrade\r\n" ++
             "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n" ++
             "Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n";
-        try t.expectString(expected, try Handshake.createReply("this is my key", &res_headers, .{}, &buf));
+        try t.expectString(expected, try Handshake.createReply("this is my key", null, .{}, &buf));
     }
 
     {
@@ -557,47 +598,7 @@ test "handshake: reply" {
             "Connection: upgrade\r\n" ++
             "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n" ++
             "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n\r\n";
-        try t.expectString(expected, try Handshake.createReply("this is my key", &res_headers, .{
-            .client_no_context_takeover = true,
-            .server_no_context_takeover = true,
-        }, &buf));
-    }
-
-    // With custom headers
-    res_headers.add("Set-Cookie", "Yummy!");
-    {
-        // no compression
-        const expected =
-            "HTTP/1.1 101 Switching Protocols\r\n" ++
-            "Upgrade: websocket\r\n" ++
-            "Connection: upgrade\r\n" ++
-            "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n" ++
-            "Set-Cookie: Yummy!\r\n\r\n";
-        try t.expectString(expected, try Handshake.createReply("this is my key", &res_headers, null, &buf));
-    }
-
-    {
-        // compression
-        const expected =
-            "HTTP/1.1 101 Switching Protocols\r\n" ++
-            "Upgrade: websocket\r\n" ++
-            "Connection: upgrade\r\n" ++
-            "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n" ++
-            "Sec-WebSocket-Extensions: permessage-deflate\r\n" ++
-            "Set-Cookie: Yummy!\r\n\r\n";
-        try t.expectString(expected, try Handshake.createReply("this is my key", &res_headers, .{}, &buf));
-    }
-
-    {
-        // compression
-        const expected =
-            "HTTP/1.1 101 Switching Protocols\r\n" ++
-            "Upgrade: websocket\r\n" ++
-            "Connection: upgrade\r\n" ++
-            "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n" ++
-            "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n" ++
-            "Set-Cookie: Yummy!\r\n\r\n";
-        try t.expectString(expected, try Handshake.createReply("this is my key", &res_headers, .{
+        try t.expectString(expected, try Handshake.createReply("this is my key", null, .{
             .client_no_context_takeover = true,
             .server_no_context_takeover = true,
         }, &buf));
@@ -606,7 +607,7 @@ test "handshake: reply" {
 
 test "KeyValue: get" {
     const allocator = t.allocator;
-    var kv = try KeyValue.init(allocator, 2);
+    var kv = try Handshake.KeyValue.init(allocator, 2);
     defer kv.deinit(t.allocator);
 
     var key = "content-type".*;
@@ -621,7 +622,7 @@ test "KeyValue: get" {
 }
 
 test "KeyValue: ignores beyond max" {
-    var kv = try KeyValue.init(t.allocator, 2);
+    var kv = try Handshake.KeyValue.init(t.allocator, 2);
     defer kv.deinit(t.allocator);
 
     var n1 = "content-length".*;
