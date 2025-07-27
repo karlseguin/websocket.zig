@@ -2,6 +2,7 @@ const std = @import("std");
 const proto = @import("../proto.zig");
 const buffer = @import("../buffer.zig");
 
+const ascii = std.ascii;
 const net = std.net;
 const posix = std.posix;
 const tls = std.crypto.tls;
@@ -9,6 +10,8 @@ const tls = std.crypto.tls;
 const Reader = proto.Reader;
 const Allocator = std.mem.Allocator;
 const Bundle = std.crypto.Certificate.Bundle;
+const CompressionOpts = @import("../websocket.zig").Compression;
+const ServerHandshake = @import("../server/handshake.zig").Handshake;
 
 fn ReadLoopHandler(comptime T: type) type {
     const info = @typeInfo(T);
@@ -34,6 +37,8 @@ pub const Client = struct {
     stream: Stream,
     _reader: Reader,
     _closed: bool,
+    _compression_opts: ?CompressionOpts,
+    _compression: ?*Client.Compression = null,
 
     // When creating a client, we can either be given a BufferProvider or create
     // one ourselves. If we create it ourselves (in init), we "own" it and must
@@ -56,11 +61,22 @@ pub const Client = struct {
         ca_bundle: ?Bundle = null,
         mask_fn: *const fn () [4]u8 = generateMask,
         buffer_provider: ?*buffer.Provider = null,
+        compression: ?CompressionOpts = null,
     };
 
     pub const HandshakeOpts = struct {
         timeout_ms: u32 = 10000,
         headers: ?[]const u8 = null,
+    };
+
+    const Compression = struct {
+        reset: bool,
+        retain_writer: bool,
+        write_treshold: usize,
+        compressor: Type,
+        writer: std.ArrayList(u8),
+
+        const Type = std.compress.flate.Compressor(std.ArrayList(u8).Writer);
     };
 
     pub fn init(allocator: Allocator, config: Config) !Client {
@@ -115,6 +131,7 @@ pub const Client = struct {
         return .{
             .stream = stream,
             ._closed = false,
+            ._compression_opts = config.compression,
             ._own_bp = own_bp,
             ._mask_fn = config.mask_fn,
             ._reader = Reader.init(reader_buf, buffer_provider, null),
@@ -134,6 +151,10 @@ pub const Client = struct {
             larger_buffer_provider.deinit();
             allocator.destroy(larger_buffer_provider);
         }
+
+        if (self._compression) |compression| {
+            allocator.destroy(compression);
+        }
     }
 
     pub fn handshake(self: *Client, path: []const u8, opts: HandshakeOpts) !void {
@@ -149,13 +170,48 @@ pub const Client = struct {
             break :blk std.base64.standard.Encoder.encode(&encoded_key, &bin_key);
         };
 
-        try sendHandshake(path, key, buf, &opts, stream);
+        try sendHandshake(path, key, buf, &opts, self._compression_opts, stream);
 
-        const over_read = try readHandshakeReply(buf, key, &opts, stream);
+        const res = try HandShakeReply.read(buf, key, &opts, self._compression_opts, stream);
+        errdefer self.close(.{.code = 1001}) catch unreachable;
+
+        // Set up compression with agreed-on parameters
+        try self.setupCompression(res.compression);
+
         // We might have read more than handshake response. If so, readHandshakeReply
         // has positioned the extra data at the start of the buffer, but we need
         // to set the length.
-        self._reader.pos = over_read;
+        self._reader.pos = res.over_read;
+    }
+
+    fn setupCompression(self: *Client, agreed: ?ServerHandshake.Compression) !void {
+        if (agreed == null) {
+            self._compression_opts = null;
+        } else if (self._compression_opts != null) {
+            self._compression_opts.?.client_no_context_takeover = agreed.?.client_no_context_takeover;
+            self._compression_opts.?.server_no_context_takeover = agreed.?.server_no_context_takeover;
+        } else {
+            unreachable; // HandShakeReply would return an error
+        }
+        if (self._compression_opts) |c| {
+            self._reader.decompressor = .{};
+            self._reader.decompressor_reset = c.server_no_context_takeover;
+            if (c.write_threshold == null) {
+                return;
+            }
+            const allocator = self._reader.large_buffer_provider.allocator;
+            const compression = try allocator.create(Compression);
+            errdefer allocator.destroy(compression);
+            compression.* = .{
+                .compressor = undefined,
+                .write_treshold = c.write_threshold.?,
+                .reset = c.server_no_context_takeover,
+                .retain_writer = c.retain_write_buffer,
+                .writer = std.ArrayList(u8).init(allocator),
+            };
+            compression.compressor = try Compression.Type.init(compression.writer.writer(), .{});
+            self._compression = compression;
+        }
     }
 
     pub fn readLoop(self: *Client, handler: anytype) !void {
@@ -311,9 +367,36 @@ pub const Client = struct {
     }
 
     pub fn writeFrame(self: *Client, op_code: proto.OpCode, data: []u8) !void {
+        var payload = data;
+        var compressed = false;
+        if (self._compression) |c| {
+            if (data.len >= c.write_treshold) {
+                compressed = true;
+
+                var writer = &c.writer;
+                var compressor = &c.compressor;
+                var fbs = std.io.fixedBufferStream(data);
+                _ = try compressor.compress(fbs.reader());
+                try compressor.flush();
+                payload = writer.items[0..writer.items.len - 4];
+
+                if (c.reset) {
+                    c.compressor = try Compression.Type.init(writer.writer(), .{});
+                }
+            }
+        }
+        defer if (compressed) {
+            const c = self._compression.?;
+            if (c.retain_writer) {
+                c.compressor.wrt.context.clearRetainingCapacity();
+            } else {
+                c.compressor.wrt.context.clearAndFree();
+            }
+        };
+
         // maximum possible prefix length. op_code + length_type + 8byte length + 4 byte mask
         var buf: [14]u8 = undefined;
-        const header = proto.writeFrameHeader(&buf, op_code, data.len, false);
+        const header = proto.writeFrameHeader(&buf, op_code, payload.len, compressed);
 
         const header_len = header.len;
         const header_end = header.len + 4; // for the mask
@@ -324,9 +407,9 @@ pub const Client = struct {
         @memcpy(buf[header_len..header_end], &mask);
         try self.stream.writeAll(buf[0..header_end]);
 
-        if (data.len > 0) {
-            proto.mask(&mask, data);
-            try self.stream.writeAll(data);
+        if (payload.len > 0) {
+            proto.mask(&mask, payload);
+            try self.stream.writeAll(payload);
         }
     }
 
@@ -428,7 +511,7 @@ fn generateMask() [4]u8 {
     return m;
 }
 
-fn sendHandshake(path: []const u8, key: []const u8, buf: []u8, opts: *const Client.HandshakeOpts, stream: anytype) !void {
+fn sendHandshake(path: []const u8, key: []const u8, buf: []u8, opts: *const Client.HandshakeOpts, compression: ?CompressionOpts, stream: anytype) !void {
     @memcpy(buf[0..4], "GET ");
     var pos: usize = 4;
     var end = pos + path.len;
@@ -446,7 +529,32 @@ fn sendHandshake(path: []const u8, key: []const u8, buf: []u8, opts: *const Clie
         pos = end;
         end = pos + key.len;
         @memcpy(buf[pos..end], key);
+    }
 
+    if (compression) |c| {
+        // TODO: also advertise no_context_takeover if false
+        // NOTE: client_max_window_bits is unsupported
+        {
+            const permessage_deflate = "\r\nSec-WebSocket-Extensions: permessage-deflate";
+            pos = end;
+            end = pos + permessage_deflate.len;
+            @memcpy(buf[pos..end], permessage_deflate);
+        }
+        if (c.server_no_context_takeover) {
+            const server_no_context_takeover = "; server_no_context_takeover";
+            pos = end;
+            end = pos + server_no_context_takeover.len;
+            @memcpy(buf[pos..end], server_no_context_takeover);
+        }
+        if (c.client_no_context_takeover) {
+            const client_no_context_takeover = "; client_no_context_takeover";
+            pos = end;
+            end = pos + client_no_context_takeover.len;
+            @memcpy(buf[pos..end], client_no_context_takeover);
+        }
+    }
+
+    {
         pos = end;
         end = pos + 2;
         @memcpy(buf[pos..end], "\r\n");
@@ -471,108 +579,172 @@ fn sendHandshake(path: []const u8, key: []const u8, buf: []u8, opts: *const Clie
     try stream.writeTimeout(0);
 }
 
-fn readHandshakeReply(buf: []u8, key: []const u8, opts: *const Client.HandshakeOpts, stream: anytype) !usize {
-    const ascii = std.ascii;
+const HandShakeReply = struct {
+    compression: ?ServerHandshake.Compression,
+    over_read: usize,
 
-    const timeout_ms = opts.timeout_ms;
-    const deadline = std.time.milliTimestamp() + timeout_ms;
-    try stream.readTimeout(timeout_ms);
+    fn read(buf: []u8, key: []const u8, opts: *const Client.HandshakeOpts, compression: ?CompressionOpts, stream: anytype) !HandShakeReply {
+        const timeout_ms = opts.timeout_ms;
+        const deadline = std.time.milliTimestamp() + timeout_ms;
+        try stream.readTimeout(timeout_ms);
 
-    var pos: usize = 0;
-    var line_start: usize = 0;
-    var complete_response: u8 = 0;
+        var pos: usize = 0;
+        var line_start: usize = 0;
+        var complete_response: u8 = 0;
+        var server_compression: ?ServerHandshake.Compression = null;
 
-    while (true) {
-        const n = stream.read(buf[pos..]) catch |err| switch (err) {
-            error.WouldBlock => return error.Timeout,
-            else => return err,
-        };
-        if (n == 0) {
-            return error.ConnectionClosed;
-        }
-
-        pos += n;
-        while (std.mem.indexOfScalar(u8, buf[line_start..pos], '\r')) |relative_end| {
-            if (relative_end == 0) {
-                if (complete_response != 15) {
-                    return error.InvalidHandshakeResponse;
-                }
-                const over_read = pos - (line_start + 2);
-                std.mem.copyForwards(u8, buf[0..over_read], buf[line_start + 2 .. pos]);
-                try stream.readTimeout(0);
-                return over_read;
+        while (true) {
+            const n = stream.read(buf[pos..]) catch |err| switch (err) {
+                error.WouldBlock => return error.Timeout,
+                else => return err,
+            };
+            if (n == 0) {
+                return error.ConnectionClosed;
             }
 
-            const line_end = line_start + relative_end;
-            const line = buf[line_start..line_end];
-
-            // the next line starts where this line ends, skip over the \r\n
-            line_start = line_end + 2;
-
-            if (complete_response == 0) {
-                if (!ascii.startsWithIgnoreCase(line, "HTTP/1.1 101 ")) {
-                    return error.InvalidHandshakeResponse;
+            pos += n;
+            while (std.mem.indexOfScalar(u8, buf[line_start..pos], '\r')) |relative_end| {
+                if (relative_end == 0) {
+                    if (complete_response != 15) {
+                        return error.InvalidHandshakeResponse;
+                    }
+                    const over_read = pos - (line_start + 2);
+                    std.mem.copyForwards(u8, buf[0..over_read], buf[line_start + 2 .. pos]);
+                    try stream.readTimeout(0);
+                    return .{
+                        .compression = server_compression,
+                        .over_read = over_read,
+                    };
                 }
-                complete_response |= 1;
-                continue;
-            }
 
-            for (line, 0..) |b, i| {
-                // find the colon and lowercase the header while we're iterating
-                if ('A' <= b and b <= 'Z') {
-                    line[i] = b + 32;
+                const line_end = line_start + relative_end;
+                const line = buf[line_start..line_end];
+
+                // the next line starts where this line ends, skip over the \r\n
+                line_start = line_end + 2;
+
+                if (complete_response == 0) {
+                    if (!ascii.startsWithIgnoreCase(line, "HTTP/1.1 101 ")) {
+                        return error.InvalidHandshakeResponse;
+                    }
+                    complete_response |= 1;
                     continue;
                 }
 
-                if (b != ':') {
-                    continue;
-                }
+                for (line, 0..) |b, i| {
+                    // find the colon and lowercase the header while we're iterating
+                    if ('A' <= b and b <= 'Z') {
+                        line[i] = b + 32;
+                        continue;
+                    }
 
-                switch (i) {
-                    7 => if (std.mem.eql(u8, line[0..i], "upgrade")) {
-                        if (!ascii.eqlIgnoreCase(std.mem.trim(u8, line[i + 1 ..], &ascii.whitespace), "websocket")) {
-                            return error.InvalidUpgradeHeader;
-                        }
-                        complete_response |= 2;
-                    },
-                    10 => if (std.mem.eql(u8, line[0..i], "connection")) {
-                        if (!ascii.eqlIgnoreCase(std.mem.trim(u8, line[i + 1 ..], &ascii.whitespace), "upgrade")) {
-                            return error.InvalidConnectionHeader;
-                        }
-                        complete_response |= 4;
-                    },
-                    20 => if (std.mem.eql(u8, line[0..i], "sec-websocket-accept")) {
-                        var h: [20]u8 = undefined;
-                        {
-                            var hasher = std.crypto.hash.Sha1.init(.{});
-                            hasher.update(key);
-                            hasher.update("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-                            hasher.final(&h);
-                        }
+                    if (b != ':') {
+                        continue;
+                    }
 
-                        var encoded_buf: [28]u8 = undefined;
-                        const sec_hash = std.base64.standard.Encoder.encode(&encoded_buf, &h);
-                        const header_value = std.mem.trim(u8, line[i + 1 ..], &ascii.whitespace);
+                    switch (i) {
+                        7 => if (std.mem.eql(u8, line[0..i], "upgrade")) {
+                            if (!ascii.eqlIgnoreCase(std.mem.trim(u8, line[i + 1 ..], &ascii.whitespace), "websocket")) {
+                                return error.InvalidUpgradeHeader;
+                            }
+                            complete_response |= 2;
+                        },
+                        10 => if (std.mem.eql(u8, line[0..i], "connection")) {
+                            if (!ascii.eqlIgnoreCase(std.mem.trim(u8, line[i + 1 ..], &ascii.whitespace), "upgrade")) {
+                                return error.InvalidConnectionHeader;
+                            }
+                            complete_response |= 4;
+                        },
+                        20 => if (std.mem.eql(u8, line[0..i], "sec-websocket-accept")) {
+                            var h: [20]u8 = undefined;
+                            {
+                                var hasher = std.crypto.hash.Sha1.init(.{});
+                                hasher.update(key);
+                                hasher.update("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+                                hasher.final(&h);
+                            }
 
-                        if (!std.mem.eql(u8, header_value, sec_hash)) {
-                            return error.InvalidWebsocketAcceptHeader;
-                        }
-                        complete_response |= 8;
-                    },
-                    else => {}, // some other header we don't care about
+                            var encoded_buf: [28]u8 = undefined;
+                            const sec_hash = std.base64.standard.Encoder.encode(&encoded_buf, &h);
+                            const header_value = std.mem.trim(u8, line[i + 1 ..], &ascii.whitespace);
+
+                            if (!std.mem.eql(u8, header_value, sec_hash)) {
+                                return error.InvalidWebsocketAcceptHeader;
+                            }
+                            complete_response |= 8;
+                        },
+                        24 => if (std.mem.eql(u8, line[0..i], "sec-websocket-extensions")) {
+                            server_compression = try parseExtension(line[i + 1 ..]);
+                            if (server_compression) |agreed| {
+                                if (compression) |offered| {
+                                    if ((!agreed.client_no_context_takeover and offered.client_no_context_takeover) or
+                                        (!agreed.server_no_context_takeover and offered.server_no_context_takeover))
+                                    {
+                                        return error.InvalidExtensionHeader;
+                                    }
+                                } else {
+                                    return error.InvalidExtensionHeader;
+                                }
+                            }
+                        },
+                        else => {}, // some other header we don't care about
+                    }
                 }
             }
-        }
 
-        if (std.time.milliTimestamp() > deadline) {
-            return error.Timeout;
-        }
+            if (std.time.milliTimestamp() > deadline) {
+                return error.Timeout;
+            }
 
-        if (pos == buf.len) {
-            return error.ResponseTooLarge;
+            if (pos == buf.len) {
+                return error.ResponseTooLarge;
+            }
         }
     }
-}
+
+    pub fn parseExtension(value: []const u8) !?ServerHandshake.Compression {
+        var deflate = false;
+        var client_max_bits: u8 = 15;
+        var client_no_context_takeover = false;
+        var server_no_context_takeover = false;
+
+        var it = std.mem.splitScalar(u8, value, ';');
+        while (it.next()) |param_| {
+            const param = std.mem.trim(u8, param_, &ascii.whitespace);
+            if (std.mem.eql(u8, param, "permessage-deflate")) {
+                deflate = true;
+                continue;
+            }
+            if (std.mem.eql(u8, param, "client_no_context_takeover")) {
+                client_no_context_takeover = true;
+                continue;
+            }
+            if (std.mem.eql(u8, param, "server_no_context_takeover")) {
+                server_no_context_takeover = true;
+                continue;
+            }
+            const client_max_window_bits = "client_max_window_bits=";
+            if (std.mem.startsWith(u8, param, client_max_window_bits)) {
+                client_max_bits = std.fmt.parseInt(u8, param[client_max_window_bits.len..], 10) catch {
+                    return error.InvalidCompressionServerMaxBits;
+                };
+            }
+        }
+        if (deflate == false) {
+            return null;
+        }
+
+        if (client_max_bits != 15) {
+            // We don't offer client window, so if the server asks for one, that's an error
+        return error.InvalidExtensionHeader;
+        }
+
+        return .{
+            .client_no_context_takeover = client_no_context_takeover,
+            .server_no_context_takeover = server_no_context_takeover,
+        };
+    }
+};
 
 const t = @import("../t.zig");
 test "Client: handshake" {
