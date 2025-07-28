@@ -382,7 +382,7 @@ pub fn Blocking(comptime H: type) type {
                     }
                     if (hc.handler != null) {
                         // if we have a handler, the our handshake completed
-                    try conn_manager.setupCompression(hc, compression);
+                        try conn_manager.setupCompression(hc, compression);
                         break;
                     }
                     if (timestamp() > deadline) {
@@ -681,7 +681,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
                 conn_manager.inactive(hc);
             }
 
-        try conn_manager.setupCompression(hc, compression);
+            try conn_manager.setupCompression(hc, compression);
             return true;
         }
     };
@@ -1382,7 +1382,7 @@ pub const Conn = struct {
                 var fbs = std.io.fixedBufferStream(data);
                 _ = try compressor.compress(fbs.reader());
                 try compressor.flush();
-                payload = writer.items[0..writer.items.len - 4];
+                payload = writer.items[0 .. writer.items.len - 4];
 
                 if (c.reset) {
                     c.compressor = try Conn.Compression.Type.init(writer.writer(), .{});
@@ -1485,14 +1485,14 @@ pub const Conn = struct {
     };
 };
 
-fn handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx: anytype) struct{?Compression, bool} {
+fn handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx: anytype) struct { ?Compression, bool } {
     return _handleHandshake(H, worker, hc, ctx) catch |err| {
         log.warn("({}) uncaugh error processing handshake: {}", .{ hc.conn.address, err });
-        return .{null, false};
+        return .{ null, false };
     };
 }
 
-fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx: anytype) !struct{?Compression, bool} {
+fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx: anytype) !struct { ?Compression, bool } {
     std.debug.assert(hc.handler == null);
 
     var state = hc.handshake orelse blk: {
@@ -1507,7 +1507,7 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
 
     if (len == buf.len) {
         log.warn("({}) handshake request exceeded maximum configured size ({d})", .{ conn.address, buf.len });
-        return .{null, false};
+        return .{ null, false };
     }
 
     const n = posix.read(hc.socket, buf[len..]) catch |err| {
@@ -1519,22 +1519,22 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
             },
             else => log.warn("({}) handshake error reading from socket: {}", .{ conn.address, err }),
         }
-        return .{null, false};
+        return .{ null, false };
     };
 
     if (n == 0) {
         log.debug("({}) handshake connection closed", .{conn.address});
-        return .{null, false};
+        return .{ null, false };
     }
 
     state.len = len + n;
     var handshake = Handshake.parse(state) catch |err| {
         log.debug("({}) error parsing handshake: {}", .{ conn.address, err });
         respondToHandshakeError(conn, err);
-        return .{null, false};
+        return .{ null, false };
     } orelse {
         // we need more data
-        return .{null, true};
+        return .{ null, true };
     };
 
     var agreed_compression: ?Compression = null;
@@ -1550,7 +1550,6 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
     defer state.release();
     hc.handshake = null;
 
-
     // After this, the app has access to &hc.conn, so any access to the
     // conn has to be synchronized (which the conn does internally).
 
@@ -1561,7 +1560,7 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
             respondToHandshakeError(conn, err);
         }
         log.debug("({}) " ++ @typeName(H) ++ ".init rejected request {}", .{ conn.address, err });
-        return .{null, false};
+        return .{ null, false };
     };
 
     hc.handler = handler;
@@ -1575,12 +1574,12 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
         const res = if (params.len == 1) hc.handler.?.afterInit() else hc.handler.?.afterInit(ctx);
         res catch |err| {
             log.debug("({}) " ++ @typeName(H) ++ ".afterInit error: {}", .{ conn.address, err });
-            return .{null, false};
+            return .{ null, false };
         };
     }
 
     log.debug("({}) connection successfully upgraded", .{conn.address});
-    return .{agreed_compression, true};
+    return .{ agreed_compression, true };
 }
 
 fn handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator, fba: *FixedBufferAllocator) bool {

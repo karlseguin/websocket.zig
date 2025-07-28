@@ -15,7 +15,7 @@ docker run --rm \
 	crossbario/autobahn-testsuite \
 	/opt/pypy/bin/wstest --mode fuzzingserver --spec /ab/config.json &
 
-cd support/autobahn/client/ && zig build run
+cd support/autobahn/client/ && zig build -Doptimize=ReleaseFast run
 
 if grep FAILED support/autobahn/client/reports/index.json*; then
 	exit 1
