@@ -27,7 +27,7 @@ pub const Testing = struct {
         errdefer arena.deinit();
 
         const port = opts.port orelse 0;
-        const pair = t.SocketPair.init(.{.port = port});
+        const pair = t.SocketPair.init(.{ .port = port });
         const timeout = std.mem.toBytes(std.posix.timeval{
             .sec = 0,
             .usec = 50_000,

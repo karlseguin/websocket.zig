@@ -173,7 +173,7 @@ pub const Client = struct {
         try sendHandshake(path, key, buf, &opts, self._compression_opts, stream);
 
         const res = try HandShakeReply.read(buf, key, &opts, self._compression_opts, stream);
-        errdefer self.close(.{.code = 1001}) catch unreachable;
+        errdefer self.close(.{ .code = 1001 }) catch unreachable;
 
         // Set up compression with agreed-on parameters
         try self.setupCompression(res.compression);
@@ -378,7 +378,7 @@ pub const Client = struct {
                 var fbs = std.io.fixedBufferStream(data);
                 _ = try compressor.compress(fbs.reader());
                 try compressor.flush();
-                payload = writer.items[0..writer.items.len - 4];
+                payload = writer.items[0 .. writer.items.len - 4];
 
                 if (c.reset) {
                     c.compressor = try Compression.Type.init(writer.writer(), .{});
@@ -736,7 +736,7 @@ const HandShakeReply = struct {
 
         if (client_max_bits != 15) {
             // We don't offer client window, so if the server asks for one, that's an error
-        return error.InvalidExtensionHeader;
+            return error.InvalidExtensionHeader;
         }
 
         return .{

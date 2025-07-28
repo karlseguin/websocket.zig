@@ -317,7 +317,7 @@ pub const Reader = struct {
                 if (is_continuation) {
                     if (self.fragment) |*f| {
                         if (f.compressed) {
-                            return . {more, .{.data = try self.decompress(try f.last(payload)), .type = f.type}};
+                            return .{ more, .{ .data = try self.decompress(try f.last(payload)), .type = f.type } };
                         }
                         return .{ more, .{ .type = f.type, .data = try f.last(payload) } };
                     }
@@ -330,7 +330,7 @@ pub const Reader = struct {
                 }
 
                 if (compressed) {
-                    return . {more, .{.data = try self.decompress(payload), .type = message_type}};
+                    return .{ more, .{ .data = try self.decompress(payload), .type = message_type } };
                 }
 
                 // just a normal single-fragment message (most common case)
@@ -428,7 +428,7 @@ pub const Reader = struct {
                 .buf = try provider.pool.acquireOrCreate(),
             };
         } else {
-           writer = .{
+            writer = .{
                 .pooled = false,
                 .provider = provider,
                 .buf = try provider.allocator.alloc(u8, @intFromFloat(@as(f64, @floatFromInt(compressed.len)) * 1.25)),
