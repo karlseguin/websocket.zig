@@ -370,7 +370,7 @@ pub const Client = struct {
         var payload = data;
         var compressed = false;
         if (self._compression) |c| {
-            if (data.len >= c.write_treshold) {
+            if (data.len >= c.write_treshold and (op_code == .binary or op_code == .text)) {
                 compressed = true;
 
                 var writer = &c.writer;
