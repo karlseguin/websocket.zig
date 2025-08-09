@@ -264,6 +264,18 @@ pub const Client = struct {
         }
     }
 
+    fn pollStream(self: *Client, timeout: i32) !bool {
+        var polls = [1]std.posix.pollfd{
+            .{
+                .fd = self.stream.stream.handle,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            },
+        };
+        const readable = try std.posix.poll(&polls, timeout);
+        return readable > 0;
+    }
+
     pub fn read(self: *Client) !?proto.Message {
         var reader = &self._reader;
         const stream = &self.stream;
@@ -275,6 +287,17 @@ pub const Client = struct {
                 self.close(.{ .code = 1002 }) catch unreachable;
                 return err;
             } orelse {
+                const builtin = @import("builtin");
+                const native_os = builtin.os.tag;
+                if (native_os == .windows) {
+                    // socket rcv timeout does not work on windows with zig 0.14
+                    // TODO: make this somethow configurable. Store readTimeout value? Do we want fully non-blocking?
+                    if (!(self.pollStream(0) catch {
+                        @atomicStore(bool, &self._closed, true, .monotonic);
+                        return error.Closed;
+                    }))
+                        return null;
+                }
                 reader.fill(stream) catch |err| switch (err) {
                     error.WouldBlock => return null,
                     error.Closed, error.ConnectionResetByPeer, error.BrokenPipe, error.NotOpenForReading => {
