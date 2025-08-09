@@ -274,7 +274,11 @@ pub fn Server(comptime H: type) type {
                     // necessary to unblock accept on linux
                     // (which might not be that necessary since, on Linux,
                     // NonBlocking should be used)
-                    posix.shutdown(s, .recv) catch {};
+                    if (builtin.os.tag == .windows) {
+                        posix.shutdown(@ptrCast(s), .recv) catch {};
+                    } else {
+                        posix.shutdown(s, .recv) catch {};
+                    }
                 }
                 posix.close(s);
             }
@@ -339,6 +343,10 @@ pub fn Blocking(comptime H: type) type {
                 const socket = posix.accept(listener, &address.any, &address_len, posix.SOCK.CLOEXEC) catch |err| {
                     if (err == error.ConnectionAborted or err == error.SocketNotListening) {
                         log.info("received shutdown signal", .{});
+                        return;
+                    }
+                    if (err == error.Unexpected) {
+                        log.info("unexpected error during accept, shutting down", .{});
                         return;
                     }
                     log.err("failed to accept socket: {}", .{err});
