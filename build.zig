@@ -16,10 +16,13 @@ pub fn build(b: *std.Build) !void {
 
     {
         // run tests
-        const tests = b.addTest(.{
+        const test_mod = b.createModule(.{
             .root_source_file = b.path("src/websocket.zig"),
             .target = target,
             .optimize = optimize,
+        });
+        const tests = b.addTest(.{
+            .root_module = test_mod,
             .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
         });
         tests.linkLibC();
