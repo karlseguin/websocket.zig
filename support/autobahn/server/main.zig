@@ -22,7 +22,7 @@ pub fn main() !void {
 
         std.posix.sigaction(std.posix.SIG.TERM, &.{
             .handler = .{ .handler = shutdown },
-            .mask = std.posix.empty_sigset,
+            .mask = std.posix.sigemptyset(),
             .flags = 0,
         }, null);
     }
@@ -53,9 +53,10 @@ fn startNonBlocking(allocator: Allocator) !std.Thread {
             .max_size = 1024,
             .max_headers = 10,
         },
-        .compression = .{
-            .write_threshold = 0,
-        },
+        // zig 0.15
+        // .compression = .{
+        //     .write_threshold = 0,
+        // },
     });
     return try nonblocking_server.listenInNewThread({});
 }
@@ -76,9 +77,10 @@ fn startNonBlockingBufferPool(allocator: Allocator) !std.Thread {
             .max_size = 1024,
             .max_headers = 10,
         },
-        .compression = .{
-            .write_threshold = 0,
-        },
+        // zig 0.15
+        // .compression = .{
+        //     .write_threshold = 0,
+        // },
     });
     return try nonblocking_bp_server.listenInNewThread({});
 }
@@ -107,7 +109,7 @@ const Handler = struct {
     }
 };
 
-fn shutdown(_: c_int) callconv(.C) void {
+fn shutdown(_: c_int) callconv(.c) void {
     nonblocking_server.stop();
     nonblocking_bp_server.stop();
 }

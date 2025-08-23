@@ -18,6 +18,21 @@ pub const Writer = struct {
     pos: usize = 0,
     pooled: bool,
     provider: *Provider,
+    interface: std.Io.Writer,
+
+    pub fn init(buf: []u8, pooled: bool, provider: *Provider, dumb: []u8) Writer {
+        return .{
+            .buf = buf,
+            .pooled = pooled,
+            .provider = provider,
+            .interface = .{
+                .buffer = dumb,
+                .vtable = &.{
+                    .drain = drain,
+                },
+            },
+        };
+    }
 
     pub fn deinit(self: *Writer) void {
         if (self.pooled) {
@@ -25,6 +40,14 @@ pub const Writer = struct {
         } else {
             self.provider.allocator.free(self.buf);
         }
+    }
+
+    pub fn drain(io_w: *std.io.Writer, data: []const []const u8, splat: usize) error{WriteFailed}!usize {
+        std.debug.print("drain: {d}\n", .{data[0].len});
+        _ = splat;
+        const self: *Writer = @alignCast(@fieldParentPtr("interface", io_w));
+        self.writeAll(data[0]) catch return error.WriteFailed;
+        return data[0].len;
     }
 
     pub fn writeAll(self: *Writer, data: []const u8) !void {

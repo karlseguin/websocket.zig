@@ -6,6 +6,7 @@ const ascii = std.ascii;
 const net = std.net;
 const posix = std.posix;
 const tls = std.crypto.tls;
+const log = std.log.scoped(.websocket);
 
 const Reader = proto.Reader;
 const Allocator = std.mem.Allocator;
@@ -38,7 +39,7 @@ pub const Client = struct {
     _reader: Reader,
     _closed: bool,
     _compression_opts: ?CompressionOpts,
-    _compression: ?*Client.Compression = null,
+    _compression: ?Client.Compression = null,
 
     // When creating a client, we can either be given a BufferProvider or create
     // one ourselves. If we create it ourselves (in init), we "own" it and must
@@ -70,34 +71,23 @@ pub const Client = struct {
     };
 
     const Compression = struct {
-        reset: bool,
+        allocator: Allocator,
         retain_writer: bool,
         write_treshold: usize,
-        compressor: Type,
-        writer: std.ArrayList(u8),
-
-        const Type = std.compress.flate.Compressor(std.ArrayList(u8).Writer);
+        writer: std.Io.Writer.Allocating,
     };
 
     pub fn init(allocator: Allocator, config: Config) !Client {
+        if (config.compression != null) {
+            log.err("Compression is disabled as part of the 0.15 upgrade. I do hope to re-enable it soon.", .{});
+            return error.InvalidConfiguraion;
+        }
+
         const net_stream = try net.tcpConnectToHost(allocator, config.host, config.port);
 
-        var tls_client: ?tls.Client = null;
+        var tls_client: ?*TLSClient = null;
         if (config.tls) {
-            var own_bundle = false;
-            var bundle = config.ca_bundle orelse blk: {
-                own_bundle = true;
-                var b = Bundle{};
-                try b.rescan(allocator);
-                break :blk b;
-            };
-            defer if (own_bundle) {
-                bundle.deinit(allocator);
-            };
-            tls_client = try tls.Client.init(net_stream, .{
-                .host = .{ .explicit = config.host },
-                .ca = .{ .bundle = bundle },
-            });
+            tls_client = try TLSClient.init(allocator, net_stream, &config);
         }
         const stream = Stream.init(net_stream, tls_client);
 
@@ -131,9 +121,9 @@ pub const Client = struct {
         return .{
             .stream = stream,
             ._closed = false,
-            ._compression_opts = config.compression,
             ._own_bp = own_bp,
             ._mask_fn = config.mask_fn,
+            ._compression_opts = null, //TODO: ZIG 0.15
             ._reader = Reader.init(reader_buf, buffer_provider, null),
         };
     }
@@ -151,10 +141,6 @@ pub const Client = struct {
             larger_buffer_provider.deinit();
             allocator.destroy(larger_buffer_provider);
         }
-
-        if (self._compression) |compression| {
-            allocator.destroy(compression);
-        }
     }
 
     pub fn handshake(self: *Client, path: []const u8, opts: HandshakeOpts) !void {
@@ -170,13 +156,15 @@ pub const Client = struct {
             break :blk std.base64.standard.Encoder.encode(&encoded_key, &bin_key);
         };
 
-        try sendHandshake(path, key, buf, &opts, self._compression_opts, stream);
+        try sendHandshake(path, key, buf, &opts, self._compression_opts != null, stream);
 
-        const res = try HandShakeReply.read(buf, key, &opts, self._compression_opts, stream);
+        const res = try HandShakeReply.read(buf, key, &opts, self._compression_opts != null, stream);
         errdefer self.close(.{ .code = 1001 }) catch unreachable;
 
         // Set up compression with agreed-on parameters
-        try self.setupCompression(res.compression);
+        if (res.compression) {
+            try self.setupCompression();
+        }
 
         // We might have read more than handshake response. If so, readHandshakeReply
         // has positioned the extra data at the start of the buffer, but we need
@@ -184,34 +172,18 @@ pub const Client = struct {
         self._reader.pos = res.over_read;
     }
 
-    fn setupCompression(self: *Client, agreed: ?ServerHandshake.Compression) !void {
-        if (agreed == null) {
-            self._compression_opts = null;
-        } else if (self._compression_opts != null) {
-            self._compression_opts.?.client_no_context_takeover = agreed.?.client_no_context_takeover;
-            self._compression_opts.?.server_no_context_takeover = agreed.?.server_no_context_takeover;
-        } else {
-            unreachable; // HandShakeReply would return an error
-        }
-        if (self._compression_opts) |c| {
-            self._reader.decompressor = .{};
-            self._reader.decompressor_reset = c.server_no_context_takeover;
-            if (c.write_threshold == null) {
-                return;
-            }
-            const allocator = self._reader.large_buffer_provider.allocator;
-            const compression = try allocator.create(Compression);
-            errdefer allocator.destroy(compression);
-            compression.* = .{
-                .compressor = undefined,
-                .write_treshold = c.write_threshold.?,
-                .reset = c.server_no_context_takeover,
-                .retain_writer = c.retain_write_buffer,
-                .writer = std.ArrayList(u8).init(allocator),
-            };
-            compression.compressor = try Compression.Type.init(compression.writer.writer(), .{});
-            self._compression = compression;
-        }
+    fn setupCompression(self: *Client) !void {
+        std.debug.assert(self._compression_opts != null);
+        self._reader.allow_compressed = true;
+
+        const allocator = self._reader.large_buffer_provider.allocator;
+        const config = self._compression_opts.?;
+        self._compression = .{
+            .allocator = allocator,
+            .write_treshold = config.write_threshold.?,
+            .retain_writer = config.retain_write_buffer,
+            .writer = std.Io.Writer.Allocating.init(allocator),
+        };
     }
 
     pub fn readLoop(self: *Client, handler: anytype) !void {
@@ -367,32 +339,32 @@ pub const Client = struct {
     }
 
     pub fn writeFrame(self: *Client, op_code: proto.OpCode, data: []u8) !void {
-        var payload = data;
-        var compressed = false;
-        if (self._compression) |c| {
-            if (data.len >= c.write_treshold and (op_code == .binary or op_code == .text)) {
-                compressed = true;
+        const payload = data;
+        const compressed = false;
+        // if (self._compression) |c| {
+        //     if (data.len >= c.write_treshold and (op_code == .binary or op_code == .text)) {
+        //         compressed = true;
 
-                var writer = &c.writer;
-                var compressor = &c.compressor;
-                var fbs = std.io.fixedBufferStream(data);
-                _ = try compressor.compress(fbs.reader());
-                try compressor.flush();
-                payload = writer.items[0 .. writer.items.len - 4];
+        //         var writer = &c.writer;
+        //         var compressor = &c.compressor;
+        //         var fbs = std.io.fixedBufferStream(data);
+        //         _ = try compressor.compress(fbs.reader());
+        //         try compressor.flush();
+        //         payload = writer.items[0 .. writer.items.len - 4];
 
-                if (c.reset) {
-                    c.compressor = try Compression.Type.init(writer.writer(), .{});
-                }
-            }
-        }
-        defer if (compressed) {
-            const c = self._compression.?;
-            if (c.retain_writer) {
-                c.compressor.wrt.context.clearRetainingCapacity();
-            } else {
-                c.compressor.wrt.context.clearAndFree();
-            }
-        };
+        //         if (c.reset) {
+        //             c.compressor = try Compression.Type.init(writer.writer(), .{});
+        //         }
+        //     }
+        // }
+        // defer if (compressed) {
+        //     const c = self._compression.?;
+        //     if (c.retain_writer) {
+        //         c.compressor.wrt.context.clearRetainingCapacity();
+        //     } else {
+        //         c.compressor.wrt.context.clearAndFree();
+        //     }
+        // };
 
         // maximum possible prefix length. op_code + length_type + 8byte length + 4 byte mask
         var buf: [14]u8 = undefined;
@@ -423,9 +395,9 @@ pub const Client = struct {
 // wraps a net.Stream and optional a tls.Client
 pub const Stream = struct {
     stream: net.Stream,
-    tls_client: ?tls.Client = null,
+    tls_client: ?*TLSClient = null,
 
-    pub fn init(stream: net.Stream, tls_client: ?tls.Client) Stream {
+    pub fn init(stream: net.Stream, tls_client: ?*TLSClient) Stream {
         return .{
             .stream = stream,
             .tls_client = tls_client,
@@ -433,8 +405,8 @@ pub const Stream = struct {
     }
 
     pub fn close(self: *Stream) void {
-        if (self.tls_client) |*tls_client| {
-            _ = tls_client.writeEnd(self.stream, "", true) catch {};
+        if (self.tls_client) |tls_client| {
+            tls_client.deinit();
         }
 
         // std.posix.close panics on EBADF
@@ -457,15 +429,26 @@ pub const Stream = struct {
     }
 
     pub fn read(self: *Stream, buf: []u8) !usize {
-        if (self.tls_client) |*tls_client| {
-            return tls_client.read(self.stream, buf);
+        if (self.tls_client) |tls_client| {
+            var w: std.Io.Writer = .fixed(buf);
+            while (true) {
+                const n = try tls_client.client.reader.stream(&w, .limited(buf.len));
+                if (n != 0) {
+                    return n;
+                }
+            }
         }
         return self.stream.read(buf);
     }
 
     pub fn writeAll(self: *Stream, data: []const u8) !void {
-        if (self.tls_client) |*tls_client| {
-            return tls_client.writeAll(self.stream, data);
+        if (self.tls_client) |tls_client| {
+            try tls_client.client.writer.writeAll(data);
+            // I know this looks silly, but as far as I can tell, this is what
+            // we need to do.
+            try tls_client.client.writer.flush();
+            try tls_client.stream_writer.interface.flush();
+            return;
         }
         return self.stream.writeAll(data);
     }
@@ -496,6 +479,63 @@ pub const Stream = struct {
     }
 };
 
+const TLSClient = struct {
+    client: tls.Client,
+    stream: net.Stream,
+    stream_writer: net.Stream.Writer,
+    stream_reader: net.Stream.Reader,
+    arena: std.heap.ArenaAllocator,
+
+    fn init(allocator: Allocator, stream: net.Stream, config: *const Client.Config) !*TLSClient {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+
+        const aa = arena.allocator();
+
+        const bundle = config.ca_bundle orelse blk: {
+            var b = Bundle{};
+            try b.rescan(aa);
+            break :blk b;
+        };
+
+        // The TLS input and output have to be max_ciphertext_record_len each.
+        // It isn't clear to me how big the un-encrypted reader and writer
+        // need to be. I would think 0, but that will fail an assertion. I
+        // don't think that it's right that we need 4 buffers, but apparently
+        // we do. Until i figure this out, using 4 x max_ciphertext_record_len
+        // seems like the only safe choice.
+        const buf_len = std.crypto.tls.max_ciphertext_record_len;
+        var buf = try aa.alloc(u8, buf_len * 4);
+
+        const self = try aa.create(TLSClient);
+        self.* = .{
+            .stream = stream,
+            .arena = arena,
+            .client = undefined,
+            .stream_writer = stream.writer(buf.ptr[0..buf_len][0..buf_len]),
+            .stream_reader = stream.reader(buf.ptr[buf_len .. 2 * buf_len][0..buf_len]),
+        };
+
+        self.client = try tls.Client.init(
+            self.stream_reader.interface(),
+            &self.stream_writer.interface,
+            .{
+                .ca = .{ .bundle = bundle },
+                .host = .{ .explicit = config.host },
+                .read_buffer = buf.ptr[2 * buf_len .. 3 * buf_len][0..buf_len],
+                .write_buffer = buf.ptr[3 * buf_len .. 4 * buf_len][0..buf_len],
+            },
+        );
+
+        return self;
+    }
+
+    fn deinit(self: *TLSClient) void {
+        _ = self.client.end() catch {};
+        self.arena.deinit();
+    }
+};
+
 fn generateKey() [16]u8 {
     if (comptime @import("builtin").is_test) {
         return [16]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
@@ -511,7 +551,7 @@ fn generateMask() [4]u8 {
     return m;
 }
 
-fn sendHandshake(path: []const u8, key: []const u8, buf: []u8, opts: *const Client.HandshakeOpts, compression: ?CompressionOpts, stream: anytype) !void {
+fn sendHandshake(path: []const u8, key: []const u8, buf: []u8, opts: *const Client.HandshakeOpts, compression: bool, stream: anytype) !void {
     @memcpy(buf[0..4], "GET ");
     var pos: usize = 4;
     var end = pos + path.len;
@@ -531,27 +571,12 @@ fn sendHandshake(path: []const u8, key: []const u8, buf: []u8, opts: *const Clie
         @memcpy(buf[pos..end], key);
     }
 
-    if (compression) |c| {
-        // TODO: also advertise no_context_takeover if false
+    if (compression) {
         // NOTE: client_max_window_bits is unsupported
-        {
-            const permessage_deflate = "\r\nSec-WebSocket-Extensions: permessage-deflate";
-            pos = end;
-            end = pos + permessage_deflate.len;
-            @memcpy(buf[pos..end], permessage_deflate);
-        }
-        if (c.server_no_context_takeover) {
-            const server_no_context_takeover = "; server_no_context_takeover";
-            pos = end;
-            end = pos + server_no_context_takeover.len;
-            @memcpy(buf[pos..end], server_no_context_takeover);
-        }
-        if (c.client_no_context_takeover) {
-            const client_no_context_takeover = "; client_no_context_takeover";
-            pos = end;
-            end = pos + client_no_context_takeover.len;
-            @memcpy(buf[pos..end], client_no_context_takeover);
-        }
+        const permessage_deflate = "\r\nSec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover";
+        pos = end;
+        end = pos + permessage_deflate.len;
+        @memcpy(buf[pos..end], permessage_deflate);
     }
 
     {
@@ -580,10 +605,10 @@ fn sendHandshake(path: []const u8, key: []const u8, buf: []u8, opts: *const Clie
 }
 
 const HandShakeReply = struct {
-    compression: ?ServerHandshake.Compression,
+    compression: bool,
     over_read: usize,
 
-    fn read(buf: []u8, key: []const u8, opts: *const Client.HandshakeOpts, compression: ?CompressionOpts, stream: anytype) !HandShakeReply {
+    fn read(buf: []u8, key: []const u8, opts: *const Client.HandshakeOpts, compression: bool, stream: anytype) !HandShakeReply {
         const timeout_ms = opts.timeout_ms;
         const deadline = std.time.milliTimestamp() + timeout_ms;
         try stream.readTimeout(timeout_ms);
@@ -591,7 +616,7 @@ const HandShakeReply = struct {
         var pos: usize = 0;
         var line_start: usize = 0;
         var complete_response: u8 = 0;
-        var server_compression: ?ServerHandshake.Compression = null;
+        var server_compression: bool = false;
 
         while (true) {
             const n = stream.read(buf[pos..]) catch |err| switch (err) {
@@ -612,8 +637,8 @@ const HandShakeReply = struct {
                     std.mem.copyForwards(u8, buf[0..over_read], buf[line_start + 2 .. pos]);
                     try stream.readTimeout(0);
                     return .{
-                        .compression = server_compression,
                         .over_read = over_read,
+                        .compression = server_compression,
                     };
                 }
 
@@ -674,17 +699,18 @@ const HandShakeReply = struct {
                             complete_response |= 8;
                         },
                         24 => if (std.mem.eql(u8, line[0..i], "sec-websocket-extensions")) {
-                            server_compression = try parseExtension(line[i + 1 ..]);
-                            if (server_compression) |agreed| {
-                                if (compression) |offered| {
-                                    if ((!agreed.client_no_context_takeover and offered.client_no_context_takeover) or
-                                        (!agreed.server_no_context_takeover and offered.server_no_context_takeover))
-                                    {
-                                        return error.InvalidExtensionHeader;
-                                    }
-                                } else {
+                            if (try parseExtension(line[i + 1 ..])) |sc| {
+                                if (!compression) {
+                                    // server is saying compression, but we didn't ask for it.
                                     return error.InvalidExtensionHeader;
                                 }
+                                if (!sc.client_no_context_takeover or !sc.server_no_context_takeover) {
+                                    // as of Zig 0.15, we no longer support context takeover
+                                    // We told the server this, it should have respected it.
+                                    return error.InvalidExtensionHeader;
+                                }
+
+                                server_compression = true;
                             }
                         },
                         else => {}, // some other header we don't care about
@@ -954,6 +980,7 @@ fn testClient(stream: net.Stream) Client {
         ._closed = false,
         ._own_bp = true,
         ._mask_fn = generateMask,
+        ._compression_opts = null,
         .stream = .{ .stream = stream },
         ._reader = Reader.init(reader_buf, bp, null),
     };

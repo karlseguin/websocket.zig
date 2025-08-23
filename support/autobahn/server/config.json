@@ -2,8 +2,7 @@
 	"outdir": "/ab/reports/",
 	"options": {"failByDrop": false},
 	"servers": [
-		{"agent": "non-blocking", "url": "ws://host.docker.internal:9224"},
-		{"agent": "non-blocking buffer pool", "url": "ws://host.docker.internal:9225"}
+		{"agent": "non-blocking", "url": "ws://host.docker.internal:9224"}
 	],
 	"cases": ["*"],
 	"exclude-cases": [],

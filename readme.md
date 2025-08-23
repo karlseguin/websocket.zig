@@ -192,14 +192,14 @@ The call to `init` includes a `*websocket.Conn`. It is expected that handlers wi
 `close` takes an optional value where you can specify the `code` and/or `reason`: `conn.close(.{.code = 4000, .reason = "bye bye"})` Refer to [RFC6455](https://datatracker.ietf.org/doc/html/rfc6455#section-7.4.1) for valid codes. The `reason` must be <= 123 bytes.
 
 ### Writer
-It's possible to get a `std.io.Writer` from a `*Conn`. Because websocket messages are framed, the writter will buffer the message in memory and requires an explicit "flush". Buffering requires an allocator. 
+It's possible to get a `*std.Io.Writer` from a `*Conn`. Because websocket messages are framed, the writter will buffer the message in memory and requires an explicit "send". Buffering requires an allocator. 
 
 ```zig
 // .text or .binary
 var wb = conn.writeBuffer(allocator, .text);
 defer wb.deinit();
-try std.fmt.format(wb.writer(), "it's over {d}!!!", .{9000});
-try wb.flush();
+try wb.interface.print("it's over {d}!!!", .{9000});
+try wb.send();
 ```
 
 Consider using the `clientMessage` overload which accepts an allocator. Not only is this allocator fast (it's a thread-local buffer than fallsback to an arena), but it also eliminates the need to call `deinit`:
@@ -211,7 +211,7 @@ pub fn clientMessage(h: *Handler, allocator: Allocator, data: []const u8) !void 
 
     var wb = conn.writeBuffer(allocator, .text);
     try std.fmt.format(wb.writer(), "it's over {d}!!!", .{9000});
-    try wb.flush();
+    try wb.send();
 }
 ```
 
@@ -340,12 +340,6 @@ pub const Config = struct {
         // is freed after each message. 
         // true = more memory, but fewer allocations
         retain_write_buffer: bool = true,
-
-        // Advanced options that are part of the permessage-deflate specification.
-        // You can set these to true to try and save a bit of memory. But if you
-        // want to save memory, don't use compression at all.
-        client_no_context_takeover: bool = false,
-        server_no_context_takeover: bool = false,
     };
 }
 ```

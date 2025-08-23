@@ -5,6 +5,8 @@ pub fn build(b: *std.Build) !void {
     const optimize = b.standardOptimizeOption(.{});
 
     const websocket_module = b.addModule("websocket", .{
+        .target = target,
+        .optimize = optimize,
         .root_source_file = b.path("src/websocket.zig"),
     });
 
@@ -17,9 +19,7 @@ pub fn build(b: *std.Build) !void {
     {
         // run tests
         const tests = b.addTest(.{
-            .root_source_file = b.path("src/websocket.zig"),
-            .target = target,
-            .optimize = optimize,
+            .root_module = websocket_module,
             .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
         });
         tests.linkLibC();

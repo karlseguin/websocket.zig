@@ -87,26 +87,15 @@ pub const Reader = struct {
     // fragment), the state of the fragmented message is maintained here.)
     fragment: ?Fragmented,
 
-    decompressor: ?DecompressorType,
+    allow_compressed: bool,
 
     // if we returned a decompressed message, it's stored here so that we can
     // cleanup when the user is done with the message
     decompress_writer: ?buffer.Writer,
 
-    // when client_no_context_takeover, we reset the decompressor after every
-    // message
-    decompressor_reset: bool,
-
-    const DecompressorType = std.compress.flate.Decompressor(std.io.FixedBufferStream([]const u8).Reader);
+    const DecompressorType = std.compress.flate.Decompress;
 
     pub fn init(static: []u8, large_buffer_provider: *buffer.Provider, compression: ?Compression) Reader {
-        var decompressor_reset = false;
-        var decompressor: ?DecompressorType = null;
-        if (compression) |c| {
-            decompressor = .{};
-            decompressor_reset = c.client_no_context_takeover;
-        }
-
         return .{
             .pos = 0,
             .start = 0,
@@ -115,14 +104,13 @@ pub const Reader = struct {
             .message_len = 0,
             .fragment = null,
             .decompress_writer = null,
-            .decompressor = decompressor,
-            .decompressor_reset = decompressor_reset,
+            .allow_compressed = compression != null,
             .large_buffer_provider = large_buffer_provider,
         };
     }
 
     pub fn deinit(self: *Reader) void {
-        if (self.fragment) |f| {
+        if (self.fragment) |*f| {
             f.deinit();
         }
         if (self.decompress_writer) |*dw| {
@@ -265,14 +253,14 @@ pub const Reader = struct {
             // FIN, RSV1, RSV2, RSV3, OP,OP,OP,OP
             // RSV2 and RSV3 should never be set, and RSV1 should not be set
             // when compression is disabled
-            const rsv_bits: u8 = if (self.decompressor == null or is_continuation) 112 else 48;
+            const rsv_bits: u8 = if (self.allow_compressed == false or is_continuation) 112 else 48;
             if (byte1 & rsv_bits != 0) {
                 return error.ReservedFlags;
             }
 
             const compressed = byte1 & 64 == 64;
             if (compressed) {
-                if (self.decompressor == null) {
+                if (self.allow_compressed == false) {
                     return error.CompressionDisabled;
                 }
             }
@@ -371,17 +359,13 @@ pub const Reader = struct {
     // call to "read" to do this, because we don't know when that'll be.
     pub fn done(self: *Reader, message_type: Message.Type) void {
         if (message_type == .text or message_type == .binary) {
-            if (self.fragment) |f| {
+            if (self.fragment) |*f| {
                 f.deinit();
                 self.fragment = null;
             }
             if (self.decompress_writer) |*dw| {
                 dw.deinit();
                 self.decompress_writer = null;
-
-                if (self.decompressor_reset) {
-                    self.decompressor = .{};
-                }
             }
         }
 
@@ -420,44 +404,26 @@ pub const Reader = struct {
     fn decompress(self: *Reader, compressed: []const u8) ![]u8 {
         const provider = self.large_buffer_provider;
 
+        var dumb: [32]u8 = undefined;
         var writer: buffer.Writer = undefined;
         if (compressed.len < provider.pool_buffer_size) {
-            writer = .{
-                .pooled = true,
-                .provider = provider,
-                .buf = try provider.pool.acquireOrCreate(),
-            };
+            const buf = try provider.pool.acquireOrCreate();
+            writer = .init(buf, true, provider, &dumb);
         } else {
-            writer = .{
-                .pooled = false,
-                .provider = provider,
-                .buf = try provider.allocator.alloc(u8, @intFromFloat(@as(f64, @floatFromInt(compressed.len)) * 1.25)),
-            };
+            const buf = try provider.allocator.alloc(u8, @intFromFloat(@as(f64, @floatFromInt(compressed.len)) * 1.25));
+            writer = .init(buf, false, provider, &dumb);
         }
 
         errdefer writer.deinit();
 
-        var decompressor = &self.decompressor.?;
-        {
-            var reader = std.io.fixedBufferStream(compressed);
-            decompressor.setReader(reader.reader());
-            decompressor.decompress(&writer) catch |err| switch (err) {
-                error.EndOfStream => {},
-                else => return error.CompressionError,
-            };
-        }
-
-        {
-            var reader = std.io.fixedBufferStream(&[_]u8{ 0x00, 0x00, 0xff, 0xff });
-            decompressor.setReader(reader.reader());
-            decompressor.decompress(&writer) catch |err| switch (err) {
-                error.EndOfStream => {},
-                else => return error.CompressionError,
-            };
-        }
+        var reader = std.Io.Reader.fixed(compressed);
+        var decompressor = std.compress.flate.Decompress.init(&reader, .raw, &.{});
+        const n = decompressor.reader.streamRemaining(&writer.interface) catch {
+            return error.CompressionError;
+        };
 
         self.decompress_writer = writer;
-        return writer.buf[0..writer.pos];
+        return writer.buf[0..n];
     }
 
     inline fn usingLargeBuffer(self: *const Reader) bool {
@@ -480,10 +446,11 @@ const Fragmented = struct {
     compressed: bool,
     type: Message.Type,
     buf: std.ArrayList(u8),
+    allocator: std.mem.Allocator,
 
     pub fn init(bp: *buffer.Provider, compressed: bool, message_type: Message.Type, value: []const u8) !Fragmented {
-        var buf = std.ArrayList(u8).init(bp.allocator);
-        try buf.ensureTotalCapacity(value.len * 2);
+        var buf: std.ArrayList(u8) = .empty;
+        try buf.ensureTotalCapacity(bp.allocator, value.len * 2);
         buf.appendSliceAssumeCapacity(value);
 
         return .{
@@ -491,18 +458,19 @@ const Fragmented = struct {
             .type = message_type,
             .compressed = compressed,
             .max = bp.max_buffer_size,
+            .allocator = bp.allocator,
         };
     }
 
-    pub fn deinit(self: Fragmented) void {
-        self.buf.deinit();
+    pub fn deinit(self: *Fragmented) void {
+        self.buf.deinit(self.allocator);
     }
 
     pub fn add(self: *Fragmented, value: []const u8) !void {
         if (self.buf.items.len + value.len > self.max) {
             return error.TooLarge;
         }
-        try self.buf.appendSlice(value);
+        try self.buf.appendSlice(self.allocator, value);
     }
 
     // Optimization so that we don't over-allocate on our last frame.
@@ -511,7 +479,7 @@ const Fragmented = struct {
         if (total_len > self.max) {
             return error.TooLarge;
         }
-        try self.buf.ensureTotalCapacityPrecise(total_len);
+        try self.buf.ensureTotalCapacityPrecise(self.allocator, total_len);
         self.buf.appendSliceAssumeCapacity(value);
         return self.buf.items;
     }
@@ -680,7 +648,7 @@ test "Reader: fuzz" {
 
         var is_fragmented = false;
         var fragment_count: usize = 0;
-        var fragment = std.ArrayList(u8).init(arena);
+        var fragment: std.ArrayList(u8) = .empty;
 
         var i: usize = 0;
         while (i < MESSAGE_TO_SEND) {
@@ -710,7 +678,7 @@ test "Reader: fuzz" {
                         }
                         fragment_count += 1;
 
-                        try fragment.appendSlice(try arena.dupe(u8, buf));
+                        try fragment.appendSlice(arena, try arena.dupe(u8, buf));
 
                         if (is_fin) {
                             // this was the last message in our fragment
@@ -818,20 +786,20 @@ test "Fragmented" {
             var f = try Fragmented.init(&bp, false, .binary, payload);
             defer f.deinit();
 
-            var expected = std.ArrayList(u8).init(t.allocator);
-            defer expected.deinit();
-            try expected.appendSlice(payload);
+            var expected: std.ArrayList(u8) = .empty;
+            defer expected.deinit(t.allocator);
+            try expected.appendSlice(t.allocator, payload);
 
             const number_of_adds = random.uintAtMost(usize, 30);
             for (0..number_of_adds) |_| {
                 payload = buf[0 .. random.uintAtMost(usize, 99) + 1];
                 random.bytes(payload);
                 try f.add(payload);
-                try expected.appendSlice(payload);
+                try expected.appendSlice(t.allocator, payload);
             }
             payload = buf[0 .. random.uintAtMost(usize, 99) + 1];
             random.bytes(payload);
-            try expected.appendSlice(payload);
+            try expected.appendSlice(t.allocator, payload);
 
             try t.expectString(expected.items, try f.last(payload));
         }

@@ -34,7 +34,7 @@ pub fn main() !void {
     };
 
     // wait 5 seconds for autobanh server to be up
-    std.time.sleep(std.time.ns_per_s * 5);
+    std.Thread.sleep(std.time.ns_per_s * 5);
 
     var buffer_provider = try websocket.bufferProvider(allocator, .{ .count = 10, .size = 32768, .max = 20_000_000 });
     defer buffer_provider.deinit();
@@ -92,9 +92,10 @@ const Handler = struct {
             .port = 9001,
             .host = "localhost",
             .buffer_provider = buffer_provider,
-            .compression = .{
-                .write_threshold = 0,
-            },
+            // zig 0.15
+            // .compression = .{
+            //     .write_threshold = 0,
+            // },
         });
         errdefer client.deinit();
         try client.handshake(path, .{
