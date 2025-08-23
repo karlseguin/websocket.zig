@@ -22,8 +22,10 @@ pub const Handshake = @import("server/handshake.zig").Handshake;
 pub const Compression = struct {
     write_threshold: ?usize = null,
     retain_write_buffer: bool = true,
-    client_no_context_takeover: bool = false,
-    server_no_context_takeover: bool = false,
+    // don't know how to support these with the Zig 0.15 changes. So, for now
+    // we'll always require these to be true
+    // client_no_context_takeover: bool = false,
+    // server_no_context_takeover: bool = false,
 };
 
 pub fn bufferProvider(allocator: std.mem.Allocator, config: buffer.Config) !buffer.Provider {

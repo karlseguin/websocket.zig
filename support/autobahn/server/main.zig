@@ -7,7 +7,7 @@ const Handshake = websocket.Handshake;
 const Allocator = std.mem.Allocator;
 
 pub const std_options = std.Options{ .log_scope_levels = &[_]std.log.ScopeLevel{
-    .{ .scope = .websocket, .level = .warn },
+    .{ .scope = .websocket, .level = .debug },
 } };
 
 var nonblocking_server: websocket.Server(Handler) = undefined;
@@ -22,7 +22,7 @@ pub fn main() !void {
 
         std.posix.sigaction(std.posix.SIG.TERM, &.{
             .handler = .{ .handler = shutdown },
-            .mask = std.posix.empty_sigset,
+            .mask = std.posix.sigemptyset(),
             .flags = 0,
         }, null);
     }
@@ -107,7 +107,7 @@ const Handler = struct {
     }
 };
 
-fn shutdown(_: c_int) callconv(.C) void {
+fn shutdown(_: c_int) callconv(.c) void {
     nonblocking_server.stop();
     nonblocking_bp_server.stop();
 }

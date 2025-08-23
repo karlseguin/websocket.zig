@@ -122,7 +122,7 @@ pub const Handshake = struct {
         };
     }
 
-    pub fn createReply(key: []const u8, headers_: ?*KeyValue, compression: ?websocket.Compression, buf: []u8) ![]const u8 {
+    pub fn createReply(key: []const u8, headers_: ?*KeyValue, compression: bool, buf: []u8) ![]const u8 {
         const HEADER =
             "HTTP/1.1 101 Switching Protocols\r\n" ++
             "Upgrade: websocket\r\n" ++
@@ -145,25 +145,15 @@ pub const Handshake = struct {
             pos = end;
         }
 
-        if (compression) |c| {
-            {
-                const permessage_deflate = "\r\nSec-WebSocket-Extensions: permessage-deflate";
-                const end = pos + permessage_deflate.len;
-                @memcpy(buf[pos..end], permessage_deflate);
-                pos = end;
-            }
-            if (c.server_no_context_takeover) {
-                const server_no_context_takeover = "; server_no_context_takeover";
-                const end = pos + server_no_context_takeover.len;
-                @memcpy(buf[pos..end], server_no_context_takeover);
-                pos = end;
-            }
-            if (c.client_no_context_takeover) {
-                const client_no_context_takeover = "; client_no_context_takeover";
-                const end = pos + client_no_context_takeover.len;
-                @memcpy(buf[pos..end], client_no_context_takeover);
-                pos = end;
-            }
+        if (compression) {
+            const permessage_deflate =
+                "\r\nSec-WebSocket-Extensions: permessage-deflate" ++
+                "; server_no_context_takeover" ++
+                "; client_no_context_takeover";
+
+            const end = pos + permessage_deflate.len;
+            @memcpy(buf[pos..end], permessage_deflate);
+            pos = end;
         }
 
         if (headers_) |headers| {
@@ -535,18 +525,7 @@ test "handshake: reply" {
             "Upgrade: websocket\r\n" ++
             "Connection: upgrade\r\n" ++
             "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n\r\n";
-        try t.expectString(expected, try Handshake.createReply("this is my key", null, null, &buf));
-    }
-
-    {
-        // compression
-        const expected =
-            "HTTP/1.1 101 Switching Protocols\r\n" ++
-            "Upgrade: websocket\r\n" ++
-            "Connection: upgrade\r\n" ++
-            "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n" ++
-            "Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n";
-        try t.expectString(expected, try Handshake.createReply("this is my key", null, .{}, &buf));
+        try t.expectString(expected, try Handshake.createReply("this is my key", null, false, &buf));
     }
 
     {
@@ -557,10 +536,7 @@ test "handshake: reply" {
             "Connection: upgrade\r\n" ++
             "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n" ++
             "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n\r\n";
-        try t.expectString(expected, try Handshake.createReply("this is my key", null, .{
-            .client_no_context_takeover = true,
-            .server_no_context_takeover = true,
-        }, &buf));
+        try t.expectString(expected, try Handshake.createReply("this is my key", null, true, &buf));
     }
 
     // With custom headers
@@ -576,32 +552,7 @@ test "handshake: reply" {
             "Connection: upgrade\r\n" ++
             "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n" ++
             "Set-Cookie: Yummy!\r\n\r\n";
-        try t.expectString(expected, try Handshake.createReply("this is my key", &res_headers, null, &buf));
-    }
-
-    {
-        // compression
-        const expected =
-            "HTTP/1.1 101 Switching Protocols\r\n" ++
-            "Upgrade: websocket\r\n" ++
-            "Connection: upgrade\r\n" ++
-            "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n" ++
-            "Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n";
-        try t.expectString(expected, try Handshake.createReply("this is my key", null, .{}, &buf));
-    }
-
-    {
-        // compression
-        const expected =
-            "HTTP/1.1 101 Switching Protocols\r\n" ++
-            "Upgrade: websocket\r\n" ++
-            "Connection: upgrade\r\n" ++
-            "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n" ++
-            "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n\r\n";
-        try t.expectString(expected, try Handshake.createReply("this is my key", null, .{
-            .client_no_context_takeover = true,
-            .server_no_context_takeover = true,
-        }, &buf));
+        try t.expectString(expected, try Handshake.createReply("this is my key", &res_headers, false, &buf));
     }
 }
 

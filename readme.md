@@ -340,12 +340,6 @@ pub const Config = struct {
         // is freed after each message. 
         // true = more memory, but fewer allocations
         retain_write_buffer: bool = true,
-
-        // Advanced options that are part of the permessage-deflate specification.
-        // You can set these to true to try and save a bit of memory. But if you
-        // want to save memory, don't use compression at all.
-        client_no_context_takeover: bool = false,
-        server_no_context_takeover: bool = false,
     };
 }
 ```

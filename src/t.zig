@@ -35,13 +35,13 @@ pub const Writer = struct {
     pub fn init() Writer {
         return .{
             .pos = 0,
+            .buf = .empty,
             .random = getRandom(),
-            .buf = std.ArrayList(u8).init(allocator),
         };
     }
 
-    pub fn deinit(self: *const Writer) void {
-        self.buf.deinit();
+    pub fn deinit(self: *Writer) void {
+        self.buf.deinit(allocator);
     }
 
     pub fn ping(self: *Writer) void {
@@ -80,7 +80,7 @@ pub const Writer = struct {
 
         // 2 byte header + length_of_length + mask + payload_length
         const needed = 2 + length_of_length + 4 + l;
-        buf.ensureUnusedCapacity(needed) catch unreachable;
+        buf.ensureUnusedCapacity(allocator, needed) catch unreachable;
 
         if (fin) {
             buf.appendAssumeCapacity(128 | op_code | reserved);

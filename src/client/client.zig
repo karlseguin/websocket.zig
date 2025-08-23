@@ -66,22 +66,9 @@ pub const Client = struct {
     pub fn init(allocator: Allocator, config: Config) !Client {
         const net_stream = try net.tcpConnectToHost(allocator, config.host, config.port);
 
-        var tls_client: ?tls.Client = null;
+        var tls_client: ?*TLSClient = null;
         if (config.tls) {
-            var own_bundle = false;
-            var bundle = config.ca_bundle orelse blk: {
-                own_bundle = true;
-                var b = Bundle{};
-                try b.rescan(allocator);
-                break :blk b;
-            };
-            defer if (own_bundle) {
-                bundle.deinit(allocator);
-            };
-            tls_client = try tls.Client.init(net_stream, .{
-                .host = .{ .explicit = config.host },
-                .ca = .{ .bundle = bundle },
-            });
+            tls_client = try TLSClient.init(allocator, net_stream, &config);
         }
         const stream = Stream.init(net_stream, tls_client);
 
@@ -340,9 +327,9 @@ pub const Client = struct {
 // wraps a net.Stream and optional a tls.Client
 pub const Stream = struct {
     stream: net.Stream,
-    tls_client: ?tls.Client = null,
+    tls_client: ?*TLSClient = null,
 
-    pub fn init(stream: net.Stream, tls_client: ?tls.Client) Stream {
+    pub fn init(stream: net.Stream, tls_client: ?*TLSClient) Stream {
         return .{
             .stream = stream,
             .tls_client = tls_client,
@@ -350,8 +337,8 @@ pub const Stream = struct {
     }
 
     pub fn close(self: *Stream) void {
-        if (self.tls_client) |*tls_client| {
-            _ = tls_client.writeEnd(self.stream, "", true) catch {};
+        if (self.tls_client) |tls_client| {
+            tls_client.deinit();
         }
 
         // std.posix.close panics on EBADF
@@ -374,15 +361,26 @@ pub const Stream = struct {
     }
 
     pub fn read(self: *Stream, buf: []u8) !usize {
-        if (self.tls_client) |*tls_client| {
-            return tls_client.read(self.stream, buf);
+        if (self.tls_client) |tls_client| {
+            var w: std.Io.Writer = .fixed(buf);
+            while (true) {
+                const n = try tls_client.client.reader.stream(&w, .limited(buf.len));
+                if (n != 0) {
+                    return n;
+                }
+            }
         }
         return self.stream.read(buf);
     }
 
     pub fn writeAll(self: *Stream, data: []const u8) !void {
-        if (self.tls_client) |*tls_client| {
-            return tls_client.writeAll(self.stream, data);
+        if (self.tls_client) |tls_client| {
+            try tls_client.client.writer.writeAll(data);
+            // I know this looks silly, but as far as I can tell, this is what
+            // we need to do.
+            try tls_client.client.writer.flush();
+            try tls_client.stream_writer.interface.flush();
+            return;
         }
         return self.stream.writeAll(data);
     }
@@ -410,6 +408,63 @@ pub const Stream = struct {
 
     pub fn setsockopt(self: *const Stream, opt_name: u32, value: []const u8) !void {
         return posix.setsockopt(self.stream.handle, posix.SOL.SOCKET, opt_name, value);
+    }
+};
+
+const TLSClient = struct {
+    client: tls.Client,
+    stream: net.Stream,
+    stream_writer: net.Stream.Writer,
+    stream_reader: net.Stream.Reader,
+    arena: std.heap.ArenaAllocator,
+
+    fn init(allocator: Allocator, stream: net.Stream, config: *const Client.Config) !*TLSClient {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+
+        const aa = arena.allocator();
+
+        const bundle = config.ca_bundle orelse blk: {
+            var b = Bundle{};
+            try b.rescan(aa);
+            break :blk b;
+        };
+
+        // The TLS input and output have to be max_ciphertext_record_len each.
+        // It isn't clear to me how big the un-encrypted reader and writer
+        // need to be. I would think 0, but that will fail an assertion. I
+        // don't think that it's right that we need 4 buffers, but apparently
+        // we do. Until i figure this out, using 4 x max_ciphertext_record_len
+        // seems like the only safe choice.
+        const buf_len = std.crypto.tls.max_ciphertext_record_len;
+        var buf = try aa.alloc(u8, buf_len * 4);
+
+        const self = try aa.create(TLSClient);
+        self.* = .{
+            .stream = stream,
+            .arena = arena,
+            .client = undefined,
+            .stream_writer = stream.writer(buf.ptr[0..buf_len][0..buf_len]),
+            .stream_reader = stream.reader(buf.ptr[buf_len .. 2 * buf_len][0..buf_len]),
+        };
+
+        self.client = try tls.Client.init(
+            self.stream_reader.interface(),
+            &self.stream_writer.interface,
+            .{
+                .ca = .{ .bundle = bundle },
+                .host = .{ .explicit = config.host },
+                .read_buffer = buf.ptr[2 * buf_len .. 3 * buf_len][0..buf_len],
+                .write_buffer = buf.ptr[3 * buf_len .. 4 * buf_len][0..buf_len],
+            },
+        );
+
+        return self;
+    }
+
+    fn deinit(self: *TLSClient) void {
+        _ = self.client.end() catch {};
+        self.arena.deinit();
     }
 };
 
