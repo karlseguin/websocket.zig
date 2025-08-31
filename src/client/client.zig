@@ -405,9 +405,19 @@ pub const Stream = struct {
     }
 
     pub fn close(self: *Stream) void {
+        const fd = self.stream.handle;
+        const builtin = @import("builtin");
+        const native_os = builtin.os.tag;
+
         if (self.tls_client) |tls_client| {
             // Shutdown the socket first, so readLoop() can exit, before tls_client's buffers are freed
-            std.posix.shutdown(self.stream.handle, .both) catch {};
+            if (native_os == .windows) {
+                _ = std.os.windows.ws2_32.shutdown(fd, std.os.windows.ws2_32.SD_BOTH);
+            } else if (native_os == .wasi and !builtin.link_libc) {
+                _ = std.os.wasi.sock_shutdown(fd, .{ .WR = true, .RD = true });
+            } else {
+                std.posix.shutdown(fd, .both) catch {};
+            }
             tls_client.deinit();
         }
 
@@ -417,9 +427,6 @@ pub const Stream = struct {
         //
         // we don't want to crash on double close
 
-        const fd = self.stream.handle;
-        const builtin = @import("builtin");
-        const native_os = builtin.os.tag;
         if (native_os == .windows) {
             return std.os.windows.CloseHandle(fd);
         }
