@@ -406,6 +406,8 @@ pub const Stream = struct {
 
     pub fn close(self: *Stream) void {
         if (self.tls_client) |tls_client| {
+            // Shutdown the socket first, so readLoop() can exit, before tls_client's buffers are freed
+            std.posix.shutdown(self.stream.handle, .both) catch {};
             tls_client.deinit();
         }
 
