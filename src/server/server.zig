@@ -1466,8 +1466,8 @@ pub const Conn = struct {
         conn: *Conn,
         op_code: OpCode,
         allocator: Allocator,
-        buf: std.ArrayListUnmanaged(u8),
-        interface: std.io.Writer,
+        buf: std.ArrayList(u8),
+        interface: std.Io.Writer,
 
         pub const Error = Allocator.Error;
 
@@ -1475,7 +1475,7 @@ pub const Conn = struct {
             self.buf.deinit(self.allocator);
         }
 
-        pub fn drain(io_w: *std.io.Writer, data: []const []const u8, splat: usize) error{WriteFailed}!usize {
+        pub fn drain(io_w: *std.Io.Writer, data: []const []const u8, splat: usize) error{WriteFailed}!usize {
             _ = splat;
             const self: *Writer = @alignCast(@fieldParentPtr("interface", io_w));
             self.buf.appendSlice(self.allocator, data[0]) catch return error.WriteFailed;
