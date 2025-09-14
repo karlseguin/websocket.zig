@@ -775,11 +775,16 @@ fn NonBlockingBase(comptime H: type, comptime MANAGE_HS: bool) type {
         }
 
         fn cleanupConn(self: *Self, hc: *HandlerConn(H)) void {
-            if (hc.reader) |*reader| {
-                if (self.small_buffer_pool) |*sbp| {
-                    sbp.release(reader.static);
-                } else {
-                    self.allocator.free(reader.static);
+            {
+                hc.cleanup.lock();
+                defer hc.cleanup.unlock();
+                if (hc.reader) |*reader| {
+                    if (self.small_buffer_pool) |*sbp| {
+                        sbp.release(reader.static);
+                    } else {
+                        self.allocator.free(reader.static);
+                    }
+                    hc.reader = null;
                 }
             }
             self.conn_manager.cleanup(hc);
@@ -792,10 +797,13 @@ fn NonBlockingBase(comptime H: type, comptime MANAGE_HS: bool) type {
 
         // called for each hc when shutting down
         fn shutdownCleanup(self: *Self, hc: *HandlerConn(H)) void {
+            hc.cleanup.lock();
+            defer hc.cleanup.unlock();
             if (hc.reader) |*reader| {
                 if (self.small_buffer_pool == null) {
                     self.allocator.free(reader.static);
                 }
+                hc.reader = null;
             }
         }
     };
@@ -1086,6 +1094,7 @@ pub fn HandlerConn(comptime H: type) type {
         reader: ?Reader,
         socket: posix.socket_t, // denormalization from conn.stream.handle
         handshake: ?*Handshake.State,
+        cleanup: Thread.Mutex = .{},
         compression: ?Compression = null,
         next: ?*HandlerConn(H) = null,
         prev: ?*HandlerConn(H) = null,
@@ -1272,7 +1281,7 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
         // This is sloppy and leaves things in an unrecoverable state. To keep
         // things clean, we should call self.cleanup(hc) on each entry in the list
         // but that does a bunch of things we don't need if we know that we're
-        // shutting down - like returning data to the pools, nd popping items
+        // shutting down - like returning data to the pools, and popping items
         // out of the list.
         fn shutdownList(head: ?*HandlerConn(H), worker: anytype) void {
             var next_node = head;
