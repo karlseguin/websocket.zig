@@ -269,6 +269,9 @@ pub fn Server(comptime H: type) type {
                     thrd.join();
                 }
             }
+            self._mut.lock();
+            defer self._mut.unlock();
+            self._cond.signal();
         }
 
         pub fn stop(self: *Self) void {
@@ -283,6 +286,7 @@ pub fn Server(comptime H: type) type {
                 }
                 posix.close(s);
             }
+            self._cond.wait(&self._mut);
         }
     };
 }
