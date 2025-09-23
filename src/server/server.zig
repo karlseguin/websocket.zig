@@ -269,6 +269,7 @@ pub fn Server(comptime H: type) type {
                     thrd.join();
                 }
             }
+            self._cond.signal();
         }
 
         pub fn stop(self: *Self) void {
@@ -283,6 +284,7 @@ pub fn Server(comptime H: type) type {
                 }
                 posix.close(s);
             }
+            self._cond.wait(&self._mut);
         }
     };
 }
@@ -647,13 +649,17 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
         // Else, we'll need to throw a bunch of locking around HC just to handle shutdown.
         fn dataAvailable(self: *Self, hc: *HandlerConn(H), thread_buf: []u8) void {
             var success = false;
-            if (hc.handler == null) {
-                success = self.dataForHandshake(hc) catch |err| blk: {
-                    log.err("({f}) error processing handshake: {}", .{ hc.conn.address, err });
-                    break :blk false;
-                };
-            } else {
-                success = self.base.dataAvailable(hc, thread_buf);
+            {
+                hc.cleanup.lock();
+                defer hc.cleanup.unlock();
+                if (hc.handler == null) {
+                    success = self.dataForHandshake(hc) catch |err| blk: {
+                        log.err("({f}) error processing handshake: {}", .{ hc.conn.address, err });
+                        break :blk false;
+                    };
+                } else {
+                    success = self.base.dataAvailable(hc, thread_buf);
+                }
             }
 
             var conn = &hc.conn;
@@ -1287,6 +1293,8 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
             var next_node = head;
             while (next_node) |hc| {
                 if (comptime std.meta.hasFn(H, "close")) {
+                    hc.cleanup.lock();
+                    defer hc.cleanup.unlock();
                     if (hc.handler) |*h| {
                         h.close();
                         hc.handler = null;
