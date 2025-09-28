@@ -13,24 +13,25 @@ pub const Buffer = struct {
     };
 };
 
+pub const WriterType = std.io.Writer(*Writer, error{WriteFailed}, writeForWriter);
+
+fn writeForWriter(self: *Writer, bytes: []const u8) error{WriteFailed}!usize {
+    self.writeAll(bytes) catch return error.WriteFailed;
+    return bytes.len;
+}
+
 pub const Writer = struct {
     buf: []u8,
     pos: usize = 0,
     pooled: bool,
     provider: *Provider,
-    interface: std.Io.Writer,
 
     pub fn init(buf: []u8, pooled: bool, provider: *Provider, dumb: []u8) Writer {
+        _ = dumb;
         return .{
             .buf = buf,
             .pooled = pooled,
             .provider = provider,
-            .interface = .{
-                .buffer = dumb,
-                .vtable = &.{
-                    .drain = drain,
-                },
-            },
         };
     }
 
@@ -42,12 +43,8 @@ pub const Writer = struct {
         }
     }
 
-    pub fn drain(io_w: *std.Io.Writer, data: []const []const u8, splat: usize) error{WriteFailed}!usize {
-        std.debug.print("drain: {d}\n", .{data[0].len});
-        _ = splat;
-        const self: *Writer = @alignCast(@fieldParentPtr("interface", io_w));
-        self.writeAll(data[0]) catch return error.WriteFailed;
-        return data[0].len;
+    pub fn writer(self: *Writer) WriterType {
+        return .{ .context = self };
     }
 
     pub fn writeAll(self: *Writer, data: []const u8) !void {

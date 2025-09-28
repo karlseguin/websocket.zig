@@ -416,9 +416,10 @@ pub const Reader = struct {
 
         errdefer writer.deinit();
 
-        var reader = std.Io.Reader.fixed(compressed);
-        var decompressor = std.compress.flate.Decompress.init(&reader, .raw, &.{});
-        const n = decompressor.reader.streamRemaining(&writer.interface) catch {
+        var fbs = std.io.fixedBufferStream(compressed);
+        const reader = fbs.reader();
+        var decompressor = std.compress.flate.decompressor(reader);
+        const n = decompressor.reader().readAll(writer.buf) catch {
             return error.CompressionError;
         };
 
@@ -449,8 +450,8 @@ const Fragmented = struct {
     allocator: std.mem.Allocator,
 
     pub fn init(bp: *buffer.Provider, compressed: bool, message_type: Message.Type, value: []const u8) !Fragmented {
-        var buf: std.ArrayList(u8) = .empty;
-        try buf.ensureTotalCapacity(bp.allocator, value.len * 2);
+        var buf = std.ArrayList(u8).init(bp.allocator);
+        try buf.ensureTotalCapacity(value.len * 2);
         buf.appendSliceAssumeCapacity(value);
 
         return .{
@@ -463,14 +464,14 @@ const Fragmented = struct {
     }
 
     pub fn deinit(self: *Fragmented) void {
-        self.buf.deinit(self.allocator);
+        self.buf.deinit();
     }
 
     pub fn add(self: *Fragmented, value: []const u8) !void {
         if (self.buf.items.len + value.len > self.max) {
             return error.TooLarge;
         }
-        try self.buf.appendSlice(self.allocator, value);
+        try self.buf.appendSlice(value);
     }
 
     // Optimization so that we don't over-allocate on our last frame.
@@ -479,7 +480,7 @@ const Fragmented = struct {
         if (total_len > self.max) {
             return error.TooLarge;
         }
-        try self.buf.ensureTotalCapacityPrecise(self.allocator, total_len);
+        try self.buf.ensureTotalCapacityPrecise(total_len);
         self.buf.appendSliceAssumeCapacity(value);
         return self.buf.items;
     }
@@ -648,7 +649,7 @@ test "Reader: fuzz" {
 
         var is_fragmented = false;
         var fragment_count: usize = 0;
-        var fragment: std.ArrayList(u8) = .empty;
+        var fragment = std.ArrayList(u8).init(t.allocator);
 
         var i: usize = 0;
         while (i < MESSAGE_TO_SEND) {
@@ -678,7 +679,7 @@ test "Reader: fuzz" {
                         }
                         fragment_count += 1;
 
-                        try fragment.appendSlice(arena, try arena.dupe(u8, buf));
+                        try fragment.appendSlice(try arena.dupe(u8, buf));
 
                         if (is_fin) {
                             // this was the last message in our fragment
@@ -786,20 +787,20 @@ test "Fragmented" {
             var f = try Fragmented.init(&bp, false, .binary, payload);
             defer f.deinit();
 
-            var expected: std.ArrayList(u8) = .empty;
-            defer expected.deinit(t.allocator);
-            try expected.appendSlice(t.allocator, payload);
+            var expected = std.ArrayList(u8).init(t.allocator);
+            defer expected.deinit();
+            try expected.appendSlice(payload);
 
             const number_of_adds = random.uintAtMost(usize, 30);
             for (0..number_of_adds) |_| {
                 payload = buf[0 .. random.uintAtMost(usize, 99) + 1];
                 random.bytes(payload);
                 try f.add(payload);
-                try expected.appendSlice(t.allocator, payload);
+                try expected.appendSlice(payload);
             }
             payload = buf[0 .. random.uintAtMost(usize, 99) + 1];
             random.bytes(payload);
-            try expected.appendSlice(t.allocator, payload);
+            try expected.appendSlice(payload);
 
             try t.expectString(expected.items, try f.last(payload));
         }

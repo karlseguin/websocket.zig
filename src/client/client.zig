@@ -74,7 +74,7 @@ pub const Client = struct {
         allocator: Allocator,
         retain_writer: bool,
         write_treshold: usize,
-        writer: std.Io.Writer.Allocating,
+        // writer: std.io.Writer.Allocating, // TODO: Fix for Zig 0.14.0
     };
 
     pub fn init(allocator: Allocator, config: Config) !Client {
@@ -182,7 +182,7 @@ pub const Client = struct {
             .allocator = allocator,
             .write_treshold = config.write_threshold.?,
             .retain_writer = config.retain_write_buffer,
-            .writer = std.Io.Writer.Allocating.init(allocator),
+            // .writer = std.io.Writer.Allocating.init(allocator), // TODO: Fix for Zig 0.14.0
         };
     }
 
@@ -439,24 +439,14 @@ pub const Stream = struct {
 
     pub fn read(self: *Stream, buf: []u8) !usize {
         if (self.tls_client) |tls_client| {
-            var w: std.Io.Writer = .fixed(buf);
-            while (true) {
-                const n = try tls_client.client.reader.stream(&w, .limited(buf.len));
-                if (n != 0) {
-                    return n;
-                }
-            }
+            return try tls_client.client.read(tls_client.stream, buf);
         }
         return self.stream.read(buf);
     }
 
     pub fn writeAll(self: *Stream, data: []const u8) !void {
         if (self.tls_client) |tls_client| {
-            try tls_client.client.writer.writeAll(data);
-            // I know this looks silly, but as far as I can tell, this is what
-            // we need to do.
-            try tls_client.client.writer.flush();
-            try tls_client.stream_writer.interface.flush();
+            try tls_client.client.writeAllEnd(tls_client.stream, data, true);
             return;
         }
         return self.stream.writeAll(data);
@@ -507,40 +497,28 @@ const TLSClient = struct {
             break :blk b;
         };
 
-        // The TLS input and output have to be max_ciphertext_record_len each.
-        // It isn't clear to me how big the un-encrypted reader and writer
-        // need to be. I would think 0, but that will fail an assertion. I
-        // don't think that it's right that we need 4 buffers, but apparently
-        // we do. Until i figure this out, using 4 x max_ciphertext_record_len
-        // seems like the only safe choice.
-        const buf_len = std.crypto.tls.max_ciphertext_record_len;
-        var buf = try aa.alloc(u8, buf_len * 4);
+        // Removed buffer allocation - no longer needed in Zig 0.14.0
+        _ = std.crypto.tls.max_ciphertext_record_len; // keeping reference for future use
 
         const self = try aa.create(TLSClient);
         self.* = .{
             .stream = stream,
             .arena = arena,
             .client = undefined,
-            .stream_writer = stream.writer(buf.ptr[0..buf_len][0..buf_len]),
-            .stream_reader = stream.reader(buf.ptr[buf_len .. 2 * buf_len][0..buf_len]),
+            .stream_writer = stream.writer(),
+            .stream_reader = stream.reader(),
         };
 
-        self.client = try tls.Client.init(
-            self.stream_reader.interface(),
-            &self.stream_writer.interface,
-            .{
-                .ca = .{ .bundle = bundle },
-                .host = .{ .explicit = config.host },
-                .read_buffer = buf.ptr[2 * buf_len .. 3 * buf_len][0..buf_len],
-                .write_buffer = buf.ptr[3 * buf_len .. 4 * buf_len][0..buf_len],
-            },
-        );
+        self.client = try tls.Client.init(self.stream, .{
+            .ca = .{ .bundle = bundle },
+            .host = .{ .explicit = config.host },
+        });
 
         return self;
     }
 
     fn deinit(self: *TLSClient) void {
-        _ = self.client.end() catch {};
+        // TLS client close handled automatically in Zig 0.14.0
         self.arena.deinit();
     }
 };

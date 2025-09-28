@@ -258,7 +258,7 @@ pub fn Server(comptime H: type) type {
                     started += 1;
                 }
 
-                log.info("starting nonblocking worker to listen on {f}", .{address});
+                log.info("starting nonblocking worker to listen on {}", .{address});
 
                 // in case startInNewThread is waiting
                 self._cond.signal();
@@ -351,11 +351,11 @@ pub fn Blocking(comptime H: type) type {
                     log.err("failed to accept socket: {}", .{err});
                     continue;
                 };
-                log.debug("({f}) connected", .{address});
+                log.debug("({}) connected", .{address});
 
                 const thread = std.Thread.spawn(.{}, Self.handleConnection, .{ self, socket, address, ctx }) catch |err| {
                     posix.close(socket);
-                    log.err("({f}) failed to spawn connection thread: {}", .{ address, err });
+                    log.err("({}) failed to spawn connection thread: {}", .{ address, err });
                     continue;
                 };
                 thread.detach();
@@ -366,7 +366,7 @@ pub fn Blocking(comptime H: type) type {
         // Wrapper around _handleConnection so that we can handle erros
         fn handleConnection(self: *Self, socket: posix.socket_t, address: net.Address, ctx: anytype) void {
             self._handleConnection(socket, address, ctx) catch |err| {
-                log.err("({f}) uncaught error in connection handler: {}", .{ address, err });
+                log.err("({}) uncaught error in connection handler: {}", .{ address, err });
             };
         }
 
@@ -590,7 +590,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
                 // this connection has timed out. Don't use self.cleanup since there's
                 // a bunch of stuff we can assume here..like there's no handler or reader
                 conn.closeSocket();
-                log.debug("({f}) handshake timeout", .{conn.address});
+                log.debug("({}) handshake timeout", .{conn.address});
                 if (hc.handshake) |h| {
                     h.release();
                 }
@@ -615,7 +615,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
                     return if (err == error.WouldBlock) {} else err;
                 };
 
-                log.debug("({f}) connected", .{address});
+                log.debug("({}) connected", .{address});
 
                 {
                     errdefer posix.close(socket);
@@ -654,7 +654,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
                 defer hc.cleanup.unlock();
                 if (hc.handler == null) {
                     success = self.dataForHandshake(hc) catch |err| blk: {
-                        log.err("({f}) error processing handshake: {}", .{ hc.conn.address, err });
+                        log.err("({}) error processing handshake: {}", .{ hc.conn.address, err });
                         break :blk false;
                     };
                 } else {
@@ -675,7 +675,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
                 self.base.cleanupConn(hc);
             } else {
                 self.loop.monitorRead(hc, true) catch |err| {
-                    log.debug("({f}) failed to add read event monitor: {}", .{ conn.address, err });
+                    log.debug("({}) failed to add read event monitor: {}", .{ conn.address, err });
                     conn.closeSocket();
                     self.base.cleanupConn(hc);
                 };
@@ -755,7 +755,7 @@ fn NonBlockingBase(comptime H: type, comptime MANAGE_HS: bool) type {
 
         pub fn dataAvailable(self: *Self, hc: *HandlerConn(H), thread_buf: []u8) bool {
             return self._dataAvailable(hc, thread_buf) catch |err| {
-                log.err("({f}) error processing client message: {}", .{ hc.conn.address, err });
+                log.err("({}) error processing client message: {}", .{ hc.conn.address, err });
                 return false;
             };
         }
@@ -1231,9 +1231,9 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
                 hc.handler = null;
             }
 
-            if (hc.conn.compression) |c| {
-                c.writer.deinit();
-            }
+            // if (hc.conn.compression) |c| {
+            //     c.writer.deinit(); // TODO: Fix for Zig 0.14.0
+            // }
 
             self.lock.lock();
             if (hc.state == .active) {
@@ -1271,7 +1271,7 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
                 .allocator = self.allocator,
                 .write_treshold = config.write_threshold.?,
                 .retain_writer = config.retain_write_buffer,
-                .writer = std.Io.Writer.Allocating.init(self.allocator),
+                // .writer = std.io.Writer.Allocating.init(self.allocator), // TODO: Fix for Zig 0.14.0
             };
             hc.conn.compression = compression;
         }
@@ -1323,7 +1323,7 @@ pub const Conn = struct {
         allocator: Allocator,
         retain_writer: bool,
         write_treshold: usize,
-        writer: std.Io.Writer.Allocating,
+        // writer: std.io.Writer.Allocating, // TODO: Fix for Zig 0.14.0
     };
 
     pub fn isClosed(self: *Conn) bool {
@@ -1410,7 +1410,7 @@ pub const Conn = struct {
         //         c.writer.clearRetainingCapacity();
         //     } else {
         //         c.writer.deinit();
-        //         c.writer = std.Io.Writer.Allocating.init(c.allocator);
+        //         // c.writer = std.io.Writer.Allocating.init(c.allocator); // TODO: Fix for Zig 0.14.0
         //     }
         // };
 
@@ -1463,13 +1463,9 @@ pub const Conn = struct {
     pub fn writeBuffer(self: *Conn, allocator: Allocator, op_code: OpCode) Writer {
         return .{
             .conn = self,
-            .buf = .empty,
+            .buf = std.ArrayList(u8).init(allocator),
             .op_code = op_code,
             .allocator = allocator,
-            .interface = .{
-                .vtable = &.{ .drain = Writer.drain },
-                .buffer = &.{},
-            },
         };
     }
 
@@ -1484,7 +1480,7 @@ pub const Conn = struct {
         op_code: OpCode,
         allocator: Allocator,
         buf: std.ArrayList(u8),
-        interface: std.Io.Writer,
+        // interface: std.io.Writer, // TODO: Fix for Zig 0.14.0
 
         pub const Error = Allocator.Error;
 
@@ -1507,7 +1503,7 @@ pub const Conn = struct {
 
 fn handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx: anytype) struct { bool, bool } {
     return _handleHandshake(H, worker, hc, ctx) catch |err| {
-        log.warn("({f}) uncaugh error processing handshake: {}", .{ hc.conn.address, err });
+        log.warn("({}) uncaugh error processing handshake: {}", .{ hc.conn.address, err });
         return .{ false, false };
     };
 }
@@ -1526,30 +1522,30 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
     const len = state.len;
 
     if (len == buf.len) {
-        log.warn("({f}) handshake request exceeded maximum configured size ({d})", .{ conn.address, buf.len });
+        log.warn("({}) handshake request exceeded maximum configured size ({d})", .{ conn.address, buf.len });
         return .{ false, false };
     }
 
     const n = posix.read(hc.socket, buf[len..]) catch |err| {
         switch (err) {
-            error.BrokenPipe, error.ConnectionResetByPeer => log.debug("({f}) handshake connection closed: {}", .{ conn.address, err }),
+            error.BrokenPipe, error.ConnectionResetByPeer => log.debug("({}) handshake connection closed: {}", .{ conn.address, err }),
             error.WouldBlock => {
                 std.debug.assert(blockingMode());
-                log.debug("({f}) handshake timeout", .{conn.address});
+                log.debug("({}) handshake timeout", .{conn.address});
             },
-            else => log.warn("({f}) handshake error reading from socket: {}", .{ conn.address, err }),
+            else => log.warn("({}) handshake error reading from socket: {}", .{ conn.address, err }),
         }
         return .{ false, false };
     };
 
     if (n == 0) {
-        log.debug("({f}) handshake connection closed", .{conn.address});
+        log.debug("({}) handshake connection closed", .{conn.address});
         return .{ false, false };
     }
 
     state.len = len + n;
     var handshake = Handshake.parse(state) catch |err| {
-        log.debug("({f}) error parsing handshake: {}", .{ conn.address, err });
+        log.debug("({}) error parsing handshake: {}", .{ conn.address, err });
         respondToHandshakeError(conn, err);
         return .{ false, false };
     } orelse {
@@ -1570,7 +1566,7 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
         } else {
             respondToHandshakeError(conn, err);
         }
-        log.debug("({f}) " ++ @typeName(H) ++ ".init rejected request {}", .{ conn.address, err });
+        log.debug("({}) " ++ @typeName(H) ++ ".init rejected request {}", .{ conn.address, err });
         return .{ false, false };
     };
 
@@ -1584,19 +1580,19 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
         const params = @typeInfo(@TypeOf(H.afterInit)).@"fn".params;
         const res = if (params.len == 1) hc.handler.?.afterInit() else hc.handler.?.afterInit(ctx);
         res catch |err| {
-            log.debug("({f}) " ++ @typeName(H) ++ ".afterInit error: {}", .{ conn.address, err });
+            log.debug("({}) " ++ @typeName(H) ++ ".afterInit error: {}", .{ conn.address, err });
             return .{ false, false };
         };
     }
 
-    log.debug("({f}) connection successfully upgraded", .{conn.address});
+    log.debug("({}) connection successfully upgraded", .{conn.address});
     return .{ compression, true };
 }
 
 fn handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator, fba: *FixedBufferAllocator) bool {
     std.debug.assert(hc.handshake == null);
     return _handleClientData(H, hc, allocator, fba) catch |err| {
-        log.warn("({f}) uncaugh error handling incoming data: {}", .{ hc.conn.address, err });
+        log.warn("({}) uncaugh error handling incoming data: {}", .{ hc.conn.address, err });
         return false;
     };
 }
@@ -1606,8 +1602,8 @@ fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator
     var reader = &hc.reader.?;
     reader.fill(conn.stream) catch |err| {
         switch (err) {
-            error.BrokenPipe, error.Closed, error.ConnectionResetByPeer => log.debug("({f}) connection closed: {}", .{ conn.address, err }),
-            else => log.warn("({f}) error reading from connection: {}", .{ conn.address, err }),
+            error.BrokenPipe, error.Closed, error.ConnectionResetByPeer => log.debug("({}) connection closed: {}", .{ conn.address, err }),
+            else => log.warn("({}) error reading from connection: {}", .{ conn.address, err }),
         }
         return false;
     };
@@ -1622,7 +1618,7 @@ fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator
                 error.CompressionError => conn.writeFramed(CLOSE_PROTOCOL_ERROR) catch {},
                 else => {},
             }
-            log.debug("({f}) invalid websocket packet: {}", .{ conn.address, err });
+            log.debug("({}) invalid websocket packet: {}", .{ conn.address, err });
             return false;
         } orelse {
             // everything is fine, we just need more data
@@ -1632,7 +1628,7 @@ fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator
         const message_type = message.type;
         defer reader.done(message_type);
 
-        log.debug("({f}) received {s} message", .{ hc.conn.address, @tagName(message_type) });
+        log.debug("({}) received {s} message", .{ hc.conn.address, @tagName(message_type) });
         switch (message_type) {
             .text, .binary => {
                 const params = @typeInfo(@TypeOf(H.clientMessage)).@"fn".params;
@@ -2008,7 +2004,7 @@ const TestHandler = struct {
         }
         if (std.mem.eql(u8, data, "writer")) {
             var wb = self.conn.writeBuffer(allocator, .text);
-            try wb.interface.print("{d}!!!", .{9000});
+            try wb.buf.writer().print("{d}!!!", .{9000});
             return wb.send();
         }
         if (std.mem.eql(u8, data, "ping")) {
