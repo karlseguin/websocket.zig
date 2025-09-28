@@ -42,8 +42,7 @@ pub const Writer = struct {
         }
     }
 
-    pub fn drain(io_w: *std.io.Writer, data: []const []const u8, splat: usize) error{WriteFailed}!usize {
-        std.debug.print("drain: {d}\n", .{data[0].len});
+    pub fn drain(io_w: *std.Io.Writer, data: []const []const u8, splat: usize) error{WriteFailed}!usize {
         _ = splat;
         const self: *Writer = @alignCast(@fieldParentPtr("interface", io_w));
         self.writeAll(data[0]) catch return error.WriteFailed;
