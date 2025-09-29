@@ -953,6 +953,7 @@ fn testClient(stream: net.Stream) Client {
     return .{
         ._closed = false,
         ._own_bp = true,
+        ._compression_opts = .{},
         ._mask_fn = generateMask,
         .stream = .{ .stream = stream },
         ._reader = Reader.init(reader_buf, bp, null),
