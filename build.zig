@@ -18,8 +18,10 @@ pub fn build(b: *std.Build) !void {
 
     {
         // run tests
+        const test_filter = b.option([]const []const u8, "test-filter", "Filters for tests: specify multiple times for multiple filters");
         const tests = b.addTest(.{
             .root_module = websocket_module,
+            .filters = test_filter orelse &.{},
             .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
         });
         tests.linkLibC();
