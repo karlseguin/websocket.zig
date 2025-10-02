@@ -1379,7 +1379,7 @@ pub const Conn = struct {
             if (data.len >= c.write_treshold) {
                 compressed = true;
 
-                var compressor = std.compress.flate.Compress.init(&c.writer.writer, &.{}, .{});
+                var compressor = try std.compress.flate.Compress.init(&c.writer.writer, &.{}, .raw, .default);
                 try compressor.writer.writeAll(data);
                 try compressor.writer.flush();
                 const all = c.writer.written();
