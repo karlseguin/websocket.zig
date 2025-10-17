@@ -211,7 +211,7 @@ pub fn Server(comptime H: type) type {
                 defer w.deinit();
 
                 const thrd = try std.Thread.spawn(.{}, Blocking(H).run, .{ &w, socket, ctx });
-                log.info("starting blocking worker to listen on {}", .{address});
+                log.info("starting blocking worker to listen on {f}", .{address});
 
                 // incase listenInNewThread was used and is waiting for us to start
                 self._cond.signal();
