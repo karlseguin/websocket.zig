@@ -169,7 +169,7 @@ clientMessage(h: *Handler, allocator: Allocator, data: []u8, tpe: ws.MessageText
 If `clientMessage` returns an error, the connection is closed. You can also call `conn.close()` within the method.
 
 ### close
-If your handler defines a `close(handler: *Handler)` method, the method is called whenever the connection is being closed. Guaranteed to be called exactly once, so it is safe to deinitialize the `handler` at this point. This is called no mater the reason for the closure (on shutdown, if the client closed the connection, if your code close the connection, ...)
+If your handler defines a `close(handler: *Handler) void` method, the method is called whenever the connection is being closed. Guaranteed to be called exactly once, so it is safe to deinitialize the `handler` at this point. This is called no matter the reason for the closure (on shutdown, if the client closed the connection, if your code close the connection, ...)
 
 The socket may or may not still be alive.
 
