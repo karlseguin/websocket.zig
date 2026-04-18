@@ -1,9 +1,11 @@
 const std = @import("std");
+const posix_shim = @import("../posix_shim.zig");
+const io_shim = @import("../io_shim.zig");
 const builtin = @import("builtin");
 const proto = @import("../proto.zig");
 const buffer = @import("../buffer.zig");
 
-const net = std.net;
+const net = std.Io.net;
 const posix = std.posix;
 const Thread = std.Thread;
 const Allocator = std.mem.Allocator;
@@ -96,8 +98,8 @@ pub fn Server(comptime H: type) type {
 
         _state: WorkerState,
         _signals: []posix.fd_t,
-        _mut: Thread.Mutex,
-        _cond: Thread.Condition,
+        _mut: std.Io.Mutex,
+        _cond: std.Io.Condition,
 
         const Self = @This();
 
@@ -110,10 +112,9 @@ pub fn Server(comptime H: type) type {
                 }
             }
 
-            var c = config;
-            if (c.compression != null) {
-                log.warn("Compression is disabled as part of the 0.15 upgrade. I do hope to re-enable it soon.", .{});
-                c.compression = null;
+            if (config.compression != null) {
+                log.err("Compression is disabled as part of the 0.15 upgrade. I do hope to re-enable it soon.", .{});
+                return error.InvalidConfiguraion;
             }
 
             const signals = try allocator.alloc(posix.fd_t, config.workerCount());
@@ -123,11 +124,11 @@ pub fn Server(comptime H: type) type {
             errdefer state.deinit();
 
             return .{
-                ._mut = .{},
-                ._cond = .{},
+                ._mut = .init,
+                ._cond = .init,
                 ._state = state,
                 ._signals = signals,
-                .config = c,
+                .config = config,
                 .allocator = allocator,
             };
         }
@@ -138,20 +139,20 @@ pub fn Server(comptime H: type) type {
         }
 
         pub fn listenInNewThread(self: *Self, ctx: anytype) !Thread {
-            self._mut.lock();
-            defer self._mut.unlock();
+            self._mut.lockUncancelable(io_shim.stdio());
+            defer self._mut.unlock(io_shim.stdio());
             const thrd = try Thread.spawn(.{}, Self.listen, .{ self, ctx });
 
             // we don't return until listen() signals us that the server is up
-            self._cond.wait(&self._mut);
+            self._cond.wait(io_shim.stdio(), &self._mut) catch {};
             return thrd;
         }
 
         pub fn listen(self: *Self, ctx: anytype) !void {
-            self._mut.lock();
+            self._mut.lockUncancelable(io_shim.stdio());
             errdefer {
-                self._cond.signal();
-                self._mut.unlock();
+                self._cond.signal(io_shim.stdio());
+                self._mut.unlock(io_shim.stdio());
             }
 
             const config = &self.config;
@@ -159,16 +160,17 @@ pub fn Server(comptime H: type) type {
             var no_delay = true;
             const address = blk: {
                 if (config.unix_path) |unix_path| {
-                    if (comptime std.net.has_unix_sockets == false) {
+                    if (comptime std.Io.net.has_unix_sockets == false) {
                         return error.UnixPathNotSupported;
                     }
                     no_delay = false;
-                    std.fs.deleteFileAbsolute(unix_path) catch {};
-                    break :blk try net.Address.initUnix(unix_path);
+                    // 0.16 replaced `std.fs.deleteFileAbsolute` with `std.Io.Dir`-based API.
+                    std.Io.Dir.deleteFileAbsolute(io_shim.stdio(), unix_path) catch {};
+                    break :blk try posix_shim.Address.initUnix(unix_path);
                 } else {
                     const listen_port = config.port;
                     const listen_address = config.address;
-                    break :blk try net.Address.parseIp(listen_address, listen_port);
+                    break :blk try posix_shim.Address.parseIp(listen_address, listen_port);
                 }
             };
 
@@ -177,7 +179,7 @@ pub fn Server(comptime H: type) type {
                 if (blockingMode() == false) sock_flags |= posix.SOCK.NONBLOCK;
 
                 const socket_proto = if (address.any.family == posix.AF.UNIX) @as(u32, 0) else posix.IPPROTO.TCP;
-                break :blk try posix.socket(address.any.family, sock_flags, socket_proto);
+                break :blk try posix_shim.socket(address.any.family, sock_flags, socket_proto);
             };
 
             if (no_delay) {
@@ -199,29 +201,29 @@ pub fn Server(comptime H: type) type {
 
             {
                 const socklen = address.getOsSockLen();
-                try posix.bind(socket, &address.any, socklen);
-                try posix.listen(socket, 1024); // kernel backlog
+                try posix_shim.bind(socket, &address.any, socklen);
+                try posix_shim.listen(socket, 1024); // kernel backlog
             }
 
             const C = @TypeOf(ctx);
 
             if (comptime blockingMode()) {
-                errdefer posix.close(socket);
+                errdefer posix_shim.close(socket);
                 var w = try Blocking(H).init(self.allocator, &self._state);
                 defer w.deinit();
 
                 const thrd = try std.Thread.spawn(.{}, Blocking(H).run, .{ &w, socket, ctx });
-                log.info("starting blocking worker to listen on {f}", .{address});
+                log.info("starting blocking worker to listen on {}", .{address});
 
                 // incase listenInNewThread was used and is waiting for us to start
-                self._cond.signal();
+                self._cond.signal(io_shim.stdio());
 
                 // this is what we'll shutdown when stop() is called
                 self._signals[0] = socket;
-                self._mut.unlock();
+                self._mut.unlock(io_shim.stdio());
                 thrd.join();
             } else {
-                defer posix.close(socket);
+                defer posix_shim.close(socket);
                 const W = NonBlocking(H, C);
 
                 const allocator = self.allocator;
@@ -235,7 +237,7 @@ pub fn Server(comptime H: type) type {
 
                 errdefer for (0..started) |i| {
                     // on success, these will be closed by a call to stop();
-                    posix.close(signals[i]);
+                    posix_shim.close(signals[i]);
                 };
 
                 defer {
@@ -247,8 +249,8 @@ pub fn Server(comptime H: type) type {
                 }
 
                 for (0..worker_count) |i| {
-                    const pipe = try posix.pipe2(.{ .NONBLOCK = true });
-                    errdefer posix.close(pipe[1]);
+                    const pipe = try posix_shim.pipe2(.{ .NONBLOCK = true });
+                    errdefer posix_shim.close(pipe[1]);
 
                     workers[i] = try W.init(self.allocator, &self._state, ctx);
                     errdefer workers[i].deinit();
@@ -262,9 +264,9 @@ pub fn Server(comptime H: type) type {
                 log.info("starting nonblocking worker to listen on {f}", .{address});
 
                 // in case startInNewThread is waiting
-                self._cond.signal();
+                self._cond.signal(io_shim.stdio());
 
-                self._mut.unlock();
+                self._mut.unlock(io_shim.stdio());
 
                 for (threads) |thrd| {
                     thrd.join();
@@ -273,16 +275,16 @@ pub fn Server(comptime H: type) type {
         }
 
         pub fn stop(self: *Self) void {
-            self._mut.lock();
-            defer self._mut.unlock();
+            self._mut.lockUncancelable(io_shim.stdio());
+            defer self._mut.unlock(io_shim.stdio());
             for (self._signals) |s| {
                 if (blockingMode()) {
                     // necessary to unblock accept on linux
                     // (which might not be that necessary since, on Linux,
                     // NonBlocking should be used)
-                    posix.shutdown(s, .recv) catch {};
+                    posix_shim.shutdown(s, .recv) catch {};
                 }
-                posix.close(s);
+                posix_shim.close(s);
             }
         }
     };
@@ -340,9 +342,9 @@ pub fn Blocking(comptime H: type) type {
         pub fn run(self: *Self, listener: posix.socket_t, ctx: anytype) void {
             defer self.shutdown();
             while (true) {
-                var address: net.Address = undefined;
-                var address_len: posix.socklen_t = @sizeOf(net.Address);
-                const socket = posix.accept(listener, &address.any, &address_len, posix.SOCK.CLOEXEC) catch |err| {
+                var address: posix_shim.Address = undefined;
+                var address_len: posix.socklen_t = @sizeOf(posix_shim.Address);
+                const socket = posix_shim.accept(listener, &address.any, &address_len, posix.SOCK.CLOEXEC) catch |err| {
                     if (err == error.ConnectionAborted or err == error.SocketNotListening) {
                         log.info("received shutdown signal", .{});
                         return;
@@ -353,7 +355,7 @@ pub fn Blocking(comptime H: type) type {
                 log.debug("({f}) connected", .{address});
 
                 const thread = std.Thread.spawn(.{}, Self.handleConnection, .{ self, socket, address, ctx }) catch |err| {
-                    posix.close(socket);
+                    posix_shim.close(socket);
                     log.err("({f}) failed to spawn connection thread: {}", .{ address, err });
                     continue;
                 };
@@ -363,13 +365,13 @@ pub fn Blocking(comptime H: type) type {
 
         // Called in a thread started above in listen.
         // Wrapper around _handleConnection so that we can handle erros
-        fn handleConnection(self: *Self, socket: posix.socket_t, address: net.Address, ctx: anytype) void {
+        fn handleConnection(self: *Self, socket: posix.socket_t, address: posix_shim.Address, ctx: anytype) void {
             self._handleConnection(socket, address, ctx) catch |err| {
                 log.err("({f}) uncaught error in connection handler: {}", .{ address, err });
             };
         }
 
-        fn _handleConnection(self: *Self, socket: posix.socket_t, address: net.Address, ctx: anytype) !void {
+        fn _handleConnection(self: *Self, socket: posix.socket_t, address: posix_shim.Address, ctx: anytype) !void {
             const conn_manager = &self.conn_manager;
             const hc = try conn_manager.create(socket, address, timestamp());
 
@@ -438,13 +440,13 @@ pub fn Blocking(comptime H: type) type {
                 if (conn_manager.count() == 0) {
                     return;
                 }
-                std.Thread.sleep(std.time.ns_per_ms * 100);
+                std.Io.sleep(io_shim.stdio(), .{ .nanoseconds = std.time.ns_per_ms * 100 }, .awake) catch {};
             }
         }
 
         // called for each hc when shutting down
         fn shutdownCleanup(_: *Self, hc: *HandlerConn(H)) void {
-            posix.shutdown(hc.socket, .recv) catch {};
+            posix_shim.shutdown(hc.socket, .recv) catch {};
         }
     };
 }
@@ -528,7 +530,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 
                 var it = self.loop.wait(timeout) catch |err| {
                     log.err("failed to wait on events: {}", .{err});
-                    std.Thread.sleep(std.time.ns_per_s);
+                    std.Io.sleep(io_shim.stdio(), .{ .nanoseconds = std.time.ns_per_s }, .awake) catch {};
                     continue;
                 };
 
@@ -538,7 +540,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
                     if (data == 0) {
                         self.accept(listener, now) catch |err| {
                             log.err("accept error: {}", .{err});
-                            std.Thread.sleep(std.time.ns_per_ms);
+                            std.Io.sleep(io_shim.stdio(), .{ .nanoseconds = std.time.ns_per_ms }, .awake) catch {};
                         };
                         continue;
                     }
@@ -571,8 +573,8 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 
             // always ordered from oldest to newest, so once we find a conneciton
             // that isn't timed out, we can stop
-            cm.lock.lock();
-            defer cm.lock.unlock();
+            cm.lock.lockUncancelable(io_shim.stdio());
+            defer cm.lock.unlock(io_shim.stdio());
 
             var next_conn = cm.pending.head;
             while (next_conn) |hc| {
@@ -604,10 +606,10 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
             const conn_manager = &self.base.conn_manager;
 
             while (conn_manager.count() < max_conn) {
-                var address: net.Address = undefined;
-                var address_len: posix.socklen_t = @sizeOf(net.Address);
+                var address: posix_shim.Address = undefined;
+                var address_len: posix.socklen_t = @sizeOf(posix_shim.Address);
 
-                const socket = posix.accept(listener, &address.any, &address_len, posix.SOCK.CLOEXEC) catch |err| {
+                const socket = posix_shim.accept(listener, &address.any, &address_len, posix.SOCK.CLOEXEC) catch |err| {
                     // When available, we use SO_REUSEPORT_LB or SO_REUSEPORT, so WouldBlock
                     // should not be possible in those cases, but if it isn't available
                     // this error should be ignored as it means another thread picked it up.
@@ -617,15 +619,15 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
                 log.debug("({f}) connected", .{address});
 
                 {
-                    errdefer posix.close(socket);
+                    errdefer posix_shim.close(socket);
                     // socket is _probably_ in NONBLOCKING mode (it inherits
                     // the flag from the listening socket).
-                    const flags = try posix.fcntl(socket, posix.F.GETFL, 0);
+                    const flags = try posix_shim.fcntl(socket, posix.F.GETFL, 0);
                     const nonblocking = @as(u32, @bitCast(posix.O{ .NONBLOCK = true }));
                     if (flags & nonblocking == nonblocking) {
                         // Yup, it's in nonblocking mode. Disable that flag to
                         // put it in blocking mode.
-                        _ = try posix.fcntl(socket, posix.F.SETFL, flags & ~nonblocking);
+                        _ = try posix_shim.fcntl(socket, posix.F.SETFL, flags & ~nonblocking);
                     }
                 }
                 const hc = try self.base.newConn(socket, address, now);
@@ -744,7 +746,7 @@ fn NonBlockingBase(comptime H: type, comptime MANAGE_HS: bool) type {
             }
         }
 
-        fn newConn(self: *Self, socket: posix.socket_t, address: net.Address, time: u32) !*HandlerConn(H) {
+        fn newConn(self: *Self, socket: posix.socket_t, address: posix_shim.Address, time: u32) !*HandlerConn(H) {
             return self.conn_manager.create(socket, address, time);
         }
 
@@ -776,11 +778,16 @@ fn NonBlockingBase(comptime H: type, comptime MANAGE_HS: bool) type {
         }
 
         fn cleanupConn(self: *Self, hc: *HandlerConn(H)) void {
-            if (hc.reader) |*reader| {
-                if (self.small_buffer_pool) |*sbp| {
-                    sbp.release(reader.static);
-                } else {
-                    self.allocator.free(reader.static);
+            {
+                hc.cleanup.lockUncancelable(io_shim.stdio());
+                defer hc.cleanup.unlock(io_shim.stdio());
+                if (hc.reader) |*reader| {
+                    if (self.small_buffer_pool) |*sbp| {
+                        sbp.release(reader.static);
+                    } else {
+                        self.allocator.free(reader.static);
+                    }
+                    hc.reader = null;
                 }
             }
             self.conn_manager.cleanup(hc);
@@ -793,10 +800,13 @@ fn NonBlockingBase(comptime H: type, comptime MANAGE_HS: bool) type {
 
         // called for each hc when shutting down
         fn shutdownCleanup(self: *Self, hc: *HandlerConn(H)) void {
+            hc.cleanup.lockUncancelable(io_shim.stdio());
+            defer hc.cleanup.unlock(io_shim.stdio());
             if (hc.reader) |*reader| {
                 if (self.small_buffer_pool == null) {
                     self.allocator.free(reader.static);
                 }
+                hc.reader = null;
             }
         }
     };
@@ -818,7 +828,7 @@ const KQueue = struct {
 
     fn init() !KQueue {
         return .{
-            .q = try posix.kqueue(),
+            .q = try posix_shim.kqueue(),
             .change_count = 0,
             .change_buffer = undefined,
             .event_list = undefined,
@@ -826,7 +836,7 @@ const KQueue = struct {
     }
 
     fn deinit(self: KQueue) void {
-        posix.close(self.q);
+        posix_shim.close(self.q);
     }
 
     fn monitorAccept(self: *KQueue, fd: c_int) !void {
@@ -856,7 +866,7 @@ const KQueue = struct {
             .data = 0,
             .udata = @intFromPtr(hc),
         };
-        _ = try posix.kevent(self.q, &.{event}, &[_]Kevent{}, null);
+        _ = try posix_shim.kevent(self.q, &.{event}, &[_]Kevent{}, null);
     }
 
     fn change(self: *KQueue, fd: posix.fd_t, data: usize, filter: i16, flags: u16) !void {
@@ -865,7 +875,7 @@ const KQueue = struct {
 
         if (change_count == change_buffer.len) {
             // calling this with an empty event_list will return immediate
-            _ = try posix.kevent(self.q, change_buffer, &[_]Kevent{}, null);
+            _ = try posix_shim.kevent(self.q, change_buffer, &[_]Kevent{}, null);
             change_count = 0;
         }
         change_buffer[change_count] = .{
@@ -882,7 +892,7 @@ const KQueue = struct {
     fn wait(self: *KQueue, timeout_sec: ?i32) !Iterator {
         const event_list = &self.event_list;
         const timeout: ?posix.timespec = if (timeout_sec) |ts| posix.timespec{ .sec = ts, .nsec = 0 } else null;
-        const event_count = try posix.kevent(self.q, self.change_buffer[0..self.change_count], event_list, if (timeout) |ts| &ts else null);
+        const event_count = try posix_shim.kevent(self.q, self.change_buffer[0..self.change_count], event_list, if (timeout) |ts| &ts else null);
         self.change_count = 0;
 
         return .{
@@ -917,28 +927,28 @@ const EPoll = struct {
     fn init() !EPoll {
         return .{
             .event_list = undefined,
-            .q = try posix.epoll_create1(0),
+            .q = try posix_shim.epoll_create1(0),
         };
     }
 
     fn deinit(self: EPoll) void {
-        posix.close(self.q);
+        posix_shim.close(self.q);
     }
 
     fn monitorAccept(self: *EPoll, fd: c_int) !void {
         var event = linux.epoll_event{ .events = linux.EPOLL.IN, .data = .{ .ptr = 0 } };
-        return std.posix.epoll_ctl(self.q, linux.EPOLL.CTL_ADD, fd, &event);
+        return posix_shim.epoll_ctl(self.q, linux.EPOLL.CTL_ADD, fd, &event);
     }
 
     fn monitorSignal(self: *EPoll, fd: c_int) !void {
         var event = linux.epoll_event{ .events = linux.EPOLL.IN, .data = .{ .ptr = 1 } };
-        return std.posix.epoll_ctl(self.q, linux.EPOLL.CTL_ADD, fd, &event);
+        return posix_shim.epoll_ctl(self.q, linux.EPOLL.CTL_ADD, fd, &event);
     }
 
     fn monitorRead(self: *EPoll, hc: anytype, comptime rearm: bool) !void {
         const op = if (rearm) linux.EPOLL.CTL_MOD else linux.EPOLL.CTL_ADD;
         var event = linux.epoll_event{ .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT, .data = .{ .ptr = @intFromPtr(hc) } };
-        return posix.epoll_ctl(self.q, op, hc.socket, &event);
+        return posix_shim.epoll_ctl(self.q, op, hc.socket, &event);
     }
 
     fn wait(self: *EPoll, timeout_sec: ?i32) !Iterator {
@@ -953,7 +963,7 @@ const EPoll = struct {
             }
         }
 
-        const event_count = posix.epoll_wait(self.q, event_list, timeout);
+        const event_count = posix_shim.epoll_wait(self.q, event_list, timeout);
         return .{
             .index = 0,
             .events = event_list[0..event_count],
@@ -1000,7 +1010,7 @@ pub fn Worker(comptime H: type) type {
             self.worker.deinit();
         }
 
-        pub fn createConn(self: *Self, socket: posix.socket_t, address: net.Address, now: u32) !*HandlerConn(H) {
+        pub fn createConn(self: *Self, socket: posix.socket_t, address: posix_shim.Address, now: u32) !*HandlerConn(H) {
             return self.worker.conn_manager.create(socket, address, now);
         }
 
@@ -1087,6 +1097,7 @@ pub fn HandlerConn(comptime H: type) type {
         reader: ?Reader,
         socket: posix.socket_t, // denormalization from conn.stream.handle
         handshake: ?*Handshake.State,
+        cleanup: std.Io.Mutex = .init,
         compression: ?Compression = null,
         next: ?*HandlerConn(H) = null,
         prev: ?*HandlerConn(H) = null,
@@ -1100,25 +1111,25 @@ pub fn HandlerConn(comptime H: type) type {
 
 pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
     return struct {
-        lock: Thread.Mutex,
+        lock: std.Io.Mutex,
         allocator: Allocator,
         active: List(HandlerConn(H)),
         pending: List(HandlerConn(H)),
-        pool: std.heap.MemoryPool(HandlerConn(H)),
+        pool: std.heap.memory_pool.ExtraManaged(HandlerConn(H), .{ .alignment = null }),
         compression: ?Compression,
-        compression_pool: std.heap.MemoryPool(Conn.Compression),
+        compression_pool: std.heap.memory_pool.ExtraManaged(Conn.Compression, .{ .alignment = null }),
 
         const Self = @This();
 
         pub fn init(allocator: Allocator, compression: ?Compression) !Self {
-            var pool = std.heap.MemoryPool(HandlerConn(H)).init(allocator);
+            var pool = std.heap.memory_pool.ExtraManaged(HandlerConn(H), .{ .alignment = null }).init(allocator);
             errdefer pool.deinit();
 
-            var compression_pool = std.heap.MemoryPool(Conn.Compression).init(allocator);
+            var compression_pool = std.heap.memory_pool.ExtraManaged(Conn.Compression, .{ .alignment = null }).init(allocator);
             errdefer compression_pool.deinit();
 
             return .{
-                .lock = .{},
+                .lock = .init,
                 .pool = pool,
                 .active = .{},
                 .pending = .{},
@@ -1134,19 +1145,19 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
         }
 
         pub fn count(self: *Self) usize {
-            self.lock.lock();
-            defer self.lock.unlock();
+            self.lock.lockUncancelable(io_shim.stdio());
+            defer self.lock.unlock(io_shim.stdio());
             if (MANAGE_HS == false) {
                 return self.active.len;
             }
             return self.active.len + self.pending.len;
         }
 
-        pub fn create(self: *Self, socket: posix.socket_t, address: net.Address, now: u32) !*HandlerConn(H) {
-            errdefer posix.close(socket);
+        pub fn create(self: *Self, socket: posix.socket_t, address: posix_shim.Address, now: u32) !*HandlerConn(H) {
+            errdefer posix_shim.close(socket);
 
-            self.lock.lock();
-            defer self.lock.unlock();
+            self.lock.lockUncancelable(io_shim.stdio());
+            defer self.lock.unlock(io_shim.stdio());
 
             const hc = try self.pool.create();
             hc.* = .{
@@ -1180,8 +1191,8 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
 
             // our caller made sute this was the case
             std.debug.assert(hc.state == .handshake);
-            self.lock.lock();
-            defer self.lock.unlock();
+            self.lock.lockUncancelable(io_shim.stdio());
+            defer self.lock.unlock(io_shim.stdio());
             self.pending.remove(hc);
             self.active.insert(hc);
             hc.state = .active;
@@ -1195,8 +1206,8 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
             std.debug.assert(hc.state == .active);
             hc.state = .handshake;
 
-            self.lock.lock();
-            defer self.lock.unlock();
+            self.lock.lockUncancelable(io_shim.stdio());
+            defer self.lock.unlock(io_shim.stdio());
             self.active.remove(hc);
             self.pending.insert(hc);
         }
@@ -1221,7 +1232,7 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
                 c.writer.deinit();
             }
 
-            self.lock.lock();
+            self.lock.lockUncancelable(io_shim.stdio());
             if (hc.state == .active) {
                 self.active.remove(hc);
             } else {
@@ -1233,7 +1244,7 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
             }
 
             self.pool.destroy(hc);
-            self.lock.unlock();
+            self.lock.unlock(io_shim.stdio());
         }
 
         fn setupCompression(self: *Self, hc: *HandlerConn(H)) !void {
@@ -1263,8 +1274,8 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
         }
 
         pub fn shutdown(self: *Self, worker: anytype) void {
-            self.lock.lock();
-            defer self.lock.unlock();
+            self.lock.lockUncancelable(io_shim.stdio());
+            defer self.lock.unlock(io_shim.stdio());
 
             shutdownList(self.active.head, worker);
             shutdownList(self.pending.head, worker);
@@ -1273,7 +1284,7 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
         // This is sloppy and leaves things in an unrecoverable state. To keep
         // things clean, we should call self.cleanup(hc) on each entry in the list
         // but that does a bunch of things we don't need if we know that we're
-        // shutting down - like returning data to the pools, nd popping items
+        // shutting down - like returning data to the pools, and popping items
         // out of the list.
         fn shutdownList(head: ?*HandlerConn(H), worker: anytype) void {
             var next_node = head;
@@ -1298,9 +1309,9 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
 pub const Conn = struct {
     _closed: bool,
     started: u32,
-    stream: net.Stream,
-    address: net.Address,
-    lock: Thread.Mutex = .{},
+    stream: posix_shim.Stream,
+    address: posix_shim.Address,
+    lock: std.Io.Mutex = .init,
     compression: ?*Conn.Compression = null,
 
     const Compression = struct {
@@ -1373,29 +1384,30 @@ pub const Conn = struct {
     }
 
     pub fn writeFrame(self: *Conn, op_code: OpCode, data: []const u8) !void {
-        var payload = data;
-        var compressed = false;
-        if (self.compression) |c| {
-            if (data.len >= c.write_treshold) {
-                compressed = true;
+        const payload = data;
 
-                var compressor = try std.compress.flate.Compress.init(&c.writer.writer, &.{}, .raw, .default);
-                try compressor.writer.writeAll(data);
-                try compressor.writer.flush();
-                const all = c.writer.written();
-                payload = all[0 .. all.len - 4];
-            }
-        }
+        // Zig 0.15 compression disabled
+        const compressed = false;
+        // if (self.compression) |c| {
+        //     if (data.len >= c.write_treshold) {
+        //         compressed = true;
+        //         var compressor = std.compress.flate.Compress.init(&c.writer.writer, &.{}, .{});
+        //         try compressor.writer.writeAll(data);
+        //         try compressor.writer.flush();
+        //         const all = c.writer.written();
+        //         payload = all[0 .. all.len - 4];
+        //     }
+        // }
 
-        defer if (compressed) {
-            const c = self.compression.?;
-            if (c.retain_writer) {
-                c.writer.clearRetainingCapacity();
-            } else {
-                c.writer.deinit();
-                c.writer = std.Io.Writer.Allocating.init(c.allocator);
-            }
-        };
+        // defer if (compressed) {
+        //     const c = self.compression.?;
+        //     if (c.retain_writer) {
+        //         c.writer.clearRetainingCapacity();
+        //     } else {
+        //         c.writer.deinit();
+        //         c.writer = std.Io.Writer.Allocating.init(c.allocator);
+        //     }
+        // };
 
         // maximum possible prefix length. op_code + length_type + 8byte length
         var buf: [10]u8 = undefined;
@@ -1405,8 +1417,8 @@ pub const Conn = struct {
 
         if (payload.len == 0) {
             // no body, just write the header
-            self.lock.lock();
-            defer self.lock.unlock();
+            self.lock.lockUncancelable(io_shim.stdio());
+            defer self.lock.unlock(io_shim.stdio());
             return stream.writeAll(header);
         }
 
@@ -1419,20 +1431,20 @@ pub const Conn = struct {
     }
 
     pub fn writeFramed(self: *Conn, data: []const u8) !void {
-        self.lock.lock();
-        defer self.lock.unlock();
+        self.lock.lockUncancelable(io_shim.stdio());
+        defer self.lock.unlock(io_shim.stdio());
         try self.stream.writeAll(data);
     }
 
     fn writeAllIOVec(self: *Conn, vec: []std.posix.iovec_const) !void {
         const socket = self.stream.handle;
 
-        self.lock.lock();
-        defer self.lock.unlock();
+        self.lock.lockUncancelable(io_shim.stdio());
+        defer self.lock.unlock(io_shim.stdio());
 
         var i: usize = 0;
         while (true) {
-            var n = try std.posix.writev(socket, vec[i..]);
+            var n = try posix_shim.writev(socket, vec[i..]);
             while (n >= vec[i].len) {
                 n -= vec[i].len;
                 i += 1;
@@ -1458,7 +1470,7 @@ pub const Conn = struct {
 
     fn closeSocket(self: *Conn) void {
         if (@atomicRmw(bool, &self._closed, .Xchg, true, .monotonic) == false) {
-            posix.close(self.stream.handle);
+            posix_shim.close(self.stream.handle);
         }
     }
 
@@ -1466,7 +1478,7 @@ pub const Conn = struct {
         conn: *Conn,
         op_code: OpCode,
         allocator: Allocator,
-        buf: std.ArrayListUnmanaged(u8),
+        buf: std.ArrayList(u8),
         interface: std.Io.Writer,
 
         pub const Error = Allocator.Error;
@@ -1513,7 +1525,7 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
         return .{ false, false };
     }
 
-    const n = posix.read(hc.socket, buf[len..]) catch |err| {
+    const n = posix_shim.read(hc.socket, buf[len..]) catch |err| {
         switch (err) {
             error.BrokenPipe, error.ConnectionResetByPeer => log.debug("({f}) handshake connection closed: {}", .{ conn.address, err }),
             error.WouldBlock => {
@@ -1568,7 +1580,7 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
         const res = if (params.len == 1) hc.handler.?.afterInit() else hc.handler.?.afterInit(ctx);
         res catch |err| {
             log.debug("({f}) " ++ @typeName(H) ++ ".afterInit error: {}", .{ conn.address, err });
-            return .{ null, false };
+            return .{ false, false };
         };
     }
 
@@ -1753,8 +1765,8 @@ fn preHandOffWrite(conn: *Conn, response: []const u8) void {
     // to *Conn yet. In theory, this means we don't need to worry about thread-safety
     // However, it is possible for the worker to be stopped while we're doing this
     // which causes issues unless we lock
-    conn.lock.lock();
-    defer conn.lock.unlock();
+    conn.lock.lockUncancelable(io_shim.stdio());
+    defer conn.lock.unlock(io_shim.stdio());
 
     if (conn.isClosed()) {
         return;
@@ -1766,7 +1778,7 @@ fn preHandOffWrite(conn: *Conn, response: []const u8) void {
 
     var pos: usize = 0;
     while (pos < response.len) {
-        const n = posix.write(socket, response[pos..]) catch return;
+        const n = posix_shim.write(socket, response[pos..]) catch return;
         if (n == 0) {
             // closed
             return;
@@ -1779,7 +1791,7 @@ fn timestamp() u32 {
     if (comptime @hasDecl(posix, "CLOCK") == false or posix.CLOCK == void) {
         return @intCast(std.time.timestamp());
     }
-    const ts = posix.clock_gettime(posix.CLOCK.REALTIME) catch unreachable;
+    const ts = posix_shim.clock_gettime(posix.CLOCK.REALTIME) catch unreachable;
     return @intCast(ts.sec);
 }
 
@@ -1828,7 +1840,7 @@ const t = @import("../t.zig");
 
 var test_thread: Thread = undefined;
 var test_server: Server(TestHandler) = undefined;
-var global_test_allocator = std.heap.GeneralPurposeAllocator(.{}){};
+var global_test_allocator: std.heap.DebugAllocator(.{}) = .init;
 
 test "tests:beforeAll" {
     test_server = try Server(TestHandler).init(global_test_allocator.allocator(), .{
@@ -1842,7 +1854,7 @@ test "tests:afterAll" {
     test_server.stop();
     test_thread.join();
     test_server.deinit();
-    try t.expectEqual(false, global_test_allocator.detectLeaks());
+    try t.expectEqual(@as(usize, 0), global_test_allocator.detectLeaks());
 }
 
 test "Server: invalid handshake" {
@@ -1938,10 +1950,10 @@ test "Conn: close" {
     }
 }
 
-fn testStream(handshake: bool) !net.Stream {
+fn testStream(handshake: bool) !posix_shim.Stream {
     const timeout = std.mem.toBytes(std.posix.timeval{ .sec = 0, .usec = 20_000 });
-    const address = try std.net.Address.parseIp("127.0.0.1", 9292);
-    const stream = try std.net.tcpConnectToAddress(address);
+    const address = try posix_shim.Address.parseIp("127.0.0.1", 9292);
+    const stream = try posix_shim.tcpConnectToAddress(address);
     try std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &timeout);
     try std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, &timeout);
 

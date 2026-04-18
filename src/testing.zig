@@ -1,4 +1,5 @@
 const std = @import("std");
+const posix_shim = @import("posix_shim.zig");
 const t = @import("t.zig");
 const ws = @import("websocket.zig");
 
@@ -124,7 +125,7 @@ pub const Testing = struct {
     }
 };
 
-// std.posix.close panics on EBADF
+// posix_shim.close panics on EBADF
 // This is a general issue in Zig:
 // https://github.com/ziglang/zig/issues/6389
 //

@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_shim = @import("io_shim.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -43,6 +44,7 @@ pub const Writer = struct {
     }
 
     pub fn drain(io_w: *std.Io.Writer, data: []const []const u8, splat: usize) error{WriteFailed}!usize {
+        std.debug.print("drain: {d}\n", .{data[0].len});
         _ = splat;
         const self: *Writer = @alignCast(@fieldParentPtr("interface", io_w));
         self.writeAll(data[0]) catch return error.WriteFailed;
@@ -214,7 +216,7 @@ pub const Pool = struct {
     available: usize,
     buffers: [][]u8,
     allocator: Allocator,
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex,
 
     pub fn init(allocator: Allocator, count: usize, buffer_size: usize) !Pool {
         const buffers = try allocator.alloc([]u8, count);
@@ -224,7 +226,7 @@ pub const Pool = struct {
         }
 
         return .{
-            .mutex = .{},
+            .mutex = .init,
             .buffers = buffers,
             .available = count,
             .allocator = allocator,
@@ -243,8 +245,8 @@ pub const Pool = struct {
     pub fn acquire(self: *Pool) ?[]u8 {
         const buffers = self.buffers;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io_shim.stdio());
+        defer self.mutex.unlock(io_shim.stdio());
         const available = self.available;
         if (available == 0) {
             return null;
@@ -262,16 +264,16 @@ pub const Pool = struct {
     pub fn release(self: *Pool, buffer: []u8) void {
         var buffers = self.buffers;
 
-        self.mutex.lock();
+        self.mutex.lockUncancelable(io_shim.stdio());
         const available = self.available;
         if (available == buffers.len) {
-            self.mutex.unlock();
+            self.mutex.unlock(io_shim.stdio());
             self.allocator.free(buffer);
             return;
         }
         buffers[available] = buffer;
         self.available = available + 1;
-        self.mutex.unlock();
+        self.mutex.unlock(io_shim.stdio());
     }
 };
 

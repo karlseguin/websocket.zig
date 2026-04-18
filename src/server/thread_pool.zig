@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_shim = @import("../io_shim.zig");
 
 const Thread = std.Thread;
 const Allocator = std.mem.Allocator;
@@ -27,17 +28,10 @@ pub fn ThreadPool(comptime F: anytype) type {
     // []u8. But this ThreadPool is private and being used for 2 specific cases
     // that we control.
 
-    var fields: [ARG_COUNT]std.builtin.Type.StructField = undefined;
-    inline for (full_fields[0..ARG_COUNT], 0..) |field, index| fields[index] = field;
+    var types: [ARG_COUNT]type = undefined;
+    inline for (full_fields[0..ARG_COUNT], 0..) |field, index| types[index] = field.type;
 
-    const Args = comptime @Type(.{
-        .@"struct" = .{
-            .layout = .auto,
-            .is_tuple = true,
-            .fields = &fields,
-            .decls = &.{},
-        },
-    });
+    const Args = comptime @Tuple(&types);
 
     return struct {
         stopped: bool,
@@ -46,9 +40,9 @@ pub fn ThreadPool(comptime F: anytype) type {
         pending: usize,
         queue: []Args,
         threads: []Thread,
-        mutex: Thread.Mutex,
-        pull_cond: Thread.Condition,
-        push_cond: Thread.Condition,
+        mutex: std.Io.Mutex,
+        pull_cond: std.Io.Condition,
+        push_cond: std.Io.Condition,
         queue_end: usize,
         allocator: Allocator,
 
@@ -68,11 +62,11 @@ pub fn ThreadPool(comptime F: anytype) type {
                 .pull = 0,
                 .push = 0,
                 .pending = 0,
-                .mutex = .{},
+                .mutex = .init,
                 .stopped = false,
                 .queue = queue,
-                .pull_cond = .{},
-                .push_cond = .{},
+                .pull_cond = .init,
+                .push_cond = .init,
                 .threads = threads,
                 .allocator = allocator,
                 .queue_end = queue.len - 1,
@@ -81,7 +75,7 @@ pub fn ThreadPool(comptime F: anytype) type {
             var started: usize = 0;
             errdefer {
                 thread_pool.stopped = true;
-                thread_pool.pull_cond.broadcast();
+                thread_pool.pull_cond.broadcast(io_shim.stdio());
                 for (0..started) |i| {
                     threads[i].join();
                 }
@@ -110,23 +104,23 @@ pub fn ThreadPool(comptime F: anytype) type {
 
         pub fn stop(self: *Self) void {
             {
-                self.mutex.lock();
-                defer self.mutex.unlock();
+                self.mutex.lockUncancelable(io_shim.stdio());
+                defer self.mutex.unlock(io_shim.stdio());
                 if (self.stopped == true) {
                     return;
                 }
                 self.stopped = true;
             }
 
-            self.pull_cond.broadcast();
+            self.pull_cond.broadcast(io_shim.stdio());
             for (self.threads) |thrd| {
                 thrd.join();
             }
         }
 
         pub fn empty(self: *Self) bool {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(io_shim.stdio());
+            defer self.mutex.unlock(io_shim.stdio());
             return self.pull == self.push;
         }
 
@@ -134,18 +128,18 @@ pub fn ThreadPool(comptime F: anytype) type {
             const queue = self.queue;
             const len = queue.len;
 
-            self.mutex.lock();
+            self.mutex.lockUncancelable(io_shim.stdio());
             while (self.pending == len) {
-                self.push_cond.wait(&self.mutex);
+                self.push_cond.wait(io_shim.stdio(), &self.mutex) catch {};
             }
 
             const push = self.push;
             self.queue[push] = args;
             self.push = if (push == self.queue_end) 0 else push + 1;
             self.pending += 1;
-            self.mutex.unlock();
+            self.mutex.unlock(io_shim.stdio());
 
-            self.pull_cond.signal();
+            self.pull_cond.signal(io_shim.stdio());
         }
 
         fn worker(self: *Self, buffer: []u8) void {
@@ -159,20 +153,20 @@ pub fn ThreadPool(comptime F: anytype) type {
             defer self.allocator.free(buffer);
 
             while (true) {
-                self.mutex.lock();
+                self.mutex.lockUncancelable(io_shim.stdio());
                 while (self.pending == 0) {
                     if (self.stopped) {
-                        self.mutex.unlock();
+                        self.mutex.unlock(io_shim.stdio());
                         return;
                     }
-                    self.pull_cond.wait(&self.mutex);
+                    self.pull_cond.wait(io_shim.stdio(), &self.mutex) catch {};
                 }
                 const pull = self.pull;
                 const args = self.queue[pull];
                 self.pull = if (pull == self.queue_end) 0 else pull + 1;
                 self.pending -= 1;
-                self.mutex.unlock();
-                self.push_cond.signal();
+                self.mutex.unlock(io_shim.stdio());
+                self.push_cond.signal(io_shim.stdio());
 
                 // convert Args to FullArgs, i.e. inject buffer as the last argument
                 var full_args: FullArgs = undefined;
@@ -195,7 +189,7 @@ test "ThreadPool: small fuzz" {
         tp.spawn(.{1});
     }
     while (tp.empty() == false) {
-        std.Thread.sleep(std.time.ns_per_ms);
+        std.Io.sleep(io_shim.stdio(), .{ .nanoseconds = std.time.ns_per_ms }, .awake) catch {};
     }
     tp.deinit();
     try t.expectEqual(50_000, testSum);
@@ -209,7 +203,7 @@ test "ThreadPool: large fuzz" {
         tp.spawn(.{1});
     }
     while (tp.empty() == false) {
-        std.Thread.sleep(std.time.ns_per_ms);
+        std.Io.sleep(io_shim.stdio(), .{ .nanoseconds = std.time.ns_per_ms }, .awake) catch {};
     }
     tp.deinit();
     try t.expectEqual(50_000, testSum);
@@ -220,5 +214,5 @@ fn testIncr(c: u64, buf: []u8) void {
     std.debug.assert(buf.len == 512);
     _ = @atomicRmw(u64, &testSum, .Add, c, .monotonic);
     // let the threadpool queue get backed up
-    std.Thread.sleep(std.time.ns_per_us * 100);
+    std.Io.sleep(io_shim.stdio(), .{ .nanoseconds = std.time.ns_per_us * 100 }, .awake) catch {};
 }

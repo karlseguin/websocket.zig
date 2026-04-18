@@ -730,7 +730,6 @@ test "Reader: fuzz" {
                     try t.expectEqual(@as(u32, @intCast(i)), MESSAGE_TO_SEND);
                     break;
                 },
-                else => return err,
             };
 
             while (true) {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_shim = @import("../io_shim.zig");
 
 const posix = std.posix;
 const ascii = std.ascii;
@@ -356,7 +357,7 @@ pub const Handshake = struct {
 };
 
 pub const Pool = struct {
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex,
     available: usize,
     allocator: Allocator,
     buffer_size: usize,
@@ -372,7 +373,7 @@ pub const Pool = struct {
         errdefer allocator.destroy(pool);
 
         pool.* = .{
-            .mutex = .{},
+            .mutex = .init,
             .states = states,
             .allocator = allocator,
             .available = count,
@@ -405,11 +406,11 @@ pub const Pool = struct {
     pub fn acquire(self: *Pool) !*Handshake.State {
         const states = self.states;
 
-        self.mutex.lock();
+        self.mutex.lockUncancelable(io_shim.stdio());
         const available = self.available;
         if (available == 0) {
             // dont hold the lock over factory
-            self.mutex.unlock();
+            self.mutex.unlock(io_shim.stdio());
 
             const allocator = self.allocator;
             const state = try allocator.create(Handshake.State);
@@ -420,24 +421,24 @@ pub const Pool = struct {
         const index = available - 1;
         const state = states[index];
         self.available = index;
-        self.mutex.unlock();
+        self.mutex.unlock(io_shim.stdio());
         return state;
     }
 
     fn release(self: *Pool, state: *Handshake.State) void {
         var states = self.states;
 
-        self.mutex.lock();
+        self.mutex.lockUncancelable(io_shim.stdio());
         const available = self.available;
         if (available == states.len) {
-            self.mutex.unlock();
+            self.mutex.unlock(io_shim.stdio());
             state.deinit();
             self.allocator.destroy(state);
             return;
         }
         states[available] = state;
         self.available = available + 1;
-        self.mutex.unlock();
+        self.mutex.unlock(io_shim.stdio());
     }
 };
 
@@ -554,6 +555,18 @@ test "handshake: reply" {
             "Set-Cookie: Yummy!\r\n\r\n";
         try t.expectString(expected, try Handshake.createReply("this is my key", &res_headers, false, &buf));
     }
+
+    {
+        // compression
+        const expected =
+            "HTTP/1.1 101 Switching Protocols\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: upgrade\r\n" ++
+            "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n" ++
+            "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n" ++
+            "Set-Cookie: Yummy!\r\n\r\n";
+        try t.expectString(expected, try Handshake.createReply("this is my key", &res_headers, true, &buf));
+    }
 }
 
 test "KeyValue: get" {
@@ -648,7 +661,7 @@ fn testPool(p: *Pool) void {
         var hs = p.acquire() catch unreachable;
         std.debug.assert(hs.buf[0] == 0);
         hs.buf[0] = 255;
-        std.Thread.sleep(random.uintAtMost(u32, 100000));
+        std.Io.sleep(io_shim.stdio(), .{ .nanoseconds = random.uintAtMost(u32, 100000) }, .awake) catch {};
         hs.buf[0] = 0;
         p.release(hs);
     }
