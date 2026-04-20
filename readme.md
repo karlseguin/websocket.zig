@@ -1,6 +1,11 @@
 # A zig websocket server.
 The master branch targets the latest stable of Zig (0.15.1). The dev branch targets the latest version of Zig. If you're looking for an older version, look for an zig-X.YZ branches.
 
+## Zig Version
+This is for Zig 0.16.0. Use the [zig-0.15.2](https://github.com/karlseguin/websocket.zig/tree/zig-0.15) branch for Zig 0.15 or the [dev](https://github.com/karlseguin/websocket.zig/tree/dev) which may or may not be up to date with zig dev.
+
+This ZIG 0.16 version is not well tested. Like Zig 0.16 itself, consider this experimental!
+
 Skip to the [client section](#client).
 
 If you're upgrading from a previous version, check out the [Server Migration](https://github.com/karlseguin/websocket.zig/wiki/Server-Migration) and [Client Migration](https://github.com/karlseguin/websocket.zig/wiki/Client-Migration) wikis.
@@ -10,11 +15,10 @@ If you're upgrading from a previous version, check out the [Server Migration](ht
 const std = @import("std");
 const ws = @import("websocket");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
-    var server = try ws.Server(Handler).init(allocator, .{
+    var server = try ws.Server(Handler).init(init.io, allocator, .{
         .port = 9224,
         .address = "127.0.0.1",
         .handshake = .{
@@ -112,7 +116,6 @@ pub fn init(h: *websocket.Handshake, conn: websocket.Conn, app: *App) !Handler {
         .conn = conn,
     };
 }
-
 ```
 
 You can iterate through all the headers:
@@ -422,12 +425,11 @@ Note that this testing is heavy-handed. It opens up a pair of sockets with one s
 The `*websocket.Client` can be used in one of two ways. At its simplest, after creating a client and initiating a handshake, you simply use <code>write</code> to send messages and <code>read</code> to receive them. First, we create the client and initiate the handshake:
 
 ```zig
-pub fn main() !void {
-  var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-  const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+  const allocator = init.gpa;
 
   // create the client
-  var client = try websocket.Client.init(allocator, .{
+  var client = try websocket.Client.init(init.io, allocator, .{
     .port = 9224,
     .host = "localhost",
   });

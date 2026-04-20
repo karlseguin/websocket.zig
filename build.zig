@@ -7,6 +7,7 @@ pub fn build(b: *std.Build) !void {
     const websocket_module = b.addModule("websocket", .{
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
         .root_source_file = b.path("src/websocket.zig"),
     });
 
@@ -22,7 +23,6 @@ pub fn build(b: *std.Build) !void {
             .root_module = websocket_module,
             .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
         });
-        tests.linkLibC();
         const force_blocking = b.option(bool, "force_blocking", "Force blocking mode") orelse false;
         const options = b.addOptions();
         options.addOption(bool, "websocket_blocking", force_blocking);

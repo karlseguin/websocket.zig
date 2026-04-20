@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const posix = @import("posix.zig");
 const buffer = @import("buffer.zig");
 const Compression = @import("websocket.zig").Compression;
 
@@ -124,10 +125,43 @@ pub const Reader = struct {
         }
     }
 
-    pub fn fill(self: *Reader, stream: anytype) !void {
+    const FillError = error{
+        Closed,
+        BrokenPipe,
+        WriteFailed,
+        Canceled,
+        InputOutput,
+        SystemResources,
+        IsDir,
+        ConnectionResetByPeer,
+        NotOpenForReading,
+        WouldBlock,
+        Unexpected,
+        EndOfStream,
+        ReadFailed,
+        ProcessNotFound,
+        ConnectionTimedOut,
+        SocketNotConnected,
+    };
+    pub fn fill(self: *Reader, source: anytype) FillError!void {
         const pos = self.pos;
         std.debug.assert(self.buf.data.len > pos);
-        const n = try stream.read(self.buf.data[pos..]);
+        const buf = self.buf.data[pos..];
+
+        // Zig 0.16's Io.net.Stream doesn't expose WouldBlock. It just panics. I don't
+        // understand why it's like that. But we're in a transition, and I just want to
+        // make this work. So, in "real" code, `source` will be a socket_t. In tests,
+        // `source` will be an Io.Reader.
+        // In theory, I woulc wrap the `socket_t` in a `Io.Reader` that behaves like I
+        // want it to, but this is _a lot_ easier, especially since all of this will
+        // be re-worked when networking is fully working in Zig.
+
+        const n = blk: {
+            if (@TypeOf(source) == posix.socket_t) {
+                break :blk try posix.read(source, buf);
+            }
+            break :blk try source.read(buf);
+        };
         if (n == 0) {
             return error.Closed;
         }
@@ -750,7 +784,7 @@ test "Reader: fuzz" {
 
 test "Fragmented" {
     {
-        var bp = try buffer.Provider.init(t.allocator, .{ .count = 0, .size = 0, .max = 500 });
+        var bp = try buffer.Provider.init(t.io, t.allocator, .{ .count = 0, .size = 0, .max = 500 });
         var f = try Fragmented.init(&bp, false, .text, "hello");
         defer f.deinit();
 
@@ -764,7 +798,7 @@ test "Fragmented" {
     }
 
     {
-        var bp = try buffer.Provider.init(t.allocator, .{ .count = 0, .size = 0, .max = 10 });
+        var bp = try buffer.Provider.init(t.io, t.allocator, .{ .count = 0, .size = 0, .max = 10 });
         var f = try Fragmented.init(&bp, false, .text, "hello");
         defer f.deinit();
         try f.add(" ");
@@ -772,7 +806,7 @@ test "Fragmented" {
     }
 
     {
-        var bp = try buffer.Provider.init(t.allocator, .{ .count = 0, .size = 0, .max = 5000 });
+        var bp = try buffer.Provider.init(t.io, t.allocator, .{ .count = 0, .size = 0, .max = 5000 });
 
         var r = std.Random.DefaultPrng.init(0);
         var random = r.random();
@@ -812,7 +846,7 @@ fn testReader(opts: anytype) Reader {
     const aa = t.arena.allocator();
 
     const bp = aa.create(buffer.Provider) catch unreachable;
-    bp.* = buffer.Provider.init(t.allocator, .{
+    bp.* = buffer.Provider.init(t.io, t.allocator, .{
         .max = if (@hasField(T, "max")) opts.max else 20,
         .size = if (@hasField(T, "size")) opts.size else 0,
         .count = if (@hasField(T, "count")) opts.count else 0,
@@ -826,7 +860,7 @@ fn testReader(opts: anytype) Reader {
 fn testRead(reader: *Reader, pair: t.SocketPair) !Message {
     var i: usize = 0;
     while (i < 100) : (i += 1) {
-        try reader.fill(pair.server);
+        try reader.fill(pair.server.socket.handle);
         if (try reader.read()) |result| {
             return result.@"1";
         }

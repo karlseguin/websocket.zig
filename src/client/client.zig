@@ -1,18 +1,19 @@
 const std = @import("std");
+
+const posix = @import("../posix.zig");
 const proto = @import("../proto.zig");
 const buffer = @import("../buffer.zig");
+const CompressionOpts = @import("../websocket.zig").Compression;
+const ServerHandshake = @import("../server/handshake.zig").Handshake;
 
+const Io = std.Io;
 const ascii = std.ascii;
-const net = std.net;
-const posix = std.posix;
 const tls = std.crypto.tls;
 const log = std.log.scoped(.websocket);
 
 const Reader = proto.Reader;
 const Allocator = std.mem.Allocator;
 const Bundle = std.crypto.Certificate.Bundle;
-const CompressionOpts = @import("../websocket.zig").Compression;
-const ServerHandshake = @import("../server/handshake.zig").Handshake;
 
 fn ReadLoopHandler(comptime T: type) type {
     const info = @typeInfo(T);
@@ -35,6 +36,7 @@ fn ReadLoopHandler(comptime T: type) type {
 }
 
 pub const Client = struct {
+    io: Io,
     stream: Stream,
     _reader: Reader,
     _closed: bool,
@@ -51,7 +53,7 @@ pub const Client = struct {
     // is a security feature that only really makes sense in the browser. If you
     // aren't running websockets in the browser AND you control both the client
     // and the server, you could get a performance boost by not masking.
-    _mask_fn: *const fn () [4]u8,
+    _mask_fn: *const fn (Io) [4]u8,
 
     pub const Config = struct {
         port: u16,
@@ -60,7 +62,7 @@ pub const Client = struct {
         max_size: usize = 65536,
         buffer_size: usize = 4096,
         ca_bundle: ?Bundle = null,
-        mask_fn: *const fn () [4]u8 = generateMask,
+        mask_fn: *const fn (Io) [4]u8 = generateMask,
         buffer_provider: ?*buffer.Provider = null,
         compression: ?CompressionOpts = null,
     };
@@ -74,22 +76,23 @@ pub const Client = struct {
         allocator: Allocator,
         retain_writer: bool,
         write_treshold: usize,
-        writer: std.Io.Writer.Allocating,
+        writer: Io.Writer.Allocating,
     };
 
-    pub fn init(allocator: Allocator, config: Config) !Client {
+    pub fn init(io: Io, allocator: Allocator, config: Config) !Client {
         if (config.compression != null) {
             log.err("Compression is disabled as part of the 0.15 upgrade. I do hope to re-enable it soon.", .{});
             return error.InvalidConfiguraion;
         }
 
-        const net_stream = try net.tcpConnectToHost(allocator, config.host, config.port);
+        const host_name = try Io.net.HostName.init(config.host);
+        const net_stream = try host_name.connect(io, config.port, .{.mode = .stream});
 
         var tls_client: ?*TLSClient = null;
         if (config.tls) {
-            tls_client = try TLSClient.init(allocator, net_stream, &config);
+            tls_client = try TLSClient.init(io, allocator, net_stream, &config);
         }
-        const stream = Stream.init(net_stream, tls_client);
+        const stream = Stream.init(io, net_stream, tls_client);
 
         var own_bp = false;
         var buffer_provider: *buffer.Provider = undefined;
@@ -103,7 +106,7 @@ pub const Client = struct {
             own_bp = true;
             buffer_provider = try allocator.create(buffer.Provider);
             errdefer allocator.destroy(buffer_provider);
-            buffer_provider.* = try buffer.Provider.init(allocator, .{
+            buffer_provider.* = try buffer.Provider.init(io, allocator, .{
                 .size = 0,
                 .count = 0,
                 .max = config.max_size,
@@ -119,6 +122,7 @@ pub const Client = struct {
         errdefer buffer_provider.allocator.free(reader_buf);
 
         return .{
+            .io = io,
             .stream = stream,
             ._closed = false,
             ._own_bp = own_bp,
@@ -158,7 +162,7 @@ pub const Client = struct {
 
         try sendHandshake(path, key, buf, &opts, self._compression_opts != null, stream);
 
-        const res = try HandShakeReply.read(buf, key, &opts, self._compression_opts != null, stream);
+        const res = try HandShakeReply.read(self.io, buf, key, &opts, self._compression_opts != null, stream);
         errdefer self.close(.{ .code = 1001 }) catch unreachable;
 
         // Set up compression with agreed-on parameters
@@ -375,7 +379,7 @@ pub const Client = struct {
 
         buf[1] |= 128; // indicate that the payload is masked
 
-        const mask = self._mask_fn();
+        const mask = self._mask_fn(self.io);
         @memcpy(buf[header_len..header_end], &mask);
         try self.stream.writeAll(buf[0..header_end]);
 
@@ -392,20 +396,21 @@ pub const Client = struct {
     }
 };
 
-// wraps a net.Stream and optional a tls.Client
 pub const Stream = struct {
-    stream: net.Stream,
+    io: Io,
+    stream: Io.net.Stream,
     tls_client: ?*TLSClient = null,
 
-    pub fn init(stream: net.Stream, tls_client: ?*TLSClient) Stream {
+    pub fn init(io: Io, stream: Io.net.Stream, tls_client: ?*TLSClient) Stream {
         return .{
+            .io = io,
             .stream = stream,
             .tls_client = tls_client,
         };
     }
 
     pub fn close(self: *Stream) void {
-        const fd = self.stream.handle;
+        const fd = self.stream.socket.handle;
         const builtin = @import("builtin");
         const native_os = builtin.os.tag;
 
@@ -416,12 +421,12 @@ pub const Stream = struct {
             } else if (native_os == .wasi and !builtin.link_libc) {
                 _ = std.os.wasi.sock_shutdown(fd, .{ .WR = true, .RD = true });
             } else {
-                std.posix.shutdown(fd, .both) catch {};
+                posix.shutdown(fd, .both) catch {};
             }
             tls_client.deinit();
         }
 
-        // std.posix.close panics on EBADF
+        // posix.close panics on EBADF
         // This is a general issue in Zig:
         // https://github.com/ziglang/zig/issues/6389
         //
@@ -447,7 +452,7 @@ pub const Stream = struct {
                 }
             }
         }
-        return self.stream.read(buf);
+        return posix.read(self.stream.socket.handle, buf);
     }
 
     pub fn writeAll(self: *Stream, data: []const u8) !void {
@@ -459,7 +464,10 @@ pub const Stream = struct {
             try tls_client.stream_writer.interface.flush();
             return;
         }
-        return self.stream.writeAll(data);
+
+        var writer = self.stream.writer(self.io, &.{});
+        try writer.interface.writeAll(data);
+        return writer.interface.flush();
     }
 
     const zero_timeout = std.mem.toBytes(posix.timeval{ .sec = 0, .usec = 0 });
@@ -484,28 +492,38 @@ pub const Stream = struct {
     }
 
     pub fn setsockopt(self: *const Stream, opt_name: u32, value: []const u8) !void {
-        return posix.setsockopt(self.stream.handle, posix.SOL.SOCKET, opt_name, value);
+        return posix.setsockopt(self.stream.socket.handle, posix.SOL.SOCKET, opt_name, value);
     }
 };
 
 const TLSClient = struct {
+    io: Io,
     client: tls.Client,
-    stream: net.Stream,
-    stream_writer: net.Stream.Writer,
-    stream_reader: net.Stream.Reader,
+    stream: Io.net.Stream,
+    stream_writer: Io.net.Stream.Writer,
+    stream_reader: Io.net.Stream.Reader,
     arena: std.heap.ArenaAllocator,
 
-    fn init(allocator: Allocator, stream: net.Stream, config: *const Client.Config) !*TLSClient {
+    fn init(io: Io, allocator: Allocator, stream: Io.net.Stream, config: *const Client.Config) !*TLSClient {
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
 
         const aa = arena.allocator();
 
-        const bundle = config.ca_bundle orelse blk: {
-            var b = Bundle{};
-            try b.rescan(aa);
-            break :blk b;
-        };
+        // 0.16: Bundle is heap-allocated so we can pass a pointer to TLS
+        // Options.ca.bundle. A single-threaded RwLock is fine here because
+        // the bundle is only touched by this TLS client; the RwLock serves
+        // only to match the Options.ca.bundle contract.
+        const bundle_ptr = try aa.create(Bundle);
+        if (config.ca_bundle) |existing| {
+            bundle_ptr.* = existing;
+        } else {
+            bundle_ptr.* = .empty;
+            // 0.16: rescan signature is (*Bundle, gpa, io, now: Io.Timestamp).
+            try bundle_ptr.rescan(aa, io, Io.Timestamp.now(io, .real));
+        }
+        const bundle_lock = try aa.create(Io.RwLock);
+        bundle_lock.* = .init;
 
         // The TLS input and output have to be max_ciphertext_record_len each.
         // It isn't clear to me how big the un-encrypted reader and writer
@@ -518,21 +536,35 @@ const TLSClient = struct {
 
         const self = try aa.create(TLSClient);
         self.* = .{
+            .io = io,
             .stream = stream,
             .arena = arena,
             .client = undefined,
-            .stream_writer = stream.writer(buf.ptr[0..buf_len][0..buf_len]),
-            .stream_reader = stream.reader(buf.ptr[buf_len .. 2 * buf_len][0..buf_len]),
+            .stream_writer = stream.writer(io, buf.ptr[0..buf_len][0..buf_len]),
+            .stream_reader = stream.reader(io, buf.ptr[buf_len .. 2 * buf_len][0..buf_len]),
         };
 
+        // 0.16 TLS Client.Options requires `entropy` and `realtime_now` in
+        // addition to the 0.15 set. Fill both from the shim Io — the
+        // entropy buffer is read only during `init`.
+        var entropy_buf: [tls.Client.Options.entropy_len]u8 = undefined;
+        io.random(&entropy_buf);
+
         self.client = try tls.Client.init(
-            self.stream_reader.interface(),
+            &self.stream_reader.interface,
             &self.stream_writer.interface,
             .{
-                .ca = .{ .bundle = bundle },
+                .ca = .{ .bundle = .{
+                    .gpa = aa,
+                    .io = io,
+                    .lock = bundle_lock,
+                    .bundle = bundle_ptr,
+                } },
                 .host = .{ .explicit = config.host },
                 .read_buffer = buf.ptr[2 * buf_len .. 3 * buf_len][0..buf_len],
                 .write_buffer = buf.ptr[3 * buf_len .. 4 * buf_len][0..buf_len],
+                .entropy = &entropy_buf,
+                .realtime_now = std.Io.Timestamp.now(io, .real),
             },
         );
 
@@ -554,9 +586,9 @@ fn generateKey() [16]u8 {
     return key;
 }
 
-fn generateMask() [4]u8 {
+fn generateMask(io: Io) [4]u8 {
     var m: [4]u8 = undefined;
-    std.crypto.random.bytes(&m);
+    io.random(&m);
     return m;
 }
 
@@ -617,9 +649,11 @@ const HandShakeReply = struct {
     compression: bool,
     over_read: usize,
 
-    fn read(buf: []u8, key: []const u8, opts: *const Client.HandshakeOpts, compression: bool, stream: anytype) !HandShakeReply {
+    fn read(io: Io, buf: []u8, key: []const u8, opts: *const Client.HandshakeOpts, compression: bool, stream: anytype) !HandShakeReply {
         const timeout_ms = opts.timeout_ms;
-        const deadline = std.time.milliTimestamp() + timeout_ms;
+        // 0.16 removed `std.time.milliTimestamp`; compute ms since epoch
+        // from `std.Io.Timestamp.now(io, .real)` (nanoseconds).
+        const deadline = @divTrunc(Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms) + timeout_ms;
         try stream.readTimeout(timeout_ms);
 
         var pos: usize = 0;
@@ -727,7 +761,7 @@ const HandShakeReply = struct {
                 }
             }
 
-            if (std.time.milliTimestamp() > deadline) {
+            if (@divTrunc(Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms) > deadline) {
                 return error.Timeout;
             }
 
@@ -787,7 +821,8 @@ test "Client: handshake" {
         // empty response
         var pair = t.SocketPair.init(.{});
         defer pair.deinit();
-        try pair.client.writeAll("\r\n\r\n");
+        var writer = pair.client.writer(t.io, &.{});
+        try writer.interface.writeAll("\r\n\r\n");
 
         var client = testClient(pair.server);
         defer client.deinit();
@@ -798,7 +833,8 @@ test "Client: handshake" {
         // invalid websocket response
         var pair = t.SocketPair.init(.{});
         defer pair.deinit();
-        try pair.client.writeAll("HTTP/1.1 200 OK\r\n\r\n");
+        var writer = pair.client.writer(t.io, &.{});
+        try writer.interface.writeAll("HTTP/1.1 200 OK\r\n\r\n");
 
         var client = testClient(pair.server);
         defer client.deinit();
@@ -809,7 +845,8 @@ test "Client: handshake" {
         // missing upgrade header
         var pair = t.SocketPair.init(.{});
         defer pair.deinit();
-        try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\n\r\n");
+        var writer = pair.client.writer(t.io, &.{});
+        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\n\r\n");
 
         var client = testClient(pair.server);
         defer client.deinit();
@@ -820,7 +857,8 @@ test "Client: handshake" {
         // wrong upgrade header
         var pair = t.SocketPair.init(.{});
         defer pair.deinit();
-        try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: nope\r\n\r\n");
+        var writer = pair.client.writer(t.io, &.{});
+        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: nope\r\n\r\n");
 
         var client = testClient(pair.server);
         defer client.deinit();
@@ -831,7 +869,8 @@ test "Client: handshake" {
         // missing connection header
         var pair = t.SocketPair.init(.{});
         defer pair.deinit();
-        try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: websocket\r\n\r\n");
+        var writer = pair.client.writer(t.io, &.{});
+        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: websocket\r\n\r\n");
 
         var client = testClient(pair.server);
         defer client.deinit();
@@ -842,7 +881,8 @@ test "Client: handshake" {
         // wrong connection header
         var pair = t.SocketPair.init(.{});
         defer pair.deinit();
-        try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: something\r\n\r\n");
+        var writer = pair.client.writer(t.io, &.{});
+        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: something\r\n\r\n");
 
         var client = testClient(pair.server);
         defer client.deinit();
@@ -853,7 +893,8 @@ test "Client: handshake" {
         // missing Sec-Websocket-Accept header
         var pair = t.SocketPair.init(.{});
         defer pair.deinit();
-        try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n");
+        var writer = pair.client.writer(t.io, &.{});
+        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n");
 
         var client = testClient(pair.server);
         defer client.deinit();
@@ -864,7 +905,8 @@ test "Client: handshake" {
         // wrong Sec-Websocket-Accept header
         var pair = t.SocketPair.init(.{});
         defer pair.deinit();
-        try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: hack\r\n\r\n");
+        var writer = pair.client.writer(t.io, &.{});
+        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: hack\r\n\r\n");
 
         var client = testClient(pair.server);
         defer client.deinit();
@@ -875,7 +917,8 @@ test "Client: handshake" {
         // ok for successful
         var pair = t.SocketPair.init(.{});
         defer pair.deinit();
-        try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: C/0nmHhBztSRGR1CwL6Tf4ZjwpY=\r\n\r\n");
+        var writer = pair.client.writer(t.io, &.{});
+        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: C/0nmHhBztSRGR1CwL6Tf4ZjwpY=\r\n\r\n");
 
         var client = testClient(pair.server);
         defer client.deinit();
@@ -887,7 +930,8 @@ test "Client: handshake" {
         // ok for successful, with overread
         var pair = t.SocketPair.init(.{});
         defer pair.deinit();
-        try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: C/0nmHhBztSRGR1CwL6Tf4ZjwpY=\r\n\r\nSome Random Data Which is Part Of the Next Message");
+        var writer = pair.client.writer(t.io, &.{});
+        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: C/0nmHhBztSRGR1CwL6Tf4ZjwpY=\r\n\r\nSome Random Data Which is Part Of the Next Message");
 
         var client = testClient(pair.server);
         defer client.deinit();
@@ -897,7 +941,7 @@ test "Client: handshake" {
 }
 
 test "Client: write/read" {
-    var client = try Client.init(t.allocator, .{
+    var client = try Client.init(t.io, t.allocator, .{
         .port = 9292,
         .host = "127.0.0.1",
     });
@@ -919,7 +963,7 @@ test "Client: write/read" {
 }
 
 test "Client: close with code" {
-    var client = try Client.init(t.allocator, .{
+    var client = try Client.init(t.io, t.allocator, .{
         .port = 9292,
         .host = "127.0.0.1",
     });
@@ -933,7 +977,7 @@ test "Client: close with code" {
 }
 
 test "Client: with code and reason" {
-    var client = try Client.init(t.allocator, .{
+    var client = try Client.init(t.io, t.allocator, .{
         .port = 9292,
         .host = "127.0.0.1",
     });
@@ -947,7 +991,7 @@ test "Client: with code and reason" {
 }
 
 test "Client: Handler" {
-    var h = try ClientHandler.init(t.allocator);
+    var h = try ClientHandler.init(t.io, t.allocator);
     defer h.deinit();
 
     var buf: [6]u8 = undefined;
@@ -979,18 +1023,19 @@ test "Client: Handler" {
     try t.expectEqual(true, h.closed);
 }
 
-fn testClient(stream: net.Stream) Client {
+fn testClient(stream: Io.net.Stream) Client {
     const bp = t.allocator.create(buffer.Provider) catch unreachable;
-    bp.* = buffer.Provider.init(t.allocator, .{ .count = 0, .size = 0, .max = 4096 }) catch unreachable;
+    bp.* = buffer.Provider.init(t.io, t.allocator, .{ .count = 0, .size = 0, .max = 4096 }) catch unreachable;
 
     const reader_buf = bp.allocator.alloc(u8, 1024) catch unreachable;
 
     return .{
+        .io = t.io,
         ._closed = false,
         ._own_bp = true,
         ._mask_fn = generateMask,
         ._compression_opts = null,
-        .stream = .{ .stream = stream },
+        .stream = .{ .io = t.io, .stream = stream },
         ._reader = Reader.init(reader_buf, bp, null),
     };
 }
@@ -1002,8 +1047,8 @@ const ClientHandler = struct {
     message: bool = false,
     client: Client,
 
-    fn init(allocator: Allocator) !ClientHandler {
-        var client = try Client.init(allocator, .{
+    fn init(io: Io, allocator: Allocator) !ClientHandler {
+        var client = try Client.init(io, allocator, .{
             .port = 9292,
             .host = "127.0.0.1",
         });

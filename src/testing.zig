@@ -1,5 +1,7 @@
 const std = @import("std");
+
 const t = @import("t.zig");
+const posix = @import("posix.zig");
 const ws = @import("websocket.zig");
 
 pub fn init() Testing {
@@ -28,11 +30,11 @@ pub const Testing = struct {
 
         const port = opts.port orelse 0;
         const pair = t.SocketPair.init(.{ .port = port });
-        const timeout = std.mem.toBytes(std.posix.timeval{
+        const timeout = std.mem.toBytes(posix.timeval{
             .sec = 0,
             .usec = 50_000,
         });
-        std.posix.setsockopt(pair.client.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &timeout) catch unreachable;
+        posix.setsockopt(pair.client.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &timeout) catch unreachable;
 
         const aa = arena.allocator();
         const buffer_provider = aa.create(ws.buffer.Provider) catch unreachable;
@@ -124,13 +126,13 @@ pub const Testing = struct {
     }
 };
 
-// std.posix.close panics on EBADF
+// posix.close panics on EBADF
 // This is a general issue in Zig:
 // https://github.com/ziglang/zig/issues/6389
 //
 // For these tests, we realy don't know if the server-side of the connection
 // is closed, so we try to close and ignore any errors.
-fn close(fd: std.posix.fd_t) void {
+fn close(fd: posix.fd_t) void {
     const builtin = @import("builtin");
     const native_os = builtin.os.tag;
     if (native_os == .windows) {
@@ -140,5 +142,5 @@ fn close(fd: std.posix.fd_t) void {
         _ = std.os.wasi.fd_close(fd);
         return;
     }
-    _ = std.posix.system.close(fd);
+    _ = posix.system.close(fd);
 }

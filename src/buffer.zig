@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 pub const Buffer = struct {
@@ -18,7 +19,7 @@ pub const Writer = struct {
     pos: usize = 0,
     pooled: bool,
     provider: *Provider,
-    interface: std.Io.Writer,
+    interface: Io.Writer,
 
     pub fn init(buf: []u8, pooled: bool, provider: *Provider, dumb: []u8) Writer {
         return .{
@@ -42,8 +43,7 @@ pub const Writer = struct {
         }
     }
 
-    pub fn drain(io_w: *std.Io.Writer, data: []const []const u8, splat: usize) error{WriteFailed}!usize {
-        std.debug.print("drain: {d}\n", .{data[0].len});
+    pub fn drain(io_w: *Io.Writer, data: []const []const u8, splat: usize) error{WriteFailed}!usize {
         _ = splat;
         const self: *Writer = @alignCast(@fieldParentPtr("interface", io_w));
         self.writeAll(data[0]) catch return error.WriteFailed;
@@ -110,7 +110,7 @@ pub const Provider = struct {
     // If this is 0, pool is undefined. We need this field here anyways.
     pool_buffer_size: usize,
 
-    pub fn init(allocator: Allocator, config: Config) !Provider {
+    pub fn init(io: Io, allocator: Allocator, config: Config) !Provider {
         const size = config.size;
         const count = config.count;
 
@@ -133,7 +133,7 @@ pub const Provider = struct {
             .allocator = allocator,
             .pool_buffer_size = size,
             .max_buffer_size = config.max,
-            .pool = try Pool.init(allocator, count, size),
+            .pool = try Pool.init(io, allocator, count, size),
         };
     }
 
@@ -211,13 +211,14 @@ pub const Provider = struct {
 };
 
 pub const Pool = struct {
+    io: Io,
     buffer_size: usize,
     available: usize,
     buffers: [][]u8,
     allocator: Allocator,
-    mutex: std.Thread.Mutex,
+    mutex: Io.Mutex,
 
-    pub fn init(allocator: Allocator, count: usize, buffer_size: usize) !Pool {
+    pub fn init(io: Io, allocator: Allocator, count: usize, buffer_size: usize) !Pool {
         const buffers = try allocator.alloc([]u8, count);
 
         for (0..count) |i| {
@@ -225,7 +226,8 @@ pub const Pool = struct {
         }
 
         return .{
-            .mutex = .{},
+            .io = io,
+            .mutex = .init,
             .buffers = buffers,
             .available = count,
             .allocator = allocator,
@@ -242,10 +244,11 @@ pub const Pool = struct {
     }
 
     pub fn acquire(self: *Pool) ?[]u8 {
+        const io = self.io;
         const buffers = self.buffers;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         const available = self.available;
         if (available == 0) {
             return null;
@@ -261,24 +264,25 @@ pub const Pool = struct {
     }
 
     pub fn release(self: *Pool, buffer: []u8) void {
+        const io = self.io;
         var buffers = self.buffers;
 
-        self.mutex.lock();
+        self.mutex.lockUncancelable(io);
         const available = self.available;
         if (available == buffers.len) {
-            self.mutex.unlock();
+            self.mutex.unlock(io);
             self.allocator.free(buffer);
             return;
         }
         buffers[available] = buffer;
         self.available = available + 1;
-        self.mutex.unlock();
+        self.mutex.unlock(io);
     }
 };
 
 const t = @import("t.zig");
 test "buffer: no pool" {
-    var p = try Provider.init(t.allocator, .{ .count = 0, .size = 0, .max = 100 });
+    var p = try Provider.init(t.io, t.allocator, .{ .count = 0, .size = 0, .max = 100 });
 
     const buffer = try p.alloc(100);
     defer p.free(buffer);
@@ -287,7 +291,7 @@ test "buffer: no pool" {
 }
 
 test "buffer: pool" {
-    var p = try Provider.init(t.allocator, .{ .count = 2, .size = 10, .max = 15 });
+    var p = try Provider.init(t.io, t.allocator, .{ .count = 2, .size = 10, .max = 15 });
     defer p.deinit();
 
     {
@@ -332,7 +336,7 @@ test "buffer: pool" {
 }
 
 test "buffer: grow" {
-    var p = try Provider.init(t.allocator, .{ .count = 1, .size = 10, .max = 30 });
+    var p = try Provider.init(t.io, t.allocator, .{ .count = 1, .size = 10, .max = 30 });
     defer p.deinit();
 
     {

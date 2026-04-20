@@ -1,24 +1,23 @@
 const std = @import("std");
 const proto = @import("proto.zig");
+const posix = @import("posix.zig");
 
-const posix = std.posix;
+const Io = std.Io;
 const ArrayList = std.ArrayList;
 
 const Message = proto.Message;
 
+pub const io = std.testing.io;
 pub const allocator = std.testing.allocator;
 
-pub fn expectEqual(expected: anytype, actual: anytype) !void {
-    try std.testing.expectEqual(@as(@TypeOf(actual), expected), actual);
-}
-
+pub const expectEqual = std.testing.expectEqual;
 pub const expectError = std.testing.expectError;
 pub const expectString = std.testing.expectEqualStrings;
 pub const expectSlice = std.testing.expectEqualSlices;
 
 pub fn getRandom() std.Random.DefaultPrng {
     var seed: u64 = undefined;
-    std.posix.getrandom(std.mem.asBytes(&seed)) catch unreachable;
+    io.random(std.mem.asBytes(&seed));
     return std.Random.DefaultPrng.init(seed);
 }
 
@@ -145,15 +144,15 @@ pub const Writer = struct {
 
 pub const SocketPair = struct {
     writer: Writer,
-    client: std.net.Stream,
-    server: std.net.Stream,
+    client: Io.net.Stream,
+    server: Io.net.Stream,
 
     const Opts = struct {
         port: ?u16 = null,
     };
 
     pub fn init(opts: Opts) SocketPair {
-        var address = std.net.Address.parseIp("127.0.0.1", opts.port orelse 0) catch unreachable;
+        var address = posix.Address.parseIp("127.0.0.1", opts.port orelse 0) catch unreachable;
         var address_len = address.getOsSockLen();
 
         const listener = posix.socket(address.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch unreachable;
@@ -181,8 +180,8 @@ pub const SocketPair = struct {
         const server = posix.accept(listener, &address.any, &address_len, posix.SOCK.CLOEXEC) catch unreachable;
 
         return .{
-            .client = .{ .handle = client },
-            .server = .{ .handle = server },
+            .client = .{ .socket = .{ .handle = client, .address = .{ .ip4 = .{ .bytes = [4]u8{ 127, 0, 0, 1 }, .port = 0 } } } },
+            .server = .{ .socket = .{ .handle = server, .address = .{ .ip4 = .{ .bytes = [4]u8{ 127, 0, 0, 1 }, .port = opts.port orelse 0 } } } },
             .writer = Writer.init(),
         };
     }
@@ -190,7 +189,7 @@ pub const SocketPair = struct {
     pub fn deinit(self: *SocketPair) void {
         self.writer.deinit();
         // assume test closes self.server
-        self.client.close();
+        self.client.close(io);
     }
 
     pub fn pingPayload(self: *SocketPair, payload: []const u8) void {
@@ -206,7 +205,10 @@ pub const SocketPair = struct {
     }
 
     pub fn sendBuf(self: *SocketPair) void {
-        self.client.writeAll(self.writer.bytes()) catch unreachable;
+        var writer = self.client.writer(io, &.{});
+        writer.interface.writeAll(self.writer.bytes()) catch unreachable;
+        writer.interface.flush() catch unreachable;
+
         self.writer.clear();
     }
 };

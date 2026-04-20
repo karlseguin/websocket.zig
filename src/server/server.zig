@@ -1,10 +1,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
+
+const posix = @import("../posix.zig");
 const proto = @import("../proto.zig");
 const buffer = @import("../buffer.zig");
 
-const net = std.net;
-const posix = std.posix;
+const Io = std.Io;
 const Thread = std.Thread;
 const Allocator = std.mem.Allocator;
 const FixedBufferAllocator = std.heap.FixedBufferAllocator;
@@ -91,17 +92,18 @@ pub const Config = struct {
 
 pub fn Server(comptime H: type) type {
     return struct {
+        io: Io,
         config: Config,
         allocator: Allocator,
 
         _state: WorkerState,
         _signals: []posix.fd_t,
-        _mut: Thread.Mutex,
-        _cond: Thread.Condition,
+        _mut: Io.Mutex,
+        _cond: Io.Condition,
 
         const Self = @This();
 
-        pub fn init(allocator: Allocator, config: Config) !Self {
+        pub fn init(io: Io, allocator: Allocator, config: Config) !Self {
             if (blockingMode()) {
                 if (config.buffers.small_pool) |p| {
                     if (p > 1) {
@@ -118,12 +120,13 @@ pub fn Server(comptime H: type) type {
             const signals = try allocator.alloc(posix.fd_t, config.workerCount());
             errdefer allocator.free(signals);
 
-            var state = try WorkerState.init(allocator, config);
+            var state = try WorkerState.init(io, allocator, config);
             errdefer state.deinit();
 
             return .{
-                ._mut = .{},
-                ._cond = .{},
+                .io = io,
+                ._mut = .init,
+                ._cond = .init,
                 ._state = state,
                 ._signals = signals,
                 .config = config,
@@ -137,38 +140,40 @@ pub fn Server(comptime H: type) type {
         }
 
         pub fn listenInNewThread(self: *Self, ctx: anytype) !Thread {
-            self._mut.lock();
-            defer self._mut.unlock();
+            const io = self.io;
+            self._mut.lockUncancelable(io);
+            defer self._mut.unlock(io);
             const thrd = try Thread.spawn(.{}, Self.listen, .{ self, ctx });
 
             // we don't return until listen() signals us that the server is up
-            self._cond.wait(&self._mut);
+            self._cond.waitUncancelable(io, &self._mut);
             return thrd;
         }
 
         pub fn listen(self: *Self, ctx: anytype) !void {
-            self._mut.lock();
+            const io = self.io;
+            self._mut.lockUncancelable(io);
             errdefer {
-                self._cond.signal();
-                self._mut.unlock();
+                self._cond.signal(io);
+                self._mut.unlock(io);
             }
 
             const config = &self.config;
 
             var no_delay = true;
-            const address = blk: {
-                if (config.unix_path) |unix_path| {
-                    if (comptime std.net.has_unix_sockets == false) {
+            const address: posix.Address = blk: {
+                if (config.unix_path) |path| {
+                    if (comptime Io.net.has_unix_sockets == false) {
                         return error.UnixPathNotSupported;
                     }
                     no_delay = false;
-                    std.fs.deleteFileAbsolute(unix_path) catch {};
-                    break :blk try net.Address.initUnix(unix_path);
-                } else {
-                    const listen_port = config.port;
-                    const listen_address = config.address;
-                    break :blk try net.Address.parseIp(listen_address, listen_port);
+                    Io.Dir.deleteFileAbsolute(io, path) catch {};
+                    break :blk try posix.Address.initUnix(path);
                 }
+
+                const listen_port = config.port;
+                const listen_address = config.address;
+                break :blk try posix.Address.parseIp(listen_address, listen_port);
             };
 
             const socket = blk: {
@@ -217,7 +222,7 @@ pub fn Server(comptime H: type) type {
 
                 // this is what we'll shutdown when stop() is called
                 self._signals[0] = socket;
-                self._mut.unlock();
+                self._mut.unlock(io);
                 thrd.join();
             } else {
                 defer posix.close(socket);
@@ -249,7 +254,7 @@ pub fn Server(comptime H: type) type {
                     const pipe = try posix.pipe2(.{ .NONBLOCK = true });
                     errdefer posix.close(pipe[1]);
 
-                    workers[i] = try W.init(self.allocator, &self._state, ctx);
+                    workers[i] = try W.init(io, self.allocator, &self._state, ctx);
                     errdefer workers[i].deinit();
 
                     threads[i] = try Thread.spawn(.{}, W.run, .{ &workers[i], socket, pipe[0] });
@@ -261,20 +266,21 @@ pub fn Server(comptime H: type) type {
                 log.info("starting nonblocking worker to listen on {f}", .{address});
 
                 // in case startInNewThread is waiting
-                self._cond.signal();
+                self._cond.signal(io);
 
-                self._mut.unlock();
+                self._mut.unlock(io);
 
                 for (threads) |thrd| {
                     thrd.join();
                 }
             }
-            self._cond.signal();
+            self._cond.signal(io);
         }
 
         pub fn stop(self: *Self) void {
-            self._mut.lock();
-            defer self._mut.unlock();
+            const io = self.io;
+            self._mut.lockUncancelable(io);
+            defer self._mut.unlock(io);
             for (self._signals) |s| {
                 if (blockingMode()) {
                     // necessary to unblock accept on linux
@@ -284,7 +290,7 @@ pub fn Server(comptime H: type) type {
                 }
                 posix.close(s);
             }
-            self._cond.wait(&self._mut);
+            self._cond.waitUncancelable(io, &self._mut);
         }
     };
 }
@@ -302,7 +308,7 @@ pub fn Blocking(comptime H: type) type {
 
         const Timeout = struct {
             sec: u32,
-            timeval: [@sizeOf(std.posix.timeval)]u8,
+            timeval: [@sizeOf(posix.timeval)]u8,
 
             // if sec is null, it means we want to cancel the timeout.
             fn init(sec: u32) Timeout {
@@ -317,10 +323,10 @@ pub fn Blocking(comptime H: type) type {
 
         const Self = @This();
 
-        pub fn init(allocator: Allocator, state: *WorkerState) !Self {
+        pub fn init(io: Io, allocator: Allocator, state: *WorkerState) !Self {
             const config = &state.config;
 
-            var conn_manager = try ConnManager(H, false).init(allocator, config.compression);
+            var conn_manager = try ConnManager(H, false).init(io, allocator, config.compression);
             errdefer conn_manager.deinit();
 
             return .{
@@ -341,8 +347,8 @@ pub fn Blocking(comptime H: type) type {
         pub fn run(self: *Self, listener: posix.socket_t, ctx: anytype) void {
             defer self.shutdown();
             while (true) {
-                var address: net.Address = undefined;
-                var address_len: posix.socklen_t = @sizeOf(net.Address);
+                var address: posix.Address = undefined;
+                var address_len: posix.socklen_t = @sizeOf(posix.Address);
                 const socket = posix.accept(listener, &address.any, &address_len, posix.SOCK.CLOEXEC) catch |err| {
                     if (err == error.ConnectionAborted or err == error.SocketNotListening) {
                         log.info("received shutdown signal", .{});
@@ -364,21 +370,22 @@ pub fn Blocking(comptime H: type) type {
 
         // Called in a thread started above in listen.
         // Wrapper around _handleConnection so that we can handle erros
-        fn handleConnection(self: *Self, socket: posix.socket_t, address: net.Address, ctx: anytype) void {
+        fn handleConnection(self: *Self, socket: posix.socket_t, address: posix.Address, ctx: anytype) void {
             self._handleConnection(socket, address, ctx) catch |err| {
                 log.err("({f}) uncaught error in connection handler: {}", .{ address, err });
             };
         }
 
-        fn _handleConnection(self: *Self, socket: posix.socket_t, address: net.Address, ctx: anytype) !void {
+        fn _handleConnection(self: *Self, socket: posix.socket_t, address: posix.Address, ctx: anytype) !void {
+            const io = self.io;
             const conn_manager = &self.conn_manager;
-            const hc = try conn_manager.create(socket, address, timestamp());
+            const hc = try conn_manager.create(socket, address, timestamp(io));
 
             {
                 // Do our handshake
                 errdefer self.cleanupConn(hc);
                 const timeout = self.handshake_timeout;
-                const deadline = timestamp() + timeout.sec;
+                const deadline = timestamp(io) + timeout.sec;
                 try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &timeout.timeval);
 
                 while (true) {
@@ -394,7 +401,7 @@ pub fn Blocking(comptime H: type) type {
                         }
                         break;
                     }
-                    if (timestamp() > deadline) {
+                    if (timestamp(io) > deadline) {
                         self.cleanupConn(hc);
                         return;
                     }
@@ -468,15 +475,15 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
         const Self = @This();
         const ThreadPool = @import("thread_pool.zig").ThreadPool(Self.dataAvailable);
 
-        pub fn init(allocator: Allocator, state: *WorkerState, ctx: C) !Self {
-            var base = try NonBlockingBase(H, true).init(allocator, state);
+        pub fn init(io: Io, allocator: Allocator, state: *WorkerState, ctx: C) !Self {
+            var base = try NonBlockingBase(H, true).init(io, allocator, state);
             errdefer base.deinit();
 
             const loop = try Loop.init();
             errdefer loop.deinit();
 
             const config = &state.config;
-            var thread_pool = try ThreadPool.init(allocator, .{
+            var thread_pool = try ThreadPool.init(io, allocator, .{
                 .count = config.thread_pool.count orelse 4,
                 .backlog = config.thread_pool.backlog orelse 500,
                 .buffer_size = config.thread_pool.buffer_size orelse if (needsAllocator(H)) 32_768 else 0,
@@ -502,6 +509,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
         }
 
         fn run(self: *Self, listener: posix.socket_t, signal: posix.fd_t) void {
+            const io = self.base.io;
             self.loop.monitorAccept(listener) catch |err| {
                 log.err("failed to add monitor to listening socket: {}", .{err});
                 return;
@@ -516,7 +524,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
             const conn_manager = &self.base.conn_manager;
             const handshake_timeout = self.handshake_timeout;
 
-            var now = timestamp();
+            var now = timestamp(io);
             var oldest_pending_start_time: ?u32 = null;
             while (true) {
                 const handshake_cutoff = now - handshake_timeout;
@@ -529,17 +537,21 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 
                 var it = self.loop.wait(timeout) catch |err| {
                     log.err("failed to wait on events: {}", .{err});
-                    std.Thread.sleep(std.time.ns_per_s);
+                    io.sleep(.fromMilliseconds(100), .awake) catch |err2| {
+                        log.err("Failed to do a loop recovery sleep: {}", .{err2});
+                    };
                     continue;
                 };
 
-                now = timestamp();
+                now = timestamp(io);
                 oldest_pending_start_time = null;
                 while (it.next()) |data| {
                     if (data == 0) {
                         self.accept(listener, now) catch |err| {
                             log.err("accept error: {}", .{err});
-                            std.Thread.sleep(std.time.ns_per_ms);
+                            io.sleep(.fromMilliseconds(100), .awake) catch |err2| {
+                                log.err("Failed to do a accept recovery sleep: {}", .{err2});
+                            };
                         };
                         continue;
                     }
@@ -568,12 +580,13 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 
         // Enforces timeouts, and returns when the next timeout should be checked.
         fn prepareToWait(self: *Self, cutoff: u32) ?i32 {
+            const io = self.base.io;
             const cm = &self.base.conn_manager;
 
             // always ordered from oldest to newest, so once we find a conneciton
             // that isn't timed out, we can stop
-            cm.lock.lock();
-            defer cm.lock.unlock();
+            cm.lock.lockUncancelable(io);
+            defer cm.lock.unlock(io);
 
             var next_conn = cm.pending.head;
             while (next_conn) |hc| {
@@ -605,8 +618,8 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
             const conn_manager = &self.base.conn_manager;
 
             while (conn_manager.count() < max_conn) {
-                var address: net.Address = undefined;
-                var address_len: posix.socklen_t = @sizeOf(net.Address);
+                var address: posix.Address = undefined;
+                var address_len: posix.socklen_t = @sizeOf(posix.Address);
 
                 const socket = posix.accept(listener, &address.any, &address_len, posix.SOCK.CLOEXEC) catch |err| {
                     // When available, we use SO_REUSEPORT_LB or SO_REUSEPORT, so WouldBlock
@@ -648,10 +661,11 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
         // shutdown (by waiting for all the thread pools threads to end) solves this.
         // Else, we'll need to throw a bunch of locking around HC just to handle shutdown.
         fn dataAvailable(self: *Self, hc: *HandlerConn(H), thread_buf: []u8) void {
+            const io = self.base.io;
             var success = false;
             {
-                hc.cleanup.lock();
-                defer hc.cleanup.unlock();
+                hc.cleanup.lockUncancelable(io);
+                defer hc.cleanup.unlock(io);
                 if (hc.handler == null) {
                     success = self.dataForHandshake(hc) catch |err| blk: {
                         log.err("({f}) error processing handshake: {}", .{ hc.conn.address, err });
@@ -704,6 +718,8 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 
 fn NonBlockingBase(comptime H: type, comptime MANAGE_HS: bool) type {
     return struct {
+        io: Io,
+
         allocator: Allocator,
 
         buffer_provider: *buffer.Provider,
@@ -717,16 +733,16 @@ fn NonBlockingBase(comptime H: type, comptime MANAGE_HS: bool) type {
 
         const Self = @This();
 
-        fn init(allocator: Allocator, state: *WorkerState) !Self {
+        fn init(io: Io, allocator: Allocator, state: *WorkerState) !Self {
             const config = &state.config;
 
-            var conn_manager = try ConnManager(H, MANAGE_HS).init(allocator, config.compression);
+            var conn_manager = try ConnManager(H, MANAGE_HS).init(io, allocator, config.compression);
             errdefer conn_manager.deinit();
 
             const connection_buffer_size = config.buffers.small_size orelse DEFAULT_BUFFER_SIZE;
             var small_buffer_pool: ?buffer.Pool = null;
             if (config.buffers.small_pool) |pool_count| {
-                small_buffer_pool = try buffer.Pool.init(allocator, pool_count, connection_buffer_size);
+                small_buffer_pool = try buffer.Pool.init(io, allocator, pool_count, connection_buffer_size);
             }
 
             errdefer if (small_buffer_pool) |sbp| {
@@ -734,6 +750,7 @@ fn NonBlockingBase(comptime H: type, comptime MANAGE_HS: bool) type {
             };
 
             return .{
+                .io = io,
                 .allocator = allocator,
                 .conn_manager = conn_manager,
                 .small_buffer_pool = small_buffer_pool,
@@ -749,7 +766,7 @@ fn NonBlockingBase(comptime H: type, comptime MANAGE_HS: bool) type {
             }
         }
 
-        fn newConn(self: *Self, socket: posix.socket_t, address: net.Address, time: u32) !*HandlerConn(H) {
+        fn newConn(self: *Self, socket: posix.socket_t, address: posix.Address, time: u32) !*HandlerConn(H) {
             return self.conn_manager.create(socket, address, time);
         }
 
@@ -781,9 +798,10 @@ fn NonBlockingBase(comptime H: type, comptime MANAGE_HS: bool) type {
         }
 
         fn cleanupConn(self: *Self, hc: *HandlerConn(H)) void {
+            const io = self.io;
             {
-                hc.cleanup.lock();
-                defer hc.cleanup.unlock();
+                hc.cleanup.lockUncancelable(io);
+                defer hc.cleanup.unlock(io);
                 if (hc.reader) |*reader| {
                     if (self.small_buffer_pool) |*sbp| {
                         sbp.release(reader.static);
@@ -803,8 +821,9 @@ fn NonBlockingBase(comptime H: type, comptime MANAGE_HS: bool) type {
 
         // called for each hc when shutting down
         fn shutdownCleanup(self: *Self, hc: *HandlerConn(H)) void {
-            hc.cleanup.lock();
-            defer hc.cleanup.unlock();
+            const io = self.io;
+            hc.cleanup.lockUncancelable(io);
+            defer hc.cleanup.unlock(io);
             if (hc.reader) |*reader| {
                 if (self.small_buffer_pool == null) {
                     self.allocator.free(reader.static);
@@ -940,12 +959,12 @@ const EPoll = struct {
 
     fn monitorAccept(self: *EPoll, fd: c_int) !void {
         var event = linux.epoll_event{ .events = linux.EPOLL.IN, .data = .{ .ptr = 0 } };
-        return std.posix.epoll_ctl(self.q, linux.EPOLL.CTL_ADD, fd, &event);
+        return posix.epoll_ctl(self.q, linux.EPOLL.CTL_ADD, fd, &event);
     }
 
     fn monitorSignal(self: *EPoll, fd: c_int) !void {
         var event = linux.epoll_event{ .events = linux.EPOLL.IN, .data = .{ .ptr = 1 } };
-        return std.posix.epoll_ctl(self.q, linux.EPOLL.CTL_ADD, fd, &event);
+        return posix.epoll_ctl(self.q, linux.EPOLL.CTL_ADD, fd, &event);
     }
 
     fn monitorRead(self: *EPoll, hc: anytype, comptime rearm: bool) !void {
@@ -1013,7 +1032,7 @@ pub fn Worker(comptime H: type) type {
             self.worker.deinit();
         }
 
-        pub fn createConn(self: *Self, socket: posix.socket_t, address: net.Address, now: u32) !*HandlerConn(H) {
+        pub fn createConn(self: *Self, socket: posix.socket_t, address: posix.Address, now: u32) !*HandlerConn(H) {
             return self.worker.conn_manager.create(socket, address, now);
         }
 
@@ -1048,20 +1067,20 @@ pub const WorkerState = struct {
     handshake_pool: *Handshake.Pool,
     buffer_provider: buffer.Provider,
 
-    pub fn init(allocator: Allocator, config: Config) !WorkerState {
+    pub fn init(io: Io, allocator: Allocator, config: Config) !WorkerState {
         const handshake_pool_count = config.handshake.count orelse 32;
         const handshake_max_size = config.handshake.max_size orelse 1024;
         const handshake_max_headers = config.handshake.max_headers orelse 10;
         const handshake_max_res_headers = config.handshake.max_res_headers orelse 2;
 
-        var handshake_pool = try Handshake.Pool.init(allocator, handshake_pool_count, handshake_max_size, handshake_max_headers, handshake_max_res_headers);
+        var handshake_pool = try Handshake.Pool.init(io, allocator, handshake_pool_count, handshake_max_size, handshake_max_headers, handshake_max_res_headers);
         errdefer handshake_pool.deinit();
 
         const max_message_size = config.max_message_size orelse DEFAULT_MAX_MESSAGE_SIZE;
         const large_buffer_pool = config.buffers.large_pool orelse 8;
         const large_buffer_size = config.buffers.large_size orelse @min((config.buffers.small_size orelse DEFAULT_BUFFER_SIZE) * 2, max_message_size);
 
-        var buffer_provider = try buffer.Provider.init(allocator, .{
+        var buffer_provider = try buffer.Provider.init(io, allocator, .{
             .max = max_message_size,
             .size = large_buffer_size,
             .count = large_buffer_pool,
@@ -1100,7 +1119,7 @@ pub fn HandlerConn(comptime H: type) type {
         reader: ?Reader,
         socket: posix.socket_t, // denormalization from conn.stream.handle
         handshake: ?*Handshake.State,
-        cleanup: Thread.Mutex = .{},
+        cleanup: Io.Mutex = .init,
         compression: ?Compression = null,
         next: ?*HandlerConn(H) = null,
         prev: ?*HandlerConn(H) = null,
@@ -1114,7 +1133,8 @@ pub fn HandlerConn(comptime H: type) type {
 
 pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
     return struct {
-        lock: Thread.Mutex,
+        io: Io,
+        lock: Io.Mutex,
         allocator: Allocator,
         active: List(HandlerConn(H)),
         pending: List(HandlerConn(H)),
@@ -1124,15 +1144,16 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
 
         const Self = @This();
 
-        pub fn init(allocator: Allocator, compression: ?Compression) !Self {
-            var pool = std.heap.MemoryPool(HandlerConn(H)).init(allocator);
-            errdefer pool.deinit();
+        pub fn init(io: Io, allocator: Allocator, compression: ?Compression) !Self {
+            var pool: std.heap.MemoryPool(HandlerConn(H)) = .empty;
+            errdefer pool.deinit(allocator);
 
-            var compression_pool = std.heap.MemoryPool(Conn.Compression).init(allocator);
-            errdefer compression_pool.deinit();
+            var compression_pool: std.heap.MemoryPool(Conn.Compression) = .empty;
+            errdefer compression_pool.deinit(allocator);
 
             return .{
-                .lock = .{},
+                .io = io,
+                .lock = .init,
                 .pool = pool,
                 .active = .{},
                 .pending = .{},
@@ -1143,26 +1164,30 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
         }
 
         pub fn deinit(self: *Self) void {
-            self.pool.deinit();
-            self.compression_pool.deinit();
+            self.pool.deinit(self.allocator);
+            self.compression_pool.deinit(self.allocator);
         }
 
         pub fn count(self: *Self) usize {
-            self.lock.lock();
-            defer self.lock.unlock();
+            const io = self.io;
+            self.lock.lockUncancelable(io);
+            defer self.lock.unlock(io);
             if (MANAGE_HS == false) {
                 return self.active.len;
             }
             return self.active.len + self.pending.len;
         }
 
-        pub fn create(self: *Self, socket: posix.socket_t, address: net.Address, now: u32) !*HandlerConn(H) {
+        pub fn create(self: *Self, socket: posix.socket_t, address: posix.Address, now: u32) !*HandlerConn(H) {
+            const io = self.io;
             errdefer posix.close(socket);
 
-            self.lock.lock();
-            defer self.lock.unlock();
+            const ip_address = address.toIOAddress();
 
-            const hc = try self.pool.create();
+            self.lock.lockUncancelable(io);
+            defer self.lock.unlock(io);
+
+            const hc = try self.pool.create(self.allocator);
             hc.* = .{
                 .state = if (MANAGE_HS) .handshake else .active,
                 .socket = socket,
@@ -1171,10 +1196,11 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
                 .reader = null,
                 .compression = null,
                 .conn = .{
+                    .io = io,
                     ._closed = false,
                     .started = now,
                     .address = address,
-                    .stream = .{ .handle = socket },
+                    .stream = .{ .socket = .{ .handle = socket, .address = ip_address } },
                     .compression = null,
                 },
             };
@@ -1194,8 +1220,10 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
 
             // our caller made sute this was the case
             std.debug.assert(hc.state == .handshake);
-            self.lock.lock();
-            defer self.lock.unlock();
+
+            const io = self.io;
+            self.lock.lockUncancelable(io);
+            defer self.lock.unlock(io);
             self.pending.remove(hc);
             self.active.insert(hc);
             hc.state = .active;
@@ -1207,10 +1235,12 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
             // this should only be called when we need more data to complete the handshake
             // which should only happen on an active connection
             std.debug.assert(hc.state == .active);
+
+            const io = self.io;
             hc.state = .handshake;
 
-            self.lock.lock();
-            defer self.lock.unlock();
+            self.lock.lockUncancelable(io);
+            defer self.lock.unlock(io);
             self.active.remove(hc);
             self.pending.insert(hc);
         }
@@ -1235,7 +1265,8 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
                 c.writer.deinit();
             }
 
-            self.lock.lock();
+            const io = self.io;
+            self.lock.lockUncancelable(io);
             if (hc.state == .active) {
                 self.active.remove(hc);
             } else {
@@ -1247,7 +1278,7 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
             }
 
             self.pool.destroy(hc);
-            self.lock.unlock();
+            self.lock.unlock(io);
         }
 
         fn setupCompression(self: *Self, hc: *HandlerConn(H)) !void {
@@ -1264,7 +1295,7 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
                 return;
             }
 
-            const compression = try self.compression_pool.create();
+            const compression = try self.compression_pool.create(self.allocator);
             errdefer self.compression_pool.destroy(compression);
 
             compression.* = .{
@@ -1277,11 +1308,12 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
         }
 
         pub fn shutdown(self: *Self, worker: anytype) void {
-            self.lock.lock();
-            defer self.lock.unlock();
+            const io = self.io;
+            self.lock.lockUncancelable(io);
+            defer self.lock.unlock(io);
 
-            shutdownList(self.active.head, worker);
-            shutdownList(self.pending.head, worker);
+            shutdownList(io, self.active.head, worker);
+            shutdownList(io, self.pending.head, worker);
         }
 
         // This is sloppy and leaves things in an unrecoverable state. To keep
@@ -1289,12 +1321,12 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
         // but that does a bunch of things we don't need if we know that we're
         // shutting down - like returning data to the pools, and popping items
         // out of the list.
-        fn shutdownList(head: ?*HandlerConn(H), worker: anytype) void {
+        fn shutdownList(io: Io, head: ?*HandlerConn(H), worker: anytype) void {
             var next_node = head;
             while (next_node) |hc| {
                 if (comptime std.meta.hasFn(H, "close")) {
-                    hc.cleanup.lock();
-                    defer hc.cleanup.unlock();
+                    hc.cleanup.lockUncancelable(io);
+                    defer hc.cleanup.unlock(io);
                     if (hc.handler) |*h| {
                         h.close();
                         hc.handler = null;
@@ -1312,11 +1344,12 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
 
 // This is what actually gets exposed to the app
 pub const Conn = struct {
+    io: Io,
     _closed: bool,
     started: u32,
-    stream: net.Stream,
-    address: net.Address,
-    lock: Thread.Mutex = .{},
+    stream: Io.net.Stream,
+    address: posix.Address,
+    lock: Io.Mutex = .init,
     compression: ?*Conn.Compression = null,
 
     const Compression = struct {
@@ -1380,7 +1413,7 @@ pub const Conn = struct {
         buf[1] = @intCast(reason.len + 2);
         std.mem.writeInt(u16, buf[2..], opts.code, .big);
 
-        var vec = [2]std.posix.iovec_const{
+        var vec = [2]posix.iovec_const{
             .{ .len = buf.len, .base = &buf },
             .{ .len = reason.len, .base = reason.ptr },
         };
@@ -1418,16 +1451,17 @@ pub const Conn = struct {
         var buf: [10]u8 = undefined;
         const header = proto.writeFrameHeader(&buf, op_code, payload.len, compressed);
 
-        const stream = self.stream;
-
         if (payload.len == 0) {
+            const io = self.io;
+            var writer = self.stream.writer(io, &.{});
+
             // no body, just write the header
-            self.lock.lock();
-            defer self.lock.unlock();
-            return stream.writeAll(header);
+            self.lock.lockUncancelable(io);
+            defer self.lock.unlock(io);
+            return writer.interface.writeAll(header);
         }
 
-        var vec = [2]std.posix.iovec_const{
+        var vec = [2]posix.iovec_const{
             .{ .len = header.len, .base = header.ptr },
             .{ .len = payload.len, .base = payload.ptr },
         };
@@ -1436,20 +1470,24 @@ pub const Conn = struct {
     }
 
     pub fn writeFramed(self: *Conn, data: []const u8) !void {
-        self.lock.lock();
-        defer self.lock.unlock();
-        try self.stream.writeAll(data);
+        const io = self.io;
+        var writer = self.stream.writer(io, &.{});
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+
+        try writer.interface.writeAll(data);
     }
 
-    fn writeAllIOVec(self: *Conn, vec: []std.posix.iovec_const) !void {
-        const socket = self.stream.handle;
+    fn writeAllIOVec(self: *Conn, vec: []posix.iovec_const) !void {
+        const io = self.io;
+        const socket = self.stream.socket.handle;
 
-        self.lock.lock();
-        defer self.lock.unlock();
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
 
         var i: usize = 0;
         while (true) {
-            var n = try std.posix.writev(socket, vec[i..]);
+            var n = try posix.writev(socket, vec[i..]);
             while (n >= vec[i].len) {
                 n -= vec[i].len;
                 i += 1;
@@ -1475,7 +1513,7 @@ pub const Conn = struct {
 
     fn closeSocket(self: *Conn) void {
         if (@atomicRmw(bool, &self._closed, .Xchg, true, .monotonic) == false) {
-            posix.close(self.stream.handle);
+            posix.close(self.stream.socket.handle);
         }
     }
 
@@ -1532,7 +1570,7 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
 
     const n = posix.read(hc.socket, buf[len..]) catch |err| {
         switch (err) {
-            error.BrokenPipe, error.ConnectionResetByPeer => log.debug("({f}) handshake connection closed: {}", .{ conn.address, err }),
+            error.ConnectionResetByPeer => log.debug("({f}) handshake connection closed: {}", .{ conn.address, err }),
             error.WouldBlock => {
                 std.debug.assert(blockingMode());
                 log.debug("({f}) handshake timeout", .{conn.address});
@@ -1604,9 +1642,9 @@ fn handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator,
 fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator, fba: *FixedBufferAllocator) !bool {
     var conn = &hc.conn;
     var reader = &hc.reader.?;
-    reader.fill(conn.stream) catch |err| {
+    reader.fill(conn.stream.socket.handle) catch |err| {
         switch (err) {
-            error.BrokenPipe, error.Closed, error.ConnectionResetByPeer => log.debug("({f}) connection closed: {}", .{ conn.address, err }),
+            error.Closed, error.ConnectionResetByPeer => log.debug("({f}) connection closed: {}", .{ conn.address, err }),
             else => log.warn("({f}) error reading from connection: {}", .{ conn.address, err }),
         }
         return false;
@@ -1766,18 +1804,20 @@ fn buildError(comptime status: u16, comptime err: []const u8) []const u8 {
 }
 
 fn preHandOffWrite(conn: *Conn, response: []const u8) void {
+    const io = conn.io;
+
     // "preHandOff" means we haven't given the application handler a reference
     // to *Conn yet. In theory, this means we don't need to worry about thread-safety
     // However, it is possible for the worker to be stopped while we're doing this
     // which causes issues unless we lock
-    conn.lock.lock();
-    defer conn.lock.unlock();
+    conn.lock.lockUncancelable(io);
+    defer conn.lock.unlock(io);
 
     if (conn.isClosed()) {
         return;
     }
 
-    const socket = conn.stream.handle;
+    const socket = conn.stream.socket.handle;
     const timeout = std.mem.toBytes(posix.timeval{ .sec = 5, .usec = 0 });
     posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &timeout) catch return;
 
@@ -1792,12 +1832,8 @@ fn preHandOffWrite(conn: *Conn, response: []const u8) void {
     }
 }
 
-fn timestamp() u32 {
-    if (comptime @hasDecl(posix, "CLOCK") == false or posix.CLOCK == void) {
-        return @intCast(std.time.timestamp());
-    }
-    const ts = posix.clock_gettime(posix.CLOCK.REALTIME) catch unreachable;
-    return @intCast(ts.sec);
+fn timestamp(io: Io) u32 {
+    return @intCast(Io.Timestamp.now(io, .awake).toSeconds());
 }
 
 // intrusive doubly-linked list with count, not thread safe
@@ -1845,10 +1881,10 @@ const t = @import("../t.zig");
 
 var test_thread: Thread = undefined;
 var test_server: Server(TestHandler) = undefined;
-var global_test_allocator = std.heap.GeneralPurposeAllocator(.{}){};
+var global_test_allocator = std.heap.DebugAllocator(.{}){};
 
 test "tests:beforeAll" {
-    test_server = try Server(TestHandler).init(global_test_allocator.allocator(), .{
+    test_server = try Server(TestHandler).init(t.io, global_test_allocator.allocator(), .{
         .port = 9292,
         .address = "127.0.0.1",
     });
@@ -1859,18 +1895,21 @@ test "tests:afterAll" {
     test_server.stop();
     test_thread.join();
     test_server.deinit();
-    try t.expectEqual(false, global_test_allocator.detectLeaks());
+    try t.expectEqual(0, global_test_allocator.detectLeaks());
 }
 
 test "Server: invalid handshake" {
     const stream = try testStream(false);
-    defer stream.close();
+    defer stream.close(t.io);
 
-    try stream.writeAll("GET / HTTP/1.1\r\n\r\n");
+    var writer = stream.writer(t.io, &.{});
+    try writer.interface.writeAll("GET / HTTP/1.1\r\n\r\n");
+
     var buf: [1024]u8 = undefined;
+
     var pos: usize = 0;
     while (pos < buf.len) {
-        const n = try stream.read(buf[0..]);
+        const n = try posix.read(stream.socket.handle, buf[pos..]);
         if (n == 0) {
             break;
         }
@@ -1884,31 +1923,37 @@ test "Server: invalid handshake" {
 
 test "Server: read and write" {
     const stream = try testStream(true);
-    defer stream.close();
+    defer stream.close(t.io);
 
-    try stream.writeAll(&proto.frame(.text, "over"));
+    var writer = stream.writer(t.io, &.{});
+    try writer.interface.writeAll(&proto.frame(.text, "over"));
+
     var buf: [12]u8 = undefined;
-    _ = try stream.readAtLeast(&buf, 6);
+    _ = try posix.read(stream.socket.handle, &buf);
     try t.expectSlice(u8, &.{ 129, 4, '9', '0', '0', '0' }, buf[0..6]);
 }
 
 test "Server: clientMessage allocator" {
     const stream = try testStream(true);
-    defer stream.close();
+    defer stream.close(t.io);
 
-    try stream.writeAll(&proto.frame(.text, "dyn"));
+    var writer = stream.writer(t.io, &.{});
+    try writer.interface.writeAll(&proto.frame(.text, "dyn"));
+
     var buf: [12]u8 = undefined;
-    _ = try stream.readAtLeast(&buf, 12);
+    _ = try posix.read(stream.socket.handle, &buf);
     try t.expectSlice(u8, &.{ 129, 10, 'o', 'v', 'e', 'r', ' ', '9', '0', '0', '0', '!' }, buf[0..12]);
 }
 
 test "Server: clientMessage writer" {
     const stream = try testStream(true);
-    defer stream.close();
+    defer stream.close(t.io);
 
-    try stream.writeAll(&proto.frame(.text, "writer"));
+    var writer = stream.writer(t.io, &.{});
+    try writer.interface.writeAll(&proto.frame(.text, "writer"));
+
     var buf: [9]u8 = undefined;
-    _ = try stream.readAtLeast(&buf, 9);
+    _ = try posix.read(stream.socket.handle, &buf);
     try t.expectSlice(u8, &.{ 129, 7, '9', '0', '0', '0', '!', '!', '!' }, buf[0..9]);
 }
 
@@ -1917,9 +1962,11 @@ test "Server: clientMessage writer" {
 test "Server: dirty clientMessage allocator" {
     const stream = try testStream(true);
 
-    try stream.writeAll(&proto.frame(.text, "dyn"));
+    var writer = stream.writer(t.io, &.{});
+    try writer.interface.writeAll(&proto.frame(.text, "dyn"));
+
     var buf: [12]u8 = undefined;
-    _ = try stream.readAtLeast(&buf, 12);
+    _ = try posix.read(stream.socket.handle, &buf);
     try t.expectSlice(u8, &.{ 129, 10, 'o', 'v', 'e', 'r', ' ', '9', '0', '0', '0', '!' }, buf[0..12]);
 }
 
@@ -1927,50 +1974,65 @@ test "Conn: close" {
     {
         // plain close
         const stream = try testStream(true);
-        defer stream.close();
-        try stream.writeAll(&proto.frame(.text, "close1"));
+        defer stream.close(t.io);
+
+        var writer = stream.writer(t.io, &.{});
+        try writer.interface.writeAll(&proto.frame(.text, "close1"));
+
         var buf: [4]u8 = undefined;
-        _ = try stream.readAtLeast(&buf, 4);
+        var reader = stream.reader(t.io, &.{});
+        _ = try reader.interface.readSliceShort(&buf);
         try t.expectSlice(u8, &.{ 136, 2, 3, 232 }, buf[0..4]);
     }
 
     {
         // close with code
         const stream = try testStream(true);
-        defer stream.close();
-        try stream.writeAll(&proto.frame(.text, "close2"));
+        defer stream.close(t.io);
+        var writer = stream.writer(t.io, &.{});
+        try writer.interface.writeAll(&proto.frame(.text, "close2"));
+
         var buf: [4]u8 = undefined;
-        _ = try stream.readAtLeast(&buf, 4);
+        var reader = stream.reader(t.io, &.{});
+        _ = try reader.interface.readSliceShort(&buf);
         try t.expectSlice(u8, &.{ 136, 2, 0, 0x7b }, buf[0..4]);
     }
 
     {
         // close with reason
         const stream = try testStream(true);
-        defer stream.close();
-        try stream.writeAll(&proto.frame(.text, "close3"));
+        defer stream.close(t.io);
+        var writer = stream.writer(t.io, &.{});
+        try writer.interface.writeAll(&proto.frame(.text, "close3"));
+
         var buf: [7]u8 = undefined;
-        _ = try stream.readAtLeast(&buf, 7);
+        var reader = stream.reader(t.io, &.{});
+        _ = try reader.interface.readSliceShort(&buf);
         try t.expectSlice(u8, &.{ 136, 5, 0, 0xea, 'b', 'y', 'e' }, buf[0..7]);
     }
 }
 
-fn testStream(handshake: bool) !net.Stream {
-    const timeout = std.mem.toBytes(std.posix.timeval{ .sec = 0, .usec = 20_000 });
-    const address = try std.net.Address.parseIp("127.0.0.1", 9292);
-    const stream = try std.net.tcpConnectToAddress(address);
-    try std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &timeout);
-    try std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, &timeout);
+fn testStream(handshake: bool) !Io.net.Stream {
+    const address = try Io.net.IpAddress.parse("127.0.0.1", 9292);
+    const stream = try address.connect(t.io, .{ .mode = .stream });
+
+    const socket = stream.socket.handle;
+    const timeout = std.mem.toBytes(posix.timeval{ .sec = 0, .usec = 20_000 });
+    try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &timeout);
+    try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &timeout);
 
     if (handshake == false) {
         return stream;
     }
-
-    try stream.writeAll("GET / HTTP/1.1\r\ncontent-length: 0\r\nupgrade: websocket\r\nsec-websocket-version: 13\r\nconnection: upgrade\r\nsec-websocket-key: my-key\r\n\r\n");
     var buf: [1024]u8 = undefined;
+
+    var writer = stream.writer(t.io, &buf);
+    try writer.interface.writeAll("GET / HTTP/1.1\r\ncontent-length: 0\r\nupgrade: websocket\r\nsec-websocket-version: 13\r\nconnection: upgrade\r\nsec-websocket-key: my-key\r\n\r\n");
+    try writer.interface.flush();
+
     var pos: usize = 0;
     while (pos < buf.len) {
-        const n = try stream.read(buf[0..]);
+        const n = try posix.read(socket, buf[0..]);
         if (n == 0) break;
 
         pos += n;
