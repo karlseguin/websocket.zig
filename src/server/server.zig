@@ -642,7 +642,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
                         _ = try posix.fcntl(socket, posix.F.SETFL, flags & ~nonblocking);
                     }
                 }
-                const hc = try self.base.newConn(socket, address, now);
+                const hc = try self.base.newConn(socket, address.toIOAddress(), now);
                 self.loop.monitorRead(hc, false) catch |err| {
                     self.base.cleanupConn(hc);
                     return err;
@@ -766,7 +766,7 @@ fn NonBlockingBase(comptime H: type, comptime MANAGE_HS: bool) type {
             }
         }
 
-        fn newConn(self: *Self, socket: posix.socket_t, address: posix.Address, time: u32) !*HandlerConn(H) {
+        fn newConn(self: *Self, socket: posix.socket_t, address: Io.net.IpAddress, time: u32) !*HandlerConn(H) {
             return self.conn_manager.create(socket, address, time);
         }
 
@@ -1022,9 +1022,9 @@ pub fn Worker(comptime H: type) type {
         const Self = @This();
         const W = if (blockingMode()) Blocking(H) else NonBlockingBase(H, false);
 
-        pub fn init(allocator: Allocator, state: *WorkerState) !Self {
+        pub fn init(io: Io, allocator: Allocator, state: *WorkerState) !Self {
             return .{
-                .worker = try W.init(allocator, state),
+                .worker = try W.init(io, allocator, state),
             };
         }
 
@@ -1032,7 +1032,7 @@ pub fn Worker(comptime H: type) type {
             self.worker.deinit();
         }
 
-        pub fn createConn(self: *Self, socket: posix.socket_t, address: posix.Address, now: u32) !*HandlerConn(H) {
+        pub fn createConn(self: *Self, socket: posix.socket_t, address: Io.net.IpAddress, now: u32) !*HandlerConn(H) {
             return self.worker.conn_manager.create(socket, address, now);
         }
 
@@ -1178,11 +1178,9 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
             return self.active.len + self.pending.len;
         }
 
-        pub fn create(self: *Self, socket: posix.socket_t, address: posix.Address, now: u32) !*HandlerConn(H) {
+        pub fn create(self: *Self, socket: posix.socket_t, address: Io.net.IpAddress, now: u32) !*HandlerConn(H) {
             const io = self.io;
             errdefer posix.close(socket);
-
-            const ip_address = address.toIOAddress();
 
             self.lock.lockUncancelable(io);
             defer self.lock.unlock(io);
@@ -1200,7 +1198,7 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
                     ._closed = false,
                     .started = now,
                     .address = address,
-                    .stream = .{ .socket = .{ .handle = socket, .address = ip_address } },
+                    .stream = .{ .socket = .{ .handle = socket, .address = address } },
                     .compression = null,
                 },
             };
@@ -1348,7 +1346,7 @@ pub const Conn = struct {
     _closed: bool,
     started: u32,
     stream: Io.net.Stream,
-    address: posix.Address,
+    address: Io.net.IpAddress,
     lock: Io.Mutex = .init,
     compression: ?*Conn.Compression = null,
 
