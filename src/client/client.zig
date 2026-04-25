@@ -155,7 +155,7 @@ pub const Client = struct {
         // we might as well use it!
         const buf = self._reader.static;
         const key = blk: {
-            const bin_key = generateKey();
+            const bin_key = generateKey(self.io);
             var encoded_key: [24]u8 = undefined;
             break :blk std.base64.standard.Encoder.encode(&encoded_key, &bin_key);
         };
@@ -577,12 +577,12 @@ const TLSClient = struct {
     }
 };
 
-fn generateKey() [16]u8 {
+fn generateKey(io: Io) [16]u8 {
     if (comptime @import("builtin").is_test) {
         return [16]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
     }
     var key: [16]u8 = undefined;
-    std.crypto.random.bytes(&key);
+    io.random(&key);
     return key;
 }
 
