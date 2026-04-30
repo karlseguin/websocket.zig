@@ -441,7 +441,10 @@ pub const Stream = struct {
         if (self.tls_client) |tls_client| {
             var w: std.Io.Writer = .fixed(buf);
             while (true) {
-                const n = try tls_client.client.reader.stream(&w, .limited(buf.len));
+                const n = tls_client.client.reader.stream(&w, .limited(buf.len)) catch |e| {
+                    if (tls_client.stream_reader.getError()) |se| return se;
+                    return e;
+                };
                 if (n != 0) {
                     return n;
                 }
