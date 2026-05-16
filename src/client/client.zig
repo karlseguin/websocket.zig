@@ -86,7 +86,7 @@ pub const Client = struct {
         }
 
         const host_name = try Io.net.HostName.init(config.host);
-        const net_stream = try host_name.connect(io, config.port, .{.mode = .stream});
+        const net_stream = try host_name.connect(io, config.port, .{ .mode = .stream });
 
         var tls_client: ?*TLSClient = null;
         if (config.tls) {
@@ -416,9 +416,7 @@ pub const Stream = struct {
 
         if (self.tls_client) |tls_client| {
             // Shutdown the socket first, so readLoop() can exit, before tls_client's buffers are freed
-            if (native_os == .windows) {
-                _ = std.os.windows.ws2_32.shutdown(fd, std.os.windows.ws2_32.SD_BOTH);
-            } else if (native_os == .wasi and !builtin.link_libc) {
+            if (native_os == .wasi and !builtin.link_libc) {
                 _ = std.os.wasi.sock_shutdown(fd, .{ .WR = true, .RD = true });
             } else {
                 posix.shutdown(fd, .both) catch {};
@@ -662,9 +660,11 @@ const HandShakeReply = struct {
         var server_compression: bool = false;
 
         while (true) {
-            const n = stream.read(buf[pos..]) catch |err| switch (err) {
-                error.WouldBlock => return error.Timeout,
-                else => return err,
+            const n = stream.read(buf[pos..]) catch |err| {
+                // `error.WouldBlock` may not be in `err`'s set on Windows
+                // (where the read goes through ReadFile), so match by name.
+                if (std.mem.eql(u8, @errorName(err), "WouldBlock")) return error.Timeout;
+                return err;
             };
             if (n == 0) {
                 return error.ConnectionClosed;

@@ -1,6 +1,9 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const proto = @import("proto.zig");
 const posix = @import("posix.zig");
+
+const native_os = builtin.os.tag;
 
 const Io = std.Io;
 const ArrayList = std.ArrayList;
@@ -155,7 +158,7 @@ pub const SocketPair = struct {
         var address = posix.Address.parseIp("127.0.0.1", opts.port orelse 0) catch unreachable;
         var address_len = address.getOsSockLen();
 
-        const listener = posix.socket(address.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch unreachable;
+        const listener = posix.socket(address.any.family, posix.SOCK.STREAM | posix.CLOEXEC, posix.IPPROTO.TCP) catch unreachable;
         defer posix.close(listener);
 
         {
@@ -166,10 +169,15 @@ pub const SocketPair = struct {
         }
 
         const client = posix.socket(address.any.family, posix.SOCK.STREAM, posix.IPPROTO.TCP) catch unreachable;
-        {
+        if (native_os == .windows) {
+            // fcntl-based nonblocking toggling doesn't exist on Windows.
+            // This test helper isn't expected to run on Windows; we only
+            // need it to compile.
+            posix.connect(client, &address.any, address_len) catch unreachable;
+        } else {
             // connect the client
             const flags = posix.fcntl(client, posix.F.GETFL, 0) catch unreachable;
-            _ = posix.fcntl(client, posix.F.SETFL, flags | posix.SOCK.NONBLOCK) catch unreachable;
+            _ = posix.fcntl(client, posix.F.SETFL, flags | posix.NONBLOCK) catch unreachable;
             posix.connect(client, &address.any, address_len) catch |err| switch (err) {
                 error.WouldBlock => {},
                 else => unreachable,
@@ -177,7 +185,7 @@ pub const SocketPair = struct {
             _ = posix.fcntl(client, posix.F.SETFL, flags) catch unreachable;
         }
 
-        const server = posix.accept(listener, &address.any, &address_len, posix.SOCK.CLOEXEC) catch unreachable;
+        const server = posix.accept(listener, &address.any, &address_len, posix.CLOEXEC) catch unreachable;
 
         return .{
             .client = .{ .socket = .{ .handle = client, .address = .{ .ip4 = .{ .bytes = [4]u8{ 127, 0, 0, 1 }, .port = 0 } } } },

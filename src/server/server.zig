@@ -177,8 +177,8 @@ pub fn Server(comptime H: type) type {
             };
 
             const socket = blk: {
-                var sock_flags: u32 = posix.SOCK.STREAM | posix.SOCK.CLOEXEC;
-                if (blockingMode() == false) sock_flags |= posix.SOCK.NONBLOCK;
+                var sock_flags: u32 = posix.SOCK.STREAM | posix.CLOEXEC;
+                if (blockingMode() == false) sock_flags |= posix.NONBLOCK;
 
                 const socket_proto = if (address.any.family == posix.AF.UNIX) @as(u32, 0) else posix.IPPROTO.TCP;
                 break :blk try posix.socket(address.any.family, sock_flags, socket_proto);
@@ -211,14 +211,14 @@ pub fn Server(comptime H: type) type {
 
             if (comptime blockingMode()) {
                 errdefer posix.close(socket);
-                var w = try Blocking(H).init(self.allocator, &self._state);
+                var w = try Blocking(H).init(io, self.allocator, &self._state);
                 defer w.deinit();
 
                 const thrd = try std.Thread.spawn(.{}, Blocking(H).run, .{ &w, socket, ctx });
                 log.info("starting blocking worker to listen on {f}", .{address});
 
                 // incase listenInNewThread was used and is waiting for us to start
-                self._cond.signal();
+                self._cond.signal(io);
 
                 // this is what we'll shutdown when stop() is called
                 self._signals[0] = socket;
@@ -298,6 +298,7 @@ pub fn Server(comptime H: type) type {
 // This is our Blocking worker. It's very different than NonBlocking and much simpler.
 pub fn Blocking(comptime H: type) type {
     return struct {
+        io: Io,
         allocator: Allocator,
         handshake_timeout: Timeout,
         connection_buffer_size: usize,
@@ -330,6 +331,7 @@ pub fn Blocking(comptime H: type) type {
             errdefer conn_manager.deinit();
 
             return .{
+                .io = io,
                 .conn_manager = conn_manager,
                 .allocator = allocator,
                 .compression = config.compression,
@@ -349,7 +351,7 @@ pub fn Blocking(comptime H: type) type {
             while (true) {
                 var address: posix.Address = undefined;
                 var address_len: posix.socklen_t = @sizeOf(posix.Address);
-                const socket = posix.accept(listener, &address.any, &address_len, posix.SOCK.CLOEXEC) catch |err| {
+                const socket = posix.accept(listener, &address.any, &address_len, posix.CLOEXEC) catch |err| {
                     if (err == error.ConnectionAborted or err == error.SocketNotListening) {
                         log.info("received shutdown signal", .{});
                         return;
@@ -379,7 +381,7 @@ pub fn Blocking(comptime H: type) type {
         fn _handleConnection(self: *Self, socket: posix.socket_t, address: posix.Address, ctx: anytype) !void {
             const io = self.io;
             const conn_manager = &self.conn_manager;
-            const hc = try conn_manager.create(socket, address, timestamp(io));
+            const hc = try conn_manager.create(socket, address.toIOAddress(), timestamp(io));
 
             {
                 // Do our handshake
@@ -446,7 +448,7 @@ pub fn Blocking(comptime H: type) type {
                 if (conn_manager.count() == 0) {
                     return;
                 }
-                std.Thread.sleep(std.time.ns_per_ms * 100);
+                self.io.sleep(.fromMilliseconds(100), .awake) catch {};
             }
         }
 
@@ -621,7 +623,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
                 var address: posix.Address = undefined;
                 var address_len: posix.socklen_t = @sizeOf(posix.Address);
 
-                const socket = posix.accept(listener, &address.any, &address_len, posix.SOCK.CLOEXEC) catch |err| {
+                const socket = posix.accept(listener, &address.any, &address_len, posix.CLOEXEC) catch |err| {
                     // When available, we use SO_REUSEPORT_LB or SO_REUSEPORT, so WouldBlock
                     // should not be possible in those cases, but if it isn't available
                     // this error should be ignored as it means another thread picked it up.
@@ -1567,13 +1569,16 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
     }
 
     const n = posix.read(hc.socket, buf[len..]) catch |err| {
-        switch (err) {
-            error.ConnectionResetByPeer => log.debug("({f}) handshake connection closed: {}", .{ conn.address, err }),
-            error.WouldBlock => {
-                std.debug.assert(blockingMode());
-                log.debug("({f}) handshake timeout", .{conn.address});
-            },
-            else => log.warn("({f}) handshake error reading from socket: {}", .{ conn.address, err }),
+        if (err == error.ConnectionResetByPeer) {
+            log.debug("({f}) handshake connection closed: {}", .{ conn.address, err });
+        } else if (std.mem.eql(u8, @errorName(err), "WouldBlock")) {
+            // `error.WouldBlock` isn't in posix.read's error set on Windows,
+            // but we still want to recognize it on POSIX where it represents
+            // a handshake timeout.
+            std.debug.assert(blockingMode());
+            log.debug("({f}) handshake timeout", .{conn.address});
+        } else {
+            log.warn("({f}) handshake error reading from socket: {}", .{ conn.address, err });
         }
         return .{ false, false };
     };

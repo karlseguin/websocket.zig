@@ -1,8 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const windows = @import("windows.zig");
 
 const posix = std.posix;
-const windows = std.io.windows;
 pub const system = posix.system;
 
 pub const O = system.O;
@@ -22,12 +22,18 @@ pub const Kevent = system.Kevent;
 
 const native_os = builtin.os.tag;
 
+/// WARNING: this flag is not supported by windows socket functions directly,
+///          it is only supported by std.os.socket. Be sure that this value does
+///          not share any bits with any of the `SOCK` values.
+pub const CLOEXEC = if (native_os == .windows) 0x10000 else SOCK.CLOEXEC;
+pub const NONBLOCK = if (native_os == .windows) 0x20000 else SOCK.NONBLOCK;
+
 pub fn socket(domain: u32, socket_type: u32, protocol: u32) !socket_t {
     if (native_os == .windows) {
         // These flags are not actually part of the Windows API, instead they are converted here for compatibility
-        const filtered_sock_type = socket_type & ~@as(u32, SOCK.NONBLOCK | SOCK.CLOEXEC);
+        const filtered_sock_type = socket_type & ~@as(u32, NONBLOCK | CLOEXEC);
         var flags: u32 = windows.ws2_32.WSA_FLAG_OVERLAPPED;
-        if ((socket_type & SOCK.CLOEXEC) != 0) flags |= windows.ws2_32.WSA_FLAG_NO_HANDLE_INHERIT;
+        if ((socket_type & CLOEXEC) != 0) flags |= windows.ws2_32.WSA_FLAG_NO_HANDLE_INHERIT;
 
         const rc = try windows.WSASocketW(
             @bitCast(domain),
@@ -38,7 +44,7 @@ pub fn socket(domain: u32, socket_type: u32, protocol: u32) !socket_t {
             flags,
         );
         errdefer windows.closesocket(rc) catch unreachable;
-        if ((socket_type & SOCK.NONBLOCK) != 0) {
+        if ((socket_type & NONBLOCK) != 0) {
             var mode: c_ulong = 1; // nonblocking
             if (windows.ws2_32.SOCKET_ERROR == windows.ws2_32.ioctlsocket(rc, windows.ws2_32.FIONBIO, &mode)) {
                 switch (windows.ws2_32.WSAGetLastError()) {
@@ -52,7 +58,7 @@ pub fn socket(domain: u32, socket_type: u32, protocol: u32) !socket_t {
 
     const have_sock_flags = !builtin.target.os.tag.isDarwin() and native_os != .haiku;
     const filtered_sock_type = if (!have_sock_flags)
-        socket_type & ~@as(u32, SOCK.NONBLOCK | SOCK.CLOEXEC)
+        socket_type & ~@as(u32, NONBLOCK | CLOEXEC)
     else
         socket_type;
     const rc = posix.system.socket(domain, filtered_sock_type, protocol);
@@ -79,7 +85,7 @@ pub fn socket(domain: u32, socket_type: u32, protocol: u32) !socket_t {
 }
 
 fn setSockFlags(sock: socket_t, flags: u32) !void {
-    if ((flags & SOCK.CLOEXEC) != 0) {
+    if ((flags & CLOEXEC) != 0) {
         if (native_os == .windows) {
             // TODO: Find out if this is supported for sockets
         } else {
@@ -102,7 +108,7 @@ fn setSockFlags(sock: socket_t, flags: u32) !void {
             };
         }
     }
-    if ((flags & SOCK.NONBLOCK) != 0) {
+    if ((flags & NONBLOCK) != 0) {
         if (native_os == .windows) {
             var mode: c_ulong = 1;
             if (windows.ws2_32.ioctlsocket(sock, windows.ws2_32.FIONBIO, &mode) == windows.ws2_32.SOCKET_ERROR) {
@@ -158,7 +164,7 @@ pub fn fcntl(fd: fd_t, cmd: i32, arg: usize) !usize {
 
 pub fn close(fd: fd_t) void {
     if (native_os == .windows) {
-        return windows.CloseHandle(fd);
+        return windows.std_windows.CloseHandle(fd);
     }
     switch (posix.errno(system.close(fd))) {
         .BADF => unreachable, // Always a race condition.
@@ -676,12 +682,12 @@ pub fn accept(
     /// * `SOCK.NONBLOCK` - Set the `NONBLOCK` file status flag on the open file description (see `open`)
     ///   referred  to by the new file descriptor.  Using this flag saves extra calls to `fcntl` to achieve
     ///   the same result.
-    /// * `SOCK.CLOEXEC`  - Set the close-on-exec (`FD_CLOEXEC`) flag on the new file descriptor.   See  the
+    /// * `CLOEXEC`  - Set the close-on-exec (`FD_CLOEXEC`) flag on the new file descriptor.   See  the
     ///   description  of the `CLOEXEC` flag in `open` for reasons why this may be useful.
     flags: u32,
 ) !socket_t {
     const have_accept4 = !(builtin.target.os.tag.isDarwin() or native_os == .windows or native_os == .haiku);
-    std.debug.assert(0 == (flags & ~@as(u32, SOCK.NONBLOCK | SOCK.CLOEXEC))); // Unsupported flag(s)
+    std.debug.assert(0 == (flags & ~@as(u32, NONBLOCK | CLOEXEC))); // Unsupported flag(s)
 
     const accepted_sock: socket_t = while (true) {
         const rc = if (have_accept4)

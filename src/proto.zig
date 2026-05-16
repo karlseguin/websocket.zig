@@ -142,6 +142,10 @@ pub const Reader = struct {
         ProcessNotFound,
         ConnectionTimedOut,
         SocketNotConnected,
+        // Windows ReadFile error set additions
+        AccessDenied,
+        LockViolation,
+        OperationAborted,
     };
     pub fn fill(self: *Reader, source: anytype) FillError!void {
         const pos = self.pos;
