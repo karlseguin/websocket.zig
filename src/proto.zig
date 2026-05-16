@@ -146,6 +146,8 @@ pub const Reader = struct {
         AccessDenied,
         LockViolation,
         OperationAborted,
+        // Windows recv (ws2_32) addition
+        NetworkSubsystemFailed,
     };
     pub fn fill(self: *Reader, source: anytype) FillError!void {
         const pos = self.pos;
