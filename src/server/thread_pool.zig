@@ -15,8 +15,8 @@ pub fn ThreadPool(comptime F: anytype) type {
     // So F would be: handle(server: *Server, conn: *Conn, buf: []u8)
     // and FullArgs would be our 3 args....
     const FullArgs = std.meta.ArgsTuple(@TypeOf(F));
-    const full_fields = std.meta.fields(FullArgs);
-    const ARG_COUNT = full_fields.len - 1;
+    const full_field_types = std.meta.fieldTypes(FullArgs);
+    const ARG_COUNT = full_field_types.len - 1;
 
     // Args will be FullArgs[0..len-1], so in the above example, args would be
     // (*Server, *Conn)
@@ -29,8 +29,8 @@ pub fn ThreadPool(comptime F: anytype) type {
     // that we control.
 
     var field_types: [ARG_COUNT]type = undefined;
-    inline for (full_fields[0..ARG_COUNT], 0..) |field, index| {
-        field_types[index] = field.type;
+    inline for (full_field_types[0..ARG_COUNT], 0..) |field_type, index| {
+        field_types[index] = field_type;
     }
 
     const Args = @Tuple(&field_types);

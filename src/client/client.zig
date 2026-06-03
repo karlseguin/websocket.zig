@@ -212,7 +212,7 @@ pub const Client = struct {
 
             switch (message_type) {
                 .text, .binary => {
-                    switch (comptime @typeInfo(@TypeOf(Handler.serverMessage)).@"fn".params.len) {
+                    switch (comptime @typeInfo(@TypeOf(Handler.serverMessage)).@"fn".param_types.len) {
                         2 => try handler.serverMessage(message.data),
                         3 => try handler.serverMessage(message.data, if (message_type == .text) .text else .binary),
                         else => @compileError(@typeName(Handler) ++ ".serverMessage must accept 2 or 3 parameters"),
