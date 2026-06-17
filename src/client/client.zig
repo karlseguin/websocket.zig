@@ -286,7 +286,7 @@ pub const Client = struct {
         return self.stream.writeTimeout(ms);
     }
 
-    pub fn readTimeout(self: *const Client, ms: u32) !void {
+    pub fn readTimeout(self: *Client, ms: u32) !void {
         return self.stream.readTimeout(ms);
     }
 
@@ -400,6 +400,7 @@ pub const Stream = struct {
     io: Io,
     stream: Io.net.Stream,
     tls_client: ?*TLSClient = null,
+    read_timeout_ms: u32 = 0,
 
     pub fn init(io: Io, stream: Io.net.Stream, tls_client: ?*TLSClient) Stream {
         return .{
@@ -441,6 +442,23 @@ pub const Stream = struct {
     }
 
     pub fn read(self: *Stream, buf: []u8) !usize {
+        // A read timeout is implemented by polling the socket for readiness
+        // rather than SO_RCVTIMEO. On the TLS path the underlying read goes
+        // through std.crypto.tls, whose reader treats a socket EAGAIN (what
+        // SO_RCVTIMEO produces on timeout) as a programmer bug and panics in
+        // debug builds. Polling lets a timeout surface as error.WouldBlock (which
+        // read() turns into "no message") without ever issuing a read that could
+        // EAGAIN. The caller drains its buffer before reaching here, so polling
+        // only gates an actual socket read.
+        if (self.read_timeout_ms > 0) {
+            var pfd = [_]std.posix.pollfd{.{
+                .fd = self.stream.socket.handle,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            const ready = std.posix.poll(&pfd, @intCast(self.read_timeout_ms)) catch 0;
+            if (ready == 0) return error.WouldBlock;
+        }
         if (self.tls_client) |tls_client| {
             var w: std.Io.Writer = .fixed(buf);
             while (true) {
@@ -473,8 +491,10 @@ pub const Stream = struct {
         return self.setTimeout(posix.SO.SNDTIMEO, ms);
     }
 
-    pub fn readTimeout(self: *const Stream, ms: u32) !void {
-        return self.setTimeout(posix.SO.RCVTIMEO, ms);
+    pub fn readTimeout(self: *Stream, ms: u32) !void {
+        // Stored and applied via poll() in read(); see the note there for why this
+        // does not use SO_RCVTIMEO.
+        self.read_timeout_ms = ms;
     }
 
     fn setTimeout(self: *const Stream, opt_name: u32, ms: u32) !void {
