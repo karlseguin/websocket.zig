@@ -654,4 +654,4 @@ var client = try websocket.connect(allocator, "localhost", 9001, .{
 });
 ```
 
-This allows each client to have a reasonable `buffer_size` that can accomodate most messages, while having an efficient fallback for the occasional large message. When `max_size` is greater than the large buffer pool size (32K in the above example) or when all pooled buffers are used, a dynamic buffer is created.
+This allows each client to have a reasonable `buffer_size` that can accommodate most messages, while having an efficient fallback for the occasional large message. When `max_size` is greater than the large buffer pool size (32K in the above example) or when all pooled buffers are used, a dynamic buffer is created.
