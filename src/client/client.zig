@@ -448,15 +448,22 @@ pub const Stream = struct {
         // SO_RCVTIMEO produces on timeout) as a programmer bug and panics in
         // debug builds. Polling lets a timeout surface as error.WouldBlock (which
         // read() turns into "no message") without ever issuing a read that could
-        // EAGAIN. The caller drains its buffer before reaching here, so polling
-        // only gates an actual socket read.
-        if (self.read_timeout_ms > 0) {
+        // EAGAIN.
+        //
+        // Skip the poll when the TLS client already has decrypted plaintext
+        // buffered: a previous read can decrypt more than the caller consumed, so
+        // the socket can be empty (poll would time out) even though data is
+        // available in-process, which would starve it.
+        const tls_buffered = if (self.tls_client) |tls_client| tls_client.client.reader.bufferedLen() else 0;
+        if (self.read_timeout_ms > 0 and tls_buffered == 0) {
             var pfd = [_]std.posix.pollfd{.{
                 .fd = self.stream.socket.handle,
                 .events = std.posix.POLL.IN,
                 .revents = 0,
             }};
-            const ready = std.posix.poll(&pfd, @intCast(self.read_timeout_ms)) catch 0;
+            // A poll failure is a real read failure, not "no data": surface it
+            // (mapped into this read path's error set) rather than swallowing it.
+            const ready = std.posix.poll(&pfd, @intCast(self.read_timeout_ms)) catch return error.ReadFailed;
             if (ready == 0) return error.WouldBlock;
         }
         if (self.tls_client) |tls_client| {
