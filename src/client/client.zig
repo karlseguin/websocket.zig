@@ -477,7 +477,10 @@ pub const Stream = struct {
         }
         if (comptime @import("builtin").os.tag == .windows) {
             var data = [_][]u8{buf};
-            return self.io.vtable.netRead(self.io.userdata, self.stream.socket.handle, &data);
+            // netRead returns net.Stream.Reader.Error which includes Timeout,
+            // SocketUnconnected, NetworkDown, etc. – map all to ReadFailed
+            // to keep the inferred error set compatible with callers.
+            return self.io.vtable.netRead(self.io.userdata, self.stream.socket.handle, &data) catch return error.ReadFailed;
         }
         return posix.read(self.stream.socket.handle, buf);
     }
