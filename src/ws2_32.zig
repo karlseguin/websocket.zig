@@ -163,30 +163,6 @@ pub extern "ws2_32" fn send(
     flags: u32,
 ) callconv(.winapi) i32;
 
-pub const WSAPOLLFD = extern struct {
-    fd: usize,
-    events: i16,
-    revents: i16,
-};
-
-pub const POLL = struct {
-    pub const IN = 0x001;
-    pub const PRI = 0x002;
-    pub const OUT = 0x004;
-    pub const ERR = 0x001;
-    pub const HUP = 0x002;
-    pub const NVAL = 0x004;
-    pub const RDNORM = 0x040;
-    pub const RDBAND = 0x080;
-    pub const WRBAND = 0x100;
-};
-
-pub extern "ws2_32" fn WSAPoll(
-    fdArray: [*]WSAPOLLFD,
-    fds: c_ulong,
-    timeout: c_int,
-) callconv(.winapi) c_int;
-
 // https://docs.microsoft.com/en-au/windows/win32/winsock/windows-sockets-error-codes-2
 pub const WinsockError = enum(u16) {
     /// Specified event object handle is invalid.

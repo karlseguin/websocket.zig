@@ -178,6 +178,8 @@ pub fn close(fd: fd_t) void {
 
 pub fn setsockopt(fd: socket_t, level: i32, optname: u32, opt: []const u8) !void {
     if (native_os == .windows) {
+        // Winsock takes SO_RCVTIMEO/SO_SNDTIMEO as a DWORD of milliseconds,
+        // not a struct timeval. Translate so callers can stay portable.
         var ms_buf: u32 = 0;
         var opt_ptr: [*]const u8 = opt.ptr;
         var opt_len: i32 = @intCast(opt.len);
@@ -214,8 +216,9 @@ pub fn setsockopt(fd: socket_t, level: i32, optname: u32, opt: []const u8) !void
                 0,
             );
             if (status == .SUCCESS) return;
-            if (status == .NOT_SUPPORTED) return; // Io handles timeouts internally
-            if (status != .OBJECT_TYPE_MISMATCH) {
+            if (status == .NOT_SUPPORTED or status == .OBJECT_TYPE_MISMATCH) {
+                // Not an AFD handle, or option unsupported — try Winsock.
+            } else {
                 switch (status) {
                     .INSUFFICIENT_RESOURCES => return error.SystemResources,
                     .INVALID_PARAMETER => return error.SocketNotBound,
@@ -230,7 +233,9 @@ pub fn setsockopt(fd: socket_t, level: i32, optname: u32, opt: []const u8) !void
                     .WSANOTINITIALISED => unreachable,
                     .WSAENETDOWN => return error.NetworkSubsystemFailed,
                     .WSAEFAULT => unreachable,
-                    .WSAENOTSOCK => return error.FileDescriptorNotASocket,
+                    // AFD handle that genuinely does not support this option
+                    // (e.g. RCVTIMEO — Io manages timeouts internally).
+                    .WSAENOTSOCK => return,
                     .WSAEINVAL => return error.SocketNotBound,
                     else => |err| return windows.unexpectedWSAError(err),
                 }

@@ -462,6 +462,8 @@ pub const Stream = struct {
                     .events = std.posix.POLL.IN,
                     .revents = 0,
                 }};
+                // A poll failure is a real read failure, not "no data": surface it
+                // (mapped into this read path's error set) rather than swallowing it.
                 const ready = std.posix.poll(&pfd, @intCast(self.read_timeout_ms)) catch return error.ReadFailed;
                 if (ready == 0) return error.WouldBlock;
             }
