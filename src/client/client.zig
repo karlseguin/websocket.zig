@@ -442,35 +442,16 @@ pub const Stream = struct {
     }
 
     pub fn read(self: *Stream, buf: []u8) !usize {
-        // A read timeout is implemented by polling the socket for readiness
-        // rather than SO_RCVTIMEO. On the TLS path the underlying read goes
-        // through std.crypto.tls, whose reader treats a socket EAGAIN (what
-        // SO_RCVTIMEO produces on timeout) as a programmer bug and panics in
-        // debug builds. Polling lets a timeout surface as error.WouldBlock (which
-        // read() turns into "no message") without ever issuing a read that could
-        // EAGAIN.
-        //
-        // Skip the poll when the TLS client already has decrypted plaintext
-        // buffered: a previous read can decrypt more than the caller consumed, so
-        // the socket can be empty (poll would time out) even though data is
-        // available in-process, which would starve it.
-        const tls_buffered = if (self.tls_client) |tls_client| tls_client.client.reader.bufferedLen() else 0;
-        if (comptime @import("builtin").os.tag != .windows) {
-            if (self.read_timeout_ms > 0 and tls_buffered == 0) {
-                var pfd = [_]std.posix.pollfd{.{
-                    .fd = self.stream.socket.handle,
-                    .events = std.posix.POLL.IN,
-                    .revents = 0,
-                }};
-                // A poll failure is a real read failure, not "no data": surface it
-                // (mapped into this read path's error set) rather than swallowing it.
-                const ready = std.posix.poll(&pfd, @intCast(self.read_timeout_ms)) catch return error.ReadFailed;
-                if (ready == 0) return error.WouldBlock;
-            }
-        }
         if (self.tls_client) |tls_client| {
             var w: std.Io.Writer = .fixed(buf);
             while (true) {
+                // The TLS reader decrypts into its own buffer; stream() returns
+                // >0 only once that buffer holds plaintext. A single stream()
+                // will often (typically?) returns 0 without yielding a plaintext
+                // message. We have to loop until we get a visible message..
+                if (tls_client.client.reader.bufferedLen() == 0 and !try self.pollReadable()) {
+                    return error.WouldBlock;
+                }
                 const n = try tls_client.client.reader.stream(&w, .limited(buf.len));
                 if (n != 0) {
                     return n;
@@ -487,7 +468,28 @@ pub const Stream = struct {
                 else => return error.ReadFailed,
             };
         }
+        if (!try self.pollReadable()) {
+            return error.WouldBlock;
+        }
         return posix.read(self.stream.socket.handle, buf);
+    }
+
+    fn pollReadable(self: *Stream) !bool {
+        if (comptime @import("builtin").os.tag == .windows) {
+            return true;
+        }
+        if (self.read_timeout_ms == 0) {
+            return true;
+        }
+        var pfd = [_]std.posix.pollfd{.{
+            .fd = self.stream.socket.handle,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        // A poll failure is a real read failure, not "no data": surface it
+        // (mapped into this read path's error set) rather than swallowing it.
+        const ready = std.posix.poll(&pfd, @intCast(self.read_timeout_ms)) catch return error.ReadFailed;
+        return ready != 0;
     }
 
     pub fn writeAll(self: *Stream, data: []const u8) !void {
