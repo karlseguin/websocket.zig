@@ -449,7 +449,7 @@ pub const Stream = struct {
                 // >0 only once that buffer holds plaintext. A single stream()
                 // will often (typically?) returns 0 without yielding a plaintext
                 // message. We have to loop until we get a visible message..
-                if (tls_client.client.reader.bufferedLen() == 0 and !try self.pollReadable()) {
+                if (tls_client.client.reader.bufferedLen() == 0 and !hasBufferedTlsRecord(tls_client.client.input) and !try self.pollReadable()) {
                     return error.WouldBlock;
                 }
                 const n = try tls_client.client.reader.stream(&w, .limited(buf.len));
@@ -472,6 +472,22 @@ pub const Stream = struct {
             return error.WouldBlock;
         }
         return posix.read(self.stream.socket.handle, buf);
+    }
+
+    // Ciphertext already drained off the socket sits in
+    // tls_client.client.input, invisible to poll(). If a complete
+    // record is buffered there, stream() can decrypt it without
+    // touching the socket, so we must not poll (the socket may
+    // legitimately be empty). But a *partial* record makes stream()
+    // do a blocking socket read to complete it, so in that case we
+    // still poll to honor the read timeout.
+    fn hasBufferedTlsRecord(input: *std.Io.Reader) bool {
+        const buffered = input.buffered();
+        if (buffered.len < std.crypto.tls.record_header_len) {
+            return false;
+        }
+        const record_len = std.mem.readInt(u16, buffered[3..5], .big);
+        return buffered.len >= std.crypto.tls.record_header_len + record_len;
     }
 
     fn pollReadable(self: *Stream) !bool {
