@@ -1191,6 +1191,24 @@ test "Client: handshake" {
     }
 }
 
+test "connectTimeout: refused connect is not reported as a timeout" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    // Nothing listens on loopback port 1, so connect() is refused immediately.
+    // The refusal arrives via SO_ERROR after poll() reports the socket writable,
+    // and must be reported as ConnectFailed, not ConnectTimeout.
+    try t.expectError(error.ConnectFailed, connectTimeout(t.io, "127.0.0.1", 1, 1000));
+
+    // 0 disables the bound (matching readTimeout(0)) rather than expiring
+    // instantly. It must still fail here, but never with ConnectTimeout.
+    if (connectTimeout(t.io, "127.0.0.1", 1, 0)) |stream| {
+        stream.close(t.io);
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try t.expectEqual(false, err == error.ConnectTimeout);
+    }
+}
+
 test "Client: write/read" {
     var client = try Client.init(t.io, t.allocator, .{
         .port = 9292,
