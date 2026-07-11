@@ -680,9 +680,14 @@ pub const Stream = struct {
             .events = std.posix.POLL.IN,
             .revents = 0,
         }};
+        // poll()'s timeout is a signed c_int. Clamp rather than cast: a timeout
+        // above INT_MAX panics in safe builds, and in ReleaseFast wraps to a
+        // negative value, which makes poll() block forever and silently defeats
+        // the timeout it is implementing.
+        const poll_ms: i32 = @intCast(@min(self.read_timeout_ms, @as(u32, std.math.maxInt(i32))));
         // A poll failure is a real read failure, not "no data": surface it
         // (mapped into this read path's error set) rather than swallowing it.
-        const ready = std.posix.poll(&pfd, @intCast(self.read_timeout_ms)) catch return error.ReadFailed;
+        const ready = std.posix.poll(&pfd, poll_ms) catch return error.ReadFailed;
         return ready != 0;
     }
 
