@@ -643,7 +643,7 @@ pub const Stream = struct {
                 // >0 only once that buffer holds plaintext. A single stream()
                 // will often (typically?) returns 0 without yielding a plaintext
                 // message. We have to loop until we get a visible message..
-                if (tls_client.client.reader.bufferedLen() == 0 and !try self.pollReadable()) {
+                if (tls_client.client.reader.bufferedLen() == 0 and tls_client.stream_reader.interface.bufferedLen() == 0 and !try self.pollReadable()) {
                     return error.WouldBlock;
                 }
                 const n = try tls_client.client.reader.stream(&w, .limited(buf.len));
