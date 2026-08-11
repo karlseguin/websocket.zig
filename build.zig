@@ -20,7 +20,6 @@ pub fn build(b: *std.Build) !void {
     {
         // run tests
         const tests = b.addTest(.{
-            .use_llvm = true,
             .root_module = websocket_module,
             .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
         });
