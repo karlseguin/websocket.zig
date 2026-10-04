@@ -1,10 +1,5 @@
-# A zig websocket server.
-The master branch targets the latest stable of Zig (0.15.1). The dev branch targets the latest version of Zig. If you're looking for an older version, look for an zig-X.YZ branches.
-
 ## Zig Version
-This is for Zig 0.16.0. Use the [zig-0.15.2](https://github.com/karlseguin/websocket.zig/tree/zig-0.15) branch for Zig 0.15 or the [dev](https://github.com/karlseguin/websocket.zig/tree/dev) which may or may not be up to date with zig dev.
-
-This ZIG 0.16 version is not well tested. Like Zig 0.16 itself, consider this experimental!
+This is for Zig 0.17.0. See the branches for other versions.
 
 Skip to the [client section](#client).
 
