@@ -79,7 +79,7 @@ pub const Handshake = struct {
                 .connection => {
                     // find if connection header has upgrade in it, example header:
                     // Connection: keep-alive, Upgrade
-                    if (std.ascii.indexOfIgnoreCase(value, "upgrade") == null) {
+                    if (std.ascii.findIgnoreCase(value, "upgrade") == null) {
                         return error.InvalidConnection;
                     }
                     required_headers |= 4;

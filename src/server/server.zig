@@ -1676,7 +1676,7 @@ fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator
         log.debug("({f}) received {s} message", .{ hc.conn.address, @tagName(message_type) });
         switch (message_type) {
             .text, .binary => {
-                const params = @typeInfo(@TypeOf(H.clientMessage)).@"fn".params;
+                const params = @typeInfo(@TypeOf(H.clientMessage)).@"fn".param_types;
                 const needs_allocator = comptime needsAllocator(H);
 
                 var arena: std.heap.ArenaAllocator = undefined;
@@ -1780,8 +1780,8 @@ fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator
 }
 
 fn needsAllocator(comptime H: type) bool {
-    const params = @typeInfo(@TypeOf(H.clientMessage)).@"fn".params;
-    return comptime params[1].type == Allocator;
+    const params = @typeInfo(@TypeOf(H.clientMessage)).@"fn".param_types;
+    return comptime params[1] == Allocator;
 }
 
 fn respondToHandshakeError(conn: *Conn, err: anyerror) void {
