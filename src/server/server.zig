@@ -29,10 +29,10 @@ const DEFAULT_MAX_CONN = 16_384;
 const DEFAULT_BUFFER_SIZE = 2048;
 const DEFAULT_MAX_MESSAGE_SIZE = 65_536;
 
-const EMPTY_PONG = ([2]u8{ @intFromEnum(OpCode.pong), 0 })[0..];
+const EMPTY_PONG = ([2]u8{ @backingInt(OpCode.pong), 0 })[0..];
 // CLOSE, 2 length, code
-const CLOSE_NORMAL = ([_]u8{ @intFromEnum(OpCode.close), 2, 3, 232 })[0..]; // code: 1000
-const CLOSE_PROTOCOL_ERROR = ([_]u8{ @intFromEnum(OpCode.close), 2, 3, 234 })[0..]; //code: 1002
+const CLOSE_NORMAL = ([_]u8{ @backingInt(OpCode.close), 2, 3, 232 })[0..]; // code: 1000
+const CLOSE_PROTOCOL_ERROR = ([_]u8{ @backingInt(OpCode.close), 2, 3, 234 })[0..]; //code: 1002
 
 const force_blocking: bool = blk: {
     const build = @import("build");
@@ -1457,7 +1457,7 @@ pub const Conn = struct {
         }
 
         var buf: [4]u8 = undefined;
-        buf[0] = @intFromEnum(OpCode.close);
+        buf[0] = @backingInt(OpCode.close);
         buf[1] = @intCast(reason.len + 2);
         std.mem.writeInt(u16, buf[2..], opts.code, .big);
 
@@ -1662,7 +1662,7 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
     try conn.writeFramed(handshake_reply);
 
     if (comptime std.meta.hasFn(H, "afterInit")) {
-        const params = @typeInfo(@TypeOf(H.afterInit)).@"fn".params;
+        const params = @typeInfo(@TypeOf(H.afterInit)).@"fn".param_types;
         const res = if (params.len == 1) hc.handler.?.afterInit() else hc.handler.?.afterInit(ctx);
         res catch |err| {
             log.debug("({f}) " ++ @typeName(H) ++ ".afterInit error: {}", .{ conn.address, err });
@@ -1716,7 +1716,7 @@ fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator
         log.debug("({f}) received {s} message", .{ hc.conn.address, @tagName(message_type) });
         switch (message_type) {
             .text, .binary => {
-                const params = @typeInfo(@TypeOf(H.clientMessage)).@"fn".params;
+                const params = @typeInfo(@TypeOf(H.clientMessage)).@"fn".param_types;
                 const needs_allocator = comptime needsAllocator(H);
 
                 var arena: std.heap.ArenaAllocator = undefined;
@@ -1820,8 +1820,8 @@ fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator
 }
 
 fn needsAllocator(comptime H: type) bool {
-    const params = @typeInfo(@TypeOf(H.clientMessage)).@"fn".params;
-    return comptime params[1].type == Allocator;
+    const params = @typeInfo(@TypeOf(H.clientMessage)).@"fn".param_types;
+    return comptime params[1] == Allocator;
 }
 
 fn respondToHandshakeError(conn: *Conn, err: anyerror) void {
