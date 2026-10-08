@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository Overview
 
-`webzocket` is a Zig WebSocket library (server + client), exposed as a single module named `webzocket` (root: `src/websocket.zig`). It is a fork of `karlseguin/websocket.zig` renamed for use as a Zig package dependency. Zig version: **0.15.2** (see `build.zig.zon`, `minimum_zig_version`). No external dependencies.
+`webzocket` is a Zig WebSocket library (server + client), exposed as a single module named `webzocket` (root: `src/websocket.zig`). It is a fork of `karlseguin/websocket.zig` renamed for use as a Zig package dependency. Zig version: **0.17.0** (see `build.zig.zon`, `minimum_zig_version`). No external dependencies.
 
 ## Common Commands
 

@@ -518,7 +518,7 @@ pub fn frame(op_code: OpCode, comptime msg: []const u8) [calculateFrameLen(msg)]
 }
 
 pub fn writeFrameHeader(buf: []u8, op_code: OpCode, l: usize, compressed: bool) []u8 {
-    buf[0] = @intFromEnum(op_code);
+    buf[0] = @backingInt(op_code);
     if (compressed) {
         buf[0] |= 64;
     }

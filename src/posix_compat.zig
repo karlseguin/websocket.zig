@@ -244,7 +244,7 @@ pub fn accept(sock: socket_t, addr: ?*sockaddr, addr_size: ?*socklen_t, flags: u
             const rc_signed: isize = @intCast(rc);
             if (rc_signed < 0) {
                 const wsa_err = WSAGetLastError();
-                return switch (@as(WSAError, @enumFromInt(wsa_err))) {
+                return switch (@as(WSAError, @fromBackingInt(@intCast(wsa_err)))) {
                     .WSAEINTR => continue, // interrupted; retry
                     .WSAEWOULDBLOCK => error.WouldBlock,
                     .WSAECONNABORTED, .WSAECONNRESET => error.ConnectionAborted,
@@ -338,7 +338,7 @@ pub const ShutdownHow = enum(c_int) {
 };
 
 pub fn shutdown(sock: socket_t, how: ShutdownHow) ShutdownError!void {
-    const rc = system.shutdown(sock, @intFromEnum(how));
+    const rc = system.shutdown(sock, @backingInt(how));
     switch (errno(rc)) {
         .SUCCESS => return,
         .BADF, .NOTSOCK => return error.FileDescriptorNotASocket,
@@ -367,7 +367,7 @@ pub fn write(fd: fd_t, buf: []const u8) WriteError!usize {
         // set POSIX errno — translate WSA errors directly.
         const rc = system.send(fd, buf.ptr, buf.len, 0);
         if (rc >= 0) return @intCast(rc);
-        return switch (@as(WSAError, @enumFromInt(WSAGetLastError()))) {
+        return switch (@as(WSAError, @fromBackingInt(@intCast(WSAGetLastError())))) {
             .WSAEWOULDBLOCK => error.WouldBlock,
             .WSAECONNRESET => error.ConnectionResetByPeer,
             .WSAEPIPE => error.BrokenPipe,
@@ -691,7 +691,7 @@ pub fn readFd(fd: fd_t, buf: []u8) ReadError!usize {
         if (rc >= 0) return @intCast(rc);
         // rc == -1 (SOCKET_ERROR): translate WSA error to our error set.
         const wsa_err = WSAGetLastError();
-        return switch (@as(WSAError, @enumFromInt(wsa_err))) {
+        return switch (@as(WSAError, @fromBackingInt(@intCast(wsa_err)))) {
             .WSAEINTR => error.WouldBlock, // treat interrupt as retryable
             .WSAEWOULDBLOCK => error.WouldBlock,
             .WSAECONNRESET, .WSAECONNABORTED => error.ConnectionResetByPeer,
