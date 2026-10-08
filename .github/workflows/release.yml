@@ -1,44 +1,32 @@
-name: Auto Release
+name: release
 
 on:
   push:
-    branches: ["master"]
+    tags: ['v*']
 
 permissions:
   contents: write
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
 jobs:
-  create-release:
+  release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Get Version from build.zig.zon
-        id: get_version
+      # Version single source of truth: build.zig.zon `.version`. The tag must be "v" + that string.
+      - name: Tag matches build.zig.zon version
         run: |
-          VERSION=$(sed -n 's/.*\.version = "\([^"]*\)".*/\1/p' build.zig.zon)
-          echo "Detected version: $VERSION"
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          zon=$(sed -n 's/^ *\.version = "\(.*\)",$/\1/p' build.zig.zon)
+          test "v$zon" = "$GITHUB_REF_NAME" || { echo "::error::tag $GITHUB_REF_NAME != v$zon (build.zig.zon .version). Bump the zon version, commit, then tag (tools/release.sh)."; exit 1; }
 
-      - name: Check if Tag Exists
-        run: |
-          TAG_NAME="v${{ steps.get_version.outputs.version }}"
-          if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
-            echo "::error::Tag $TAG_NAME already exists! Version was not bumped in build.zig.zon."
-            exit 1
-          fi
-          echo "Tag $TAG_NAME does not exist. Creating release."
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
+      - uses: mlugg/setup-zig@v2
         with:
-          tag_name: v${{ steps.get_version.outputs.version }}
-          name: Release v${{ steps.get_version.outputs.version }}
-          generate_release_notes: true
-          draft: false
-          prerelease: false
+          version: 0.17.0
+
+      - name: Test
+        run: zig build test --summary all
+
+      - name: Create GitHub release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes --verify-tag

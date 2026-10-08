@@ -18,7 +18,7 @@ Build / test use the Makefile or raw `zig build`:
 - `zig fmt --check src/` — formatter check (CI enforces this; run `zig fmt src/` to fix).
 - `make abs` / `make abc` — run the Autobahn fuzzing suite against the server / client (requires Docker; scripts in `support/autobahn/`).
 
-CI (`.github/workflows/ci.yml`) runs build + both-mode tests on Linux/macOS/Windows across all optimize modes, plus `zig fmt --check` and a package-consumer smoke build. **CI also enforces that `.version` in `build.zig.zon` is bumped on every PR to `master`** — bump it when opening a PR.
+CI (`.github/workflows/ci.yml`) runs build + both-mode tests on Linux/macOS/Windows across all optimize modes, plus `zig fmt --check` and a package-consumer smoke build. Releases are cut explicitly with `tools/release.sh <semver>`; PRs do not bump the version.
 
 ## Architecture
 
@@ -55,3 +55,6 @@ The CI `package` job constructs a downstream project that imports this lib as `.
 - `migrate_from_152_to_160.md` (untracked, root) is a working doc for migrating the library from Zig 0.15.2 to 0.16.0. It is not yet committed.
 - Compression is currently disabled; `Config.compression != null` returns `error.InvalidConfiguraion` (note the typo in the error name is intentional / load-bearing for any existing callers). See `server.zig` around the `init` call.
 - The `Dockerfile` pins an old Zig dev build and is not used by CI — don't rely on it for reproducible builds.
+
+## Versioning
+`build.zig.zon` `.version` is the single source of truth; code reads `webzocket.version` (from `build_options`). Never write a version literal elsewhere, never bump it in a feature PR. Releases are cut explicitly with `tools/release.sh <semver>`. See [`docs/VERSIONING.md`](docs/VERSIONING.md).

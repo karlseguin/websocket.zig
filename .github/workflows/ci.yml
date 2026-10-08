@@ -9,30 +9,7 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
-  version-check:
-    name: Version Bump Check
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Check Version Bump
-        run: |
-          PR_VERSION=$(sed -n 's/.*\.version = "\([^"]*\)".*/\1/p' build.zig.zon)
-          git fetch origin master
-          MASTER_VERSION=$(git show origin/master:build.zig.zon | sed -n 's/.*\.version = "\([^"]*\)".*/\1/p')
-          echo "PR version: $PR_VERSION"
-          echo "Master version: $MASTER_VERSION"
-          if [ "$PR_VERSION" = "$MASTER_VERSION" ]; then
-            echo "::error::Version not bumped! Update .version in build.zig.zon"
-            exit 1
-          fi
-          echo "Version bump verified: $MASTER_VERSION -> $PR_VERSION"
-
   test:
-    needs: version-check
     name: Test (${{ matrix.os }}, ${{ matrix.optimize }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -66,7 +43,6 @@ jobs:
 
   format:
     name: Format Check
-    needs: version-check
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -82,7 +58,6 @@ jobs:
 
   package:
     name: Package Validation
-    needs: version-check
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -152,7 +127,6 @@ jobs:
 
   autobahn-server:
     name: Autobahn Server Conformance
-    needs: version-check
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -179,7 +153,6 @@ jobs:
 
   autobahn-client:
     name: Autobahn Client Conformance
-    needs: version-check
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
