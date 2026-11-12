@@ -2060,6 +2060,11 @@ const TestHandler = struct {
             .conn = conn,
         };
     }
+
+    pub fn afterInit(self: *TestHandler) !void {
+        _ = self;
+    }
+
     pub fn clientMessage(
         self: *TestHandler,
         allocator: Allocator,
