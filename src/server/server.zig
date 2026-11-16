@@ -1346,6 +1346,7 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
 pub const Conn = struct {
     io: Io,
     _closed: bool,
+    _fd_closed: bool = false,
     started: u32,
     stream: Io.net.Stream,
     address: Io.net.IpAddress,
@@ -1391,11 +1392,14 @@ pub const Conn = struct {
         reason: []const u8 = "",
     };
 
+    /// Sends a close frame and closes the connection. Safe to call from any
+    /// thread: the socket is only shut down here, which wakes the thread that
+    /// owns the connection.
     pub fn close(self: *Conn, opts: CloseOpts) !void {
         if (self.isClosed()) {
             return;
         }
-        defer self.closeSocket();
+        defer self.shutdownSocket();
 
         const reason = opts.reason;
         if (reason.len == 0) {
@@ -1511,10 +1515,38 @@ pub const Conn = struct {
         };
     }
 
-    fn closeSocket(self: *Conn) void {
-        if (@atomicRmw(bool, &self._closed, .Xchg, true, .monotonic) == false) {
-            posix.close(self.stream.socket.handle);
+    // Can be called from any thread. Marks the connection as closed and shuts
+    // the socket down.
+    fn shutdownSocket(self: *Conn) void {
+        if (@atomicRmw(bool, &self._closed, .Xchg, true, .monotonic) == true) {
+            return;
         }
+        const io = self.io;
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        if (@atomicLoad(bool, &self._fd_closed, .monotonic) == false) {
+            posix.shutdown(self.stream.socket.handle, .both) catch {};
+        }
+    }
+
+    // Called by the thread that owns the connection (or the server, when
+    // stopping) once it's done with it. Releases the socket's file descriptor.
+    // Safe to call more than once.
+    fn closeSocket(self: *Conn) void {
+        @atomicStore(bool, &self._closed, true, .monotonic);
+        if (@atomicRmw(bool, &self._fd_closed, .Xchg, true, .monotonic) == true) {
+            return;
+        }
+        const socket = self.stream.socket.handle;
+
+        // Only we close the descriptor, so it's still ours to shut down without
+        // the lock.
+        posix.shutdown(socket, .both) catch {};
+
+        const io = self.io;
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        posix.close(socket);
     }
 
     pub const Writer = struct {
@@ -2053,6 +2085,7 @@ fn testStream(handshake: bool) !Io.net.Stream {
 
 const TestHandler = struct {
     conn: *Conn,
+    close_later: bool = false,
 
     pub fn init(h: *const Handshake, conn: *Conn, _: void) !TestHandler {
         try t.expectString("upgrade", h.headers.get("connection").?);
@@ -2098,8 +2131,58 @@ const TestHandler = struct {
         if (std.mem.eql(u8, data, "close3")) {
             return self.conn.close(.{ .code = 234, .reason = "bye" });
         }
+        if (std.mem.eql(u8, data, "close-later")) {
+            self.close_later = true;
+            close_later.conn.store(self.conn, .release);
+        }
+    }
+
+    pub fn close(self: *TestHandler) void {
+        if (self.close_later) {
+            close_later.handler_closed.store(true, .release);
+        }
     }
 };
+
+// The "close-later" connection: its conn, for another thread to close, and
+// whether the worker went on to close its handler.
+const close_later = struct {
+    var conn = std.atomic.Value(?*Conn).init(null);
+    var handler_closed = std.atomic.Value(bool).init(false);
+};
+
+test "Conn: close from a thread that doesn't own the connection" {
+    const stream = try testStream(true);
+    defer stream.close(t.io);
+
+    var writer = stream.writer(t.io, &.{});
+    try writer.interface.writeAll(&proto.frame(.text, "close-later"));
+
+    var waited_ms: u32 = 0;
+    const conn = while (waited_ms < 2000) : (waited_ms += 1) {
+        if (close_later.conn.load(.acquire)) |c| break c;
+        try t.io.sleep(.fromMilliseconds(1), .awake);
+    } else return error.HandlerNeverRan;
+
+    // Let the worker finish with the message and go back to waiting on the
+    // socket, so that nothing but our close can wake it.
+    try t.io.sleep(.fromMilliseconds(50), .awake);
+
+    try conn.close(.{ .code = 4003, .reason = "late" });
+
+    var buf: [8]u8 = undefined;
+    var reader = stream.reader(t.io, &.{});
+    try reader.interface.readSliceAll(&buf);
+    try t.expectSlice(u8, &.{ 136, 6, 0x0f, 0xa3, 'l', 'a', 't', 'e' }, &buf);
+
+    // The connection's owner must have been woken up and cleaned up. Had the
+    // socket been closed out from under it, it would never hear of it again.
+    waited_ms = 0;
+    while (close_later.handler_closed.load(.acquire) == false) : (waited_ms += 1) {
+        if (waited_ms == 2000) return error.HandlerNeverClosed;
+        try t.io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
 
 test "List" {
     var list = List(TestNode){};
