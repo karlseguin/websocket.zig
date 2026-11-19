@@ -100,6 +100,7 @@ pub fn Server(comptime H: type) type {
         _signals: []posix.fd_t,
         _mut: Io.Mutex,
         _cond: Io.Condition,
+        _stopped: bool,
 
         const Self = @This();
 
@@ -127,6 +128,7 @@ pub fn Server(comptime H: type) type {
                 .io = io,
                 ._mut = .init,
                 ._cond = .init,
+                ._stopped = false,
                 ._state = state,
                 ._signals = signals,
                 .config = config,
@@ -153,7 +155,9 @@ pub fn Server(comptime H: type) type {
         pub fn listen(self: *Self, ctx: anytype) !void {
             const io = self.io;
             self._mut.lockUncancelable(io);
+            self._stopped = false;
             errdefer {
+                self._stopped = true;
                 self._cond.signal(io);
                 self._mut.unlock(io);
             }
@@ -274,6 +278,12 @@ pub fn Server(comptime H: type) type {
                     thrd.join();
                 }
             }
+
+            // signal while holding the mutex: stop() checks _stopped under the
+            // same mutex, so the wakeup can't fall between its check and its wait
+            self._mut.lockUncancelable(io);
+            defer self._mut.unlock(io);
+            self._stopped = true;
             self._cond.signal(io);
         }
 
@@ -290,7 +300,9 @@ pub fn Server(comptime H: type) type {
                 }
                 posix.close(s);
             }
-            self._cond.waitUncancelable(io, &self._mut);
+            while (!self._stopped) {
+                self._cond.waitUncancelable(io, &self._mut);
+            }
         }
     };
 }
@@ -505,9 +517,11 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            // the thread pool must be drained first: a queued dataAvailable can
+            // still reference a HandlerConn owned by base's conn_manager
+            self.thread_pool.deinit();
             self.loop.deinit();
             self.base.deinit();
-            self.thread_pool.deinit();
         }
 
         fn run(self: *Self, listener: posix.socket_t, signal: posix.fd_t) void {
@@ -2250,4 +2264,24 @@ fn expectList(expected: []const i32, list: List(TestNode)) !void {
         prev = node.prev;
     }
     try t.expectEqual(0, i);
+}
+
+test "Server: stop with an open connection" {
+    for (0..50) |_| {
+        var server = try Server(TestHandler).init(t.io, t.allocator, .{
+            .port = 9293,
+            .address = "127.0.0.1",
+        });
+        const thread = try server.listenInNewThread({});
+
+        const address = try Io.net.IpAddress.parse("127.0.0.1", 9293);
+        const stream = try address.connect(t.io, .{ .mode = .stream });
+        defer stream.close(t.io);
+        var writer = stream.writer(t.io, &.{});
+        try writer.interface.writeAll("GET / HTTP/1.1\r\ncontent-length: 0\r\nupgrade: websocket\r\nsec-websocket-version: 13\r\nconnection: upgrade\r\nsec-websocket-key: my-key\r\n\r\n");
+
+        server.stop();
+        thread.join();
+        server.deinit();
+    }
 }
