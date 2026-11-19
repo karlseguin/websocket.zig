@@ -573,6 +573,9 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
                     }
 
                     if (data == 1) {
+                        // drain queued dataAvailable calls before shutdown closes
+                        // the sockets they are about to read from or write to
+                        thread_pool.stop();
                         self.base.shutdown();
                         return;
                     }
